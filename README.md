@@ -21,6 +21,26 @@ Three laws, non-negotiable:
   cell, a status word in backlog prose, or a spec heading's status word.
   Close records, rulings, founding text and decisions stay human.
 
+## Why it saves tokens
+
+An AI coding agent pays for its whole working context on every step it takes:
+each tool call re-sends the conversation so far, typically tens of thousands of
+tokens, while the command's own output is a few hundred. So what a workflow
+costs is mostly the **number of steps**, not the size of each step.
+
+Done by hand, the boundaries of an item are many small steps: check the branch,
+compare it with main, run each gate leg, count the tests, edit the backlog, commit,
+fast-forward, tag, remove the worktree, delete the branch. Each one is a model
+round trip, and each is a chance to get something slightly wrong (a missed status,
+a mistyped tag, a hand-copied test count), which costs more round trips to notice
+and repair. po turns each boundary into one command plus its dry run, with the same
+result every time, and refuses instead of half-doing. The agent spends its steps on
+the item itself.
+
+How much that saves depends on your agent, model and context size. To measure it
+for your setup, run one boundary twice on throwaway clones, once with po and once
+by hand from the same instructions, and compare the two sessions' token counts.
+
 ## Requirements
 
 - Linux (or WSL). bash 4.4 or newer, GNU coreutils (`stat -c`, `readlink -f`,
