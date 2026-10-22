@@ -1,0 +1,32 @@
+# Example manifest for a Rust project. Copy it to po.toml at your repo root and adjust.
+
+[gate]
+# po stamp runs the legs below in order and names the one that fails. A single
+# `command = "./gate.sh"` also works; the gate is then one leg, "gate".
+test_count_cmd = "cargo test 2>&1"    # parsed for libtest "test result: ok. N passed" lines
+
+[gate.legs]
+check = "cargo check"
+test = "cargo test"
+clippy = "cargo clippy --all-targets -- -D warnings"
+fmt = "cargo fmt --check"
+
+[versioning]
+scheme = "sequential-at-founding"     # a new item is latest founded + 1
+tag = "v{version}"
+item_commit = "v{version}: {title}"
+admin_prefix = "admin:"
+insert_segment = 4                    # inserts under v1.2.3 are v1.2.3.1, v1.2.3.2, ...
+# tag_style = "annotated"             # optional; default "light"
+
+[layout]
+backlog = "docs/BACKLOG.md"
+specs_dir = "docs/backlog"            # where item spec headings `## v1.2 — Title — STATUS` live
+worktrees = ".worktrees"
+branch = "item-v{version}"
+# main = "main"                       # optional; the integration branch
+# owner_column = "Owner"              # optional; a backlog table column naming each item's owner
+
+[docs]
+decisions = "docs/DECISIONS.md"       # commits touching it are marked RULING by po fresh / kickoff
+rules = "CONTRIBUTING.md"             # the rules file po kickoff points at

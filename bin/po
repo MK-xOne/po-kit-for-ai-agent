@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR/../lib/po
+# po — deterministic item-process tooling. See README.md.
+#
+# Usage: po [-C <repo>] [--manifest <file>] <command> [args]
+#   status [--idle <minutes>] what is in flight, and how long each is idle (read-only)
+#   prune           merged worktrees/branches; changes nothing without --commit
+#   stamp           run the gate here and write the evidence block gate-<n>.txt
+#   fresh <version> is the item branch based at main's tip? (read-only)
+#   open, close     the founding and closing boundaries; plan only without --commit
+#   kickoff <version> the mechanical half of an item's founding brief (read-only)
+#   report [--note <text>]... the item report: files, the fresh stamp, PROPOSED notes
+#   version         the installed po-kit tag (works anywhere)
+#   doctor          does every adopter's manifest still work? (read-only)
+#
+# The manifest defaults to po.toml at the root of the repository's main
+# worktree. po never pushes.
+set -euo pipefail
+
+PO_LIB="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/po" && pwd)"
+# shellcheck source=manifest.sh
+. "$PO_LIB/manifest.sh"
+# shellcheck source=backlog.sh
+. "$PO_LIB/backlog.sh"
+# shellcheck source=git.sh
+. "$PO_LIB/git.sh"
+# shellcheck source=status.sh
+. "$PO_LIB/status.sh"
+# shellcheck source=prune.sh
+. "$PO_LIB/prune.sh"
+# shellcheck source=stamp.sh
+. "$PO_LIB/stamp.sh"
+# shellcheck source=fresh.sh
+. "$PO_LIB/fresh.sh"
+# shellcheck source=edit.sh
+. "$PO_LIB/edit.sh"
+# shellcheck source=boundary.sh
+. "$PO_LIB/boundary.sh"
+# shellcheck source=open.sh
+. "$PO_LIB/open.sh"
+# shellcheck source=close.sh
+. "$PO_LIB/close.sh"
+# shellcheck source=kickoff.sh
+. "$PO_LIB/kickoff.sh"
+# shellcheck source=report.sh
+. "$PO_LIB/report.sh"
+# shellcheck source=release.sh
+. "$PO_LIB/release.sh"
+PO_SELF=$(cd "$PO_LIB/../../bin" && pwd)/po
+
+po_usage() {
+	cat <<'EOF'
+usage: po [-C <repo>] [--manifest <file>] <command> [args]
+
+commands:
+  status [--idle <minutes>]
+                    DOING and held items, their branches and worktrees,
+                    ahead/behind main, dirty state, latest tag, orphans;
+                    each DOING item's idle time (3h12m, or - with no
+                    worktree); with --idle, exit 8 and an IDLE (n) list
+                    when a DOING item has been idle longer
+  prune [--commit]  worktrees and branches merged into main; without
+                    --commit, prints the plan and changes nothing
+  stamp [--bin <path>]
+                    run the manifest's gate in the current worktree; on a
+                    full pass write the evidence block to gate-<n>.txt at
+                    its root and print it
+  fresh <version>   every main commit since the item branch's base, admin
+                    and law-changing ones called out; REBASE REQUIRED when
+                    the branch is behind main (read-only, never fetches)
+  open <version|next> [<title>] [--for <name>] [--epoch] [--body-file <f>]
+       [--commit]   found an item (or take a TODO one DOING): the backlog
+                    edits as an admin commit on main, then its branch and
+                    worktree; without --commit, prints the plan; --for
+                    defaults to the [layout] owner_column cell
+  close <version> [--next <version> [--next-title <title>] [--for <name>]]
+        [--also-done <version>]... [--body-file <f>] [--commit]
+                    close a DOING item: fast-forward main, bare tag, the
+                    backlog edits as an admin commit (evidence quoted),
+                    --next DOING, its worktree and branch removed; without
+                    --commit, prints the plan; a [hooks] on_close command
+                    then runs
+  kickoff <version> the item's spec section verbatim, the standing-rules
+                    pointer, and every admin/ruling commit on main from the
+                    previous boundary to its founding (read-only)
+  report [--note <text>]...
+                    the item report as one markdown block: files changed,
+                    the newest stamp verbatim, the notes numbered as
+                    PROPOSED; exit 4, nothing on stdout, unless a stamp
+                    names this HEAD and is newer than every changed file
+  version           the tag this po-kit is at (or git's description of it)
+  doctor            for each repository in ~/.config/po-kit/adopters: its
+                    manifest parses under this po, po status runs, and the
+                    optional keys it does not set; read-only, exit 2 when
+                    any adopter fails
+
+bin/po-install [<tag>] installs a tag of po-kit (default: the newest) under
+~/.local/share/po-kit/<tag>, points ~/.local/bin/po at it, then runs po
+doctor; see README.md.
+
+exit: 0 ok, 1 usage, 2 manifest/backlog/repository error, or a source
+        kickoff needs is missing (no spec section, no rules file),
+        doctor: an adopter's manifest or po status fails, or no
+        adopters list,
+      3 the backlog disagrees with itself, an edit has no single
+        exact anchor, or open/close --for names another owner than
+        the [layout] owner_column cell,
+      4 stamp: a gate leg or the test count failed; nothing written,
+        report: no stamp, or a stale one; nothing printed,
+      5 fresh (and close): REBASE REQUIRED,
+      6 open/close: refused by the item law (numbering, branch shape,
+        stamp evidence, status, a taken ref or path, main not writable),
+      7 close: the [hooks] on_close command failed (the boundary stands),
+      8 status --idle: a DOING item idle longer than the limit (the report
+        is printed in full; exit 3 outranks 8)
+EOF
+}
+
+po_usage_die() {
+	printf 'po: %s\n' "$*" >&2
+	po_usage >&2
+	exit 1
+}
+
+main() {
+	local manifest=
+	while (($# > 0)); do
+		case $1 in
+		-C)
+			(($# >= 2)) || po_usage_die "-C needs a path"
+			cd "$2" || po_die "cannot enter $2"
+			shift 2
+			;;
+		--manifest)
+			(($# >= 2)) || po_usage_die "--manifest needs a file"
+			manifest=$(readlink -f "$2")
+			shift 2
+			;;
+		-h | --help)
+			po_usage
+			exit 0
+			;;
+		-*) po_usage_die "unknown option '$1'" ;;
+		*) break ;;
+		esac
+	done
+	(($# > 0)) || po_usage_die "no command"
+	local cmd=$1
+	shift
+	# These two work from anywhere and read no manifest of the current repository.
+	case $cmd in
+	version | doctor)
+		[[ -z $manifest ]] || po_usage_die "$cmd reads each adopter's own manifest; --manifest does not apply"
+		po_cmd_"$cmd" "$@"
+		return
+		;;
+	esac
+	git rev-parse --git-dir >/dev/null 2>&1 || po_die "not inside a git repository: $PWD"
+	# Where po was started: stamp works on this worktree, and its paths
+	# are relative to this directory.
+	# shellcheck disable=SC2034 # read by stamp.sh
+	PO_INVOKE_DIR=$PWD
+	# shellcheck disable=SC2034 # read by stamp.sh
+	PO_INVOKE_WT=$(git rev-parse --show-toplevel) || po_die "not inside a worktree: $PWD"
+	# Work from the main worktree, so every relative path in the manifest
+	# means the same thing wherever po was started.
+	po_worktrees_load
+	cd "$PO_MAIN_WT" || po_die "cannot enter the main worktree $PO_MAIN_WT"
+	po_manifest_load "${manifest:-$PO_MAIN_WT/po.toml}"
+	case $cmd in
+	status) po_cmd_status "$@" ;;
+	prune) po_cmd_prune "$@" ;;
+	stamp) po_cmd_stamp "$@" ;;
+	fresh) po_cmd_fresh "$@" ;;
+	open) po_cmd_open "$@" ;;
+	close) po_cmd_close "$@" ;;
+	kickoff) po_cmd_kickoff "$@" ;;
+	report) po_cmd_report "$@" ;;
+	*) po_usage_die "unknown command '$cmd'" ;;
+	esac
+}
+
+main "$@"

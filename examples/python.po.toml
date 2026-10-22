@@ -1,0 +1,32 @@
+# Example manifest for a Python project tested with pytest (run through uv here).
+# Copy it to po.toml at your repo root and adjust.
+
+[gate]
+test_format = "pytest"                # count pytest's "N passed" summary instead of libtest lines
+test_count_cmd = "uv run pytest -q 2>&1"
+
+[gate.legs]
+lint = "uv run ruff check"
+fmt = "uv run ruff format --check"
+test = "uv run pytest -q"
+
+[versioning]
+scheme = "sequential-at-founding"
+tag = "v{version}"
+item_commit = "v{version}: {title}"
+admin_prefix = "admin:"
+insert_segment = 3                    # inserts under v0.4 are v0.4.1, v0.4.2, ...
+
+[layout]
+backlog = "docs/BACKLOG.md"
+specs_dir = "docs/items"
+worktrees = ".worktrees"
+branch = "item-v{version}"
+# owner_column = "Owner"
+
+[hooks]
+# on_close = "./scripts/after-close.sh"   # optional; runs after a complete po close --commit
+
+[docs]
+decisions = "docs/DECISIONS.md"
+rules = "AGENTS.md"
