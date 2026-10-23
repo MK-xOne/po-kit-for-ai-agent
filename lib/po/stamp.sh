@@ -12,7 +12,24 @@
 # Stamp files at a worktree root; they are not part of the state stamped.
 PO_STAMP_NAME_RE='^gate-([1-9][0-9]*)\.txt$'
 
+# What the event log needs from the run in progress: the item (the version the
+# branch names, or - for another branch), the gate's leg names and each leg's
+# result so far (skip until it runs).
+PO_STAMP_ITEM=-
+PO_STAMP_NAMES=()
+PO_STAMP_RES=()
+
+# po_stamp_legs_json: the legs array body for the event log.
+po_stamp_legs_json() {
+	local i out=''
+	for i in "${!PO_STAMP_NAMES[@]}"; do
+		out+="${out:+,}$(po_event_leg "${PO_STAMP_NAMES[i]}" "${PO_STAMP_RES[i]}")"
+	done
+	printf '%s' "$out"
+}
+
 po_stamp_fail() {
+	po_event_log stamp "$PO_STAMP_ITEM" fail "$(po_stamp_legs_json)" "$*"
 	printf 'po stamp: FAIL: %s\n' "$*" >&2
 	printf 'po stamp: no evidence written\n' >&2
 	exit 4
@@ -164,12 +181,18 @@ po_cmd_stamp() {
 
 	printf 'po stamp: gate in %s at %s\n' "$wt" "$head" >&2
 	local gate_sum=0 gate_lines=0
+	PO_STAMP_ITEM=$(po_unfill "$(po_get layout.branch)" "$branch" 2>/dev/null) || PO_STAMP_ITEM=-
+	PO_STAMP_NAMES=("${names[@]}")
+	PO_STAMP_RES=()
+	for i in "${!names[@]}"; do PO_STAMP_RES+=(skip); done
 	for i in "${!names[@]}"; do
 		printf 'po stamp: leg %s: %s\n' "${names[i]}" "${cmds[i]}" >&2
 		po_stamp_run "$wt" "${cmds[i]}"
+		PO_STAMP_RES[i]=fail
 		[[ $PO_RUN_CODE == 0 ]] ||
 			po_stamp_fail "gate leg '${names[i]}' (${cmds[i]}) exited $PO_RUN_CODE"
 		$sumfn "$PO_RUN_RESULTS" "gate leg '${names[i]}'"
+		PO_STAMP_RES[i]=pass
 		gate_sum=$((gate_sum + PO_SUM))
 		gate_lines=$((gate_lines + PO_SUM_LINES))
 	done
@@ -221,6 +244,7 @@ po_cmd_stamp() {
 		[[ -f $file ]] && rm -f -- "$file"
 		po_stamp_fail "could not write ${file##*/}"
 	fi
+	po_event_log stamp "$PO_STAMP_ITEM" pass "$(po_stamp_legs_json)" ''
 	printf '%s\n' "$block"
 	printf 'po stamp: wrote %s\n' "$file" >&2
 }

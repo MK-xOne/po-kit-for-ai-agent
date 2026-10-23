@@ -10,6 +10,8 @@
 #   open, close     the founding and closing boundaries; plan only without --commit
 #   kickoff <version> the mechanical half of an item's founding brief (read-only)
 #   report [--note <text>]... the item report: files, the fresh stamp, PROPOSED notes
+#   events [--all] [--json] the gate event log, newest first (read-only)
+#   serve [--bind <addr>] [--port <n>] read-only HTTP viewer of the gate events
 #   version         the installed po-kit tag (works anywhere)
 #   doctor          does every adopter's manifest still work? (read-only)
 #
@@ -44,8 +46,12 @@ PO_LIB="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/po" && pwd)
 . "$PO_LIB/kickoff.sh"
 # shellcheck source=report.sh
 . "$PO_LIB/report.sh"
+# shellcheck source=events.sh
+. "$PO_LIB/events.sh"
 # shellcheck source=release.sh
 . "$PO_LIB/release.sh"
+# shellcheck source=serve.sh
+. "$PO_LIB/serve.sh"
 PO_SELF=$(cd "$PO_LIB/../../bin" && pwd)/po
 
 po_usage() {
@@ -88,6 +94,17 @@ commands:
                     the newest stamp verbatim, the notes numbered as
                     PROPOSED; exit 4, nothing on stdout, unless a stamp
                     names this HEAD and is newer than every changed file
+  events [--all] [--json]
+                    the gate event log kept in the git dir (po-events.jsonl):
+                    every po stamp run, pass or fail, and every open and
+                    close --commit; the last 10, newest first, as a table
+                    in local time; --all for every event; --json for one
+                    JSON object per line, time in UTC (read-only)
+  serve [--bind <addr>] [--port <n>]
+                    a read-only HTTP viewer of the gate events (last 10 at /,
+                    all at /all, JSON at /events.json); reads them through
+                    po events --json; binds 127.0.0.1 by default and refuses
+                    0.0.0.0 and ::; GET only, other methods 405
   version           the tag this po-kit is at (or git's description of it)
   doctor            for each repository in ~/.config/po-kit/adopters: its
                     manifest parses under this po, po status runs, and the
@@ -176,6 +193,8 @@ main() {
 	close) po_cmd_close "$@" ;;
 	kickoff) po_cmd_kickoff "$@" ;;
 	report) po_cmd_report "$@" ;;
+	events) po_cmd_events "$@" ;;
+	serve) po_cmd_serve "$@" ;;
 	*) po_usage_die "unknown command '$cmd'" ;;
 	esac
 }

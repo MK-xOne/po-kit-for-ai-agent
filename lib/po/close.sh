@@ -270,6 +270,7 @@ po_cmd_close() {
 			printf 'kept branch %s: it moved since the plan\n' "$branch"
 		fi
 	fi
+	po_event_log close "$version" pass '' "$title"
 	[[ -z $hook ]] || po_close_hook "$hook" "$version" "$tag" "$title" "$tip" "$body_file" "$next" "$block"
 }
 

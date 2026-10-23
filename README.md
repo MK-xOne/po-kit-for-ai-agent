@@ -47,6 +47,7 @@ by hand from the same instructions, and compare the two sessions' token counts.
   `sort -V`) and a recent git (tested with git 2.56). Nothing else: no network, no services.
 - macOS is not supported yet: its stock bash 3.2 and BSD tools differ. With
   Homebrew's `bash` and `coreutils` first on `PATH` it may work, untested.
+- `python3` (3.8 or newer, standard library only) for `po serve`.
 - `shellcheck` only to run the kit's own lint.
 
 ## Install
@@ -85,6 +86,7 @@ po [-C <repo>] [--manifest <file>] open <version|next> [<title>] [--for <name>] 
 po [-C <repo>] [--manifest <file>] close <version> [--next <version> [--next-title <title>] [--for <name>]]
                                          [--also-done <version>]... [--body-file <f>] [--commit]
 po [-C <repo>] [--manifest <file>] kickoff <version>
+po [-C <repo>] [--manifest <file>] serve [--bind <addr>] [--port <n>]
 po version
 po doctor
 bin/po-install [<tag>]
@@ -196,6 +198,19 @@ the same from any worktree.
   changed file newer than it, it exits 4 and prints nothing on stdout. It
   never runs the gate and posts nothing; the tag comes from the branch
   name via `[layout] branch`.
+- `po events [--all] [--json]` — the gate event log, read-only. `po stamp`
+  appends one event per run, pass or fail, and `po open` and `po close` one
+  each after a complete `--commit`, to `po-events.jsonl` in the repository's
+  common git dir (shared by every worktree, never tracked, never dirt).
+  One JSON object per line: `time` (ISO 8601, UTC), `kind` (`stamp`, `open`,
+  `close`), `item` (null off an item branch), `project` (the checkout's
+  directory name), `result` (`pass`, `fail`), `agent` (`$BUZZ_AGENT`, else the
+  user), `legs` (each leg's `name` and `result`: `pass`, `fail`, or `skip` when
+  an earlier leg failed) and `detail` (why a stamp failed). Logging never
+  changes a command's exit status or output; a log that cannot be written
+  warns on stderr. `po events` prints the last 10, newest first, as a table
+  in the viewer's local time; `--all` prints every event; `--json` prints the
+  stored lines (UTC) for machines; the two combine.
 - `po open <version|next> [<title>]` — the founding boundary. A new number
   must be latest founded + 1 (`next`), an epoch step with `--epoch`
   (1.10.0, 2.0.0), or the next insert in the `insert_segment`-th segment
@@ -230,6 +245,19 @@ the same from any worktree.
   whole plan — steps, the edits as a diff, the admin message, `--commit`
   readiness — and change nothing. Exit 6: refused by the item law.
 
+- `po serve [--bind <addr>] [--port <n>]` — a small read-only web viewer of the
+  gate events, for a screen you leave open. `/` shows the last 10 events (item,
+  project, kind, result, agent, time), newest on top; each row links to `/all`,
+  the full list; `/events.json` is the same data as JSON. The pages poll it every
+  few seconds and redraw in place; times are UTC in the data and shown in the
+  browser's local time. Every field is HTML-escaped. It reads events only by
+  running `po events --json` (so it needs a po that has `po events`) and needs
+  `python3` (standard library only). GET only: any other method is 405. It binds
+  `127.0.0.1` (port 8765) unless told otherwise, and refuses `0.0.0.0`, `::` and
+  any name that resolves to them (exit 1): name one address, e.g. a VPN
+  interface's. There is no login, so bind only to an address whose reachers you
+  trust. It prints `po serve: listening on http://<addr>:<port>/` and runs until
+  stopped; `--port 0` picks a free port.
 - `po version` — the tag this po-kit checkout is at (`git describe --tags
   --exact-match`; else `git describe --tags --always --dirty`). Works from
   anywhere, reads no manifest.

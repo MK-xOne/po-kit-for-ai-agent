@@ -16,7 +16,11 @@ every backlog status; **devs** each work one item in its own worktree.
 - **Read-only, use freely:** `po status` (open items, owners, idle time,
   worktrees, dirt; `--idle <minutes>` flags stalls), `po fresh <v>` (is the
   branch behind main), `po kickoff <v>` (the item's spec section and the rulings
-  since the last boundary), `po version` (the installed tag), `po doctor` (does
+  since the last boundary), `po events` (the gate event log: every `po stamp`
+  run, pass or fail, and every `po open` and `po close --commit`; last 10,
+  `--all`, `--json`), `po serve [--bind <addr>] [--port <n>]` (a read-only web
+  viewer of those events, loopback by default; run it only when asked, it stays
+  up until stopped), `po version` (the installed tag), `po doctor` (does
   every adopter's manifest still work under the installed po, and which optional
   keys could it adopt).
 - **The PO's only:** `po open`, `po close`, `po prune` with `--commit`, and every

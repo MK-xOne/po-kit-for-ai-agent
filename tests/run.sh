@@ -864,6 +864,7 @@ printf 'Co-Authored-By: Someone <s@example.invalid>\n' >"$TMP/body.txt"
 out=$("$PO" -C "$B" --manifest "$BM" close 1.0.3 --next 1.0.5 --also-done 1.0.4 --body-file "$TMP/body.txt" --commit 2>&1)
 code=$?
 [[ $code == 0 ]] && ok "close --commit exits 0" || bad "close --commit (exit $code)" "$out"
+CLOG=$B/.git/po-events.jsonl # for the gate events tests below
 [[ $(git -C "$B" cat-file -t v1.0.3) == commit && $(git -C "$B" rev-parse v1.0.3) == "$tip" ]] &&
 	ok "the tag is bare and lightweight at the item commit, despite tag.gpgSign" || bad "tag" "$(git -C "$B" cat-file -t v1.0.3 2>&1)"
 # [versioning] tag_style (item D.1).
@@ -1505,6 +1506,107 @@ out=$("$PO" -C "$O" --manifest "$BM" kickoff 1.0.3 2>&1)
 sed 's/^owner_column = "Owner"$/owner_column = ""/' "$OM" >"$TMP/o-empty.toml"
 expect "an empty owner_column is a manifest error" 2 'owner_column' -- -C "$O" --manifest "$TMP/o-empty.toml" status
 
+# ---- gate events (item L) ---------------------------------------------------
+# The stamp fixture $S has logged every stamp above, passing and failing; $B has
+# logged its closes and opens. The log is po-events.jsonl in the common git dir.
+SLOG=$S/.git/po-events.jsonl
+BLOG=$B/.git/po-events.jsonl
+json_ok() { python3 -I -c 'import json,sys; [json.loads(l) for l in open(sys.argv[1])]' "$1" 2>/dev/null; }
+jfield() { python3 -I -c 'import json,sys; print(json.loads(sys.argv[1])[sys.argv[2]])' "$1" "$2"; }
+[[ -s $SLOG ]] && json_ok "$SLOG" && [[ $(wc -l <"$SLOG") == $(grep -c '^{' "$SLOG") ]] &&
+	ok "events: the log is in the common git dir, one JSON object per line" || bad "events log shape" "$(cat "$SLOG" 2>&1)"
+[[ ! -e $W/po-events.jsonl ]] && ! git -C "$W" status --porcelain | grep -q events &&
+	ok "events: the log is not in the worktree, so it is not dirt" || bad "events in worktree"
+first=$(grep -m1 '"result":"pass"' "$SLOG")
+[[ $(jfield "$first" kind) == stamp && $(jfield "$first" item) == 1.0.3 && $(jfield "$first" project) == stamp &&
+	$(jfield "$first" detail) == '' ]] &&
+	python3 -I -c 'import json,sys,re; e=json.loads(sys.argv[1]); assert list(e)==["time","kind","item","project","result","agent","legs","detail"]; assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", e["time"]); assert e["legs"]==[{"name":n,"result":"pass"} for n in ("check","test","clippy","fmt")]' "$first" &&
+	ok "events: a passing stamp logs time (UTC), kind, item, project, result and every leg" || bad "pass event" "$first"
+fail1=$(grep -m1 '"clippy","result":"fail"' "$SLOG")
+[[ -n $fail1 && $(jfield "$fail1" result) == fail && $(jfield "$fail1" detail) == *"gate leg 'clippy'"* ]] &&
+	python3 -I -c 'import json,sys; e=json.loads(sys.argv[1]); assert [l["result"] for l in e["legs"]]==["pass","pass","fail","skip"], e["legs"]' "$fail1" &&
+	ok "events: a failing stamp logs fail, the reason, the failing leg and skips the legs not reached" || bad "fail event" "$fail1"
+[[ $(grep -c '"kind":"stamp"' "$SLOG") == $(grep -c . "$SLOG") ]] &&
+	ok "events: every stamp run is logged (passes and fails alike)" || bad "stamp count"
+grep -q '"agent":"[^"]' "$SLOG" && [[ $(BUZZ_AGENT=zed "$PO" -C "$W" --manifest "$TMP/s.toml" stamp >/dev/null 2>&1; tail -1 "$SLOG" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["agent"])') == zed ]] &&
+	ok "events: the agent is BUZZ_AGENT" || bad "agent from BUZZ_AGENT"
+[[ $(env -u BUZZ_AGENT USER=quux "$PO" -C "$W" --manifest "$TMP/s.toml" stamp >/dev/null 2>&1; tail -1 "$SLOG" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["agent"])') == quux ]] &&
+	ok "events: without BUZZ_AGENT the agent is the user" || bad "agent from USER"
+git -C "$S" checkout -q -b scratch 2>/dev/null
+git -C "$S" worktree add -q "$S/.wt/other" -b other
+"$PO" -C "$S/.wt/other" --manifest "$TMP/s.toml" stamp >/dev/null 2>&1
+[[ $(tail -1 "$SLOG" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["item"])') == None ]] &&
+	grep -q '"item":null' "$SLOG" && ok "events: a branch that is not an item branch logs item null" || bad "item null"
+git -C "$S" worktree remove --force "$S/.wt/other"
+git -C "$S" checkout -q main
+git -C "$S" branch -q -D scratch other
+
+n_close=$(grep -c '"kind":"close"' "$CLOG")
+n_open=$(grep -c '"kind":"open"' "$BLOG")
+last_close=$(grep '"kind":"close"' "$CLOG" | tail -1)
+[[ $n_close -ge 1 && $n_open -ge 1 && $(jfield "$last_close" result) == pass && $(jfield "$last_close" item) == 1.0.3 &&
+	$(jfield "$last_close" legs) == '[]' ]] &&
+	json_ok "$BLOG" && json_ok "$CLOG" && ok "events: open --commit and close --commit each log one event" || bad "open/close events" "$(cat "$BLOG")"
+n_before=$(grep -c . "$BLOG")
+"$PO" -C "$B" --manifest "$BM" open next "Dry" >/dev/null 2>&1
+"$PO" -C "$B" --manifest "$BM" close 1.0.5 >/dev/null 2>&1
+[[ $(grep -c . "$BLOG") == "$n_before" ]] && ok "events: a dry run of open or close logs nothing" || bad "dry run logged"
+
+# po events: the table, --all, --json.
+sha=$(sha256sum "$SLOG")
+out=$(TZ=Pacific/Auckland "$PO" -C "$S" --manifest "$TMP/s.toml" events 2>&1)
+code=$?
+rows=$(($(wc -l <<<"$out") - 1))
+[[ $code == 0 && $rows == 10 ]] && head -1 <<<"$out" | grep -qE '^TIME +KIND +ITEM +PROJECT +RESULT +AGENT +LEGS$' &&
+	ok "events: by default the table shows the last 10 events under a header" || bad "events table (exit $code, rows $rows)" "$out"
+[[ $(wc -l <"$SLOG") -gt 10 ]] && out_all=$("$PO" -C "$S" --manifest "$TMP/s.toml" events --all 2>&1) &&
+	[[ $(($(wc -l <<<"$out_all") - 1)) == "$(wc -l <"$SLOG")" ]] &&
+	ok "events: --all lists every event" || bad "events --all" "$out_all"
+grep -qE ' (NZDT|NZST) ' <<<"$out" && ! grep -q 'T[0-9:]*Z' <<<"$out" &&
+	ok "events: the table shows the viewer's local time" || bad "events local time" "$out"
+# Newest first: the last line of the log is the table's first row.
+tail_time=$(python3 -I -c 'import json,sys; print(json.loads(open(sys.argv[1]).readlines()[-1])["time"])' "$SLOG")
+[[ $(TZ=UTC "$PO" -C "$S" --manifest "$TMP/s.toml" events | sed -n 2p | cut -c1-19) == "$(sed "s/T/ /;s/Z//" <<<"$tail_time")" ]] &&
+	ok "events: newest first" || bad "events order"
+out=$("$PO" -C "$S" --manifest "$TMP/s.toml" events --json 2>&1)
+[[ $(wc -l <<<"$out") == 10 ]] && python3 -I -c 'import json,sys; L=[json.loads(l) for l in sys.stdin]; assert [e["time"] for e in L]==sorted((e["time"] for e in L), reverse=True) and all(e["time"].endswith("Z") for e in L)' <<<"$out" &&
+	ok "events: --json is the last 10 as JSON lines, UTC, newest first" || bad "events --json" "$out"
+out=$("$PO" -C "$S" --manifest "$TMP/s.toml" events --all --json 2>&1)
+[[ $(wc -l <<<"$out") == "$(wc -l <"$SLOG")" ]] && python3 -I -c 'import json,sys; [json.loads(l) for l in sys.stdin]' <<<"$out" &&
+	ok "events: --all and --json combine" || bad "events --all --json"
+[[ $(sha256sum "$SLOG") == "$sha" ]] && ok "events: reading the log changes nothing" || bad "events wrote"
+expect "events rejects an unknown argument" 1 "events: unknown argument '--bogus'" -- -C "$S" --manifest "$TMP/s.toml" events --bogus
+E=$TMP/empty-events
+make_repo "$E"
+expect "events with no log says so and exits 0" 0 'none yet' -- -C "$E" --manifest "$TMP/s.toml" events
+out=$("$PO" -C "$E" --manifest "$TMP/s.toml" events --json 2>&1)
+[[ -z $out ]] && ok "events --json with no log prints nothing" || bad "events --json empty" "$out"
+printf 'garbage\n{"torn' >>"$SLOG"
+out=$("$PO" -C "$S" --manifest "$TMP/s.toml" events --all --json 2>&1)
+json_ok <(printf '%s\n' "$out") && ok "events: lines that are not events are skipped" || bad "events garbage" "$out"
+sed -i '/^garbage$/d;/^{"torn$/d' "$SLOG"
+
+# A log that cannot be written warns; the stamp's exit code and evidence stand.
+rm -f "$W"/gate-*.txt
+want_block=$("$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>/dev/null)
+rm -f "$W"/gate-*.txt
+mv "$SLOG" "$SLOG.keep"
+mkdir "$SLOG"
+out=$("$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>"$TMP/ev.err")
+code=$?
+[[ $code == 0 && $out == "$want_block" && -f $W/gate-1.txt ]] && grep -q 'warning: could not write the stamp event' "$TMP/ev.err" &&
+	ok "events: an unwritable log warns; the stamp still passes with the same block" || bad "unwritable log (exit $code)" "$(cat "$TMP/ev.err")"
+stamp_manifest check=false
+"$PO" -C "$W" --manifest "$TMP/s.toml" stamp >/dev/null 2>"$TMP/ev.err"
+code=$?
+[[ $code == 4 ]] && grep -q 'warning: could not write' "$TMP/ev.err" ||
+	bad "unwritable log on a failing stamp (exit $code)" "$(cat "$TMP/ev.err")"
+[[ $code == 4 ]] && ok "events: an unwritable log leaves a failing stamp's exit code at 4" || true
+rmdir "$SLOG"
+mv "$SLOG.keep" "$SLOG"
+stamp_manifest "${STD_LEGS[@]}"
+rm -f "$W"/gate-*.txt
+
 # ---- releases and adopters (item K) ---------------------------------------
 # Every install below runs with a throwaway HOME; the real symlink must not move.
 REAL_PO_LINK=$(readlink -f "$HOME/.local/bin/po" 2>/dev/null || true)
@@ -1642,6 +1744,160 @@ code=$?
 	ok "an adopter already broken does not block; a failing doctor exits 7 with the switch standing" || bad "install then doctor fail (exit $code)" "$out"
 [[ $(readlink -f "$HOME/.local/bin/po" 2>/dev/null || true) == "$REAL_PO_LINK" ]] &&
 	ok "the real ~/.local/bin/po was never touched" || bad "real symlink moved"
+
+# ---- the event viewer (item M) ---------------------------------------------
+# po serve reads events only through `po events --json`; a fake po on PATH
+# prints fixture JSON, so these tests hold with or without the real command.
+SV="$TMP/serve"
+mkdir -p "$SV/bin" "$SV/repo"
+make_repo "$SV/repo"
+python3 -I - "$SV/events.json" <<'PY'
+import json, sys
+ev = [{"time": "2026-10-23T%02d:00:00Z" % i, "kind": "stamp", "item": "1.%d" % i, "project": "demo",
+       "result": "pass" if i % 4 else "fail",
+       "legs": [{"name": "lint", "result": "pass"}, {"name": "test", "result": "pass" if i % 4 else "fail"}],
+       "agent": "dev%d" % i, "detail": "d%d" % i} for i in range(12)]
+ev[3]["item"] = '<script>alert("x")</script>&'
+ev[4]["agent"] = '"><img src=x>'
+ev[5]["item"] = None
+ev[5]["detail"] = "<b>boom</b>"
+ev[6]["kind"] = "open"
+ev[6]["legs"] = []
+# real po events --json: one object per line, keys in this order
+KEYS = ("time", "kind", "item", "project", "result", "agent", "legs", "detail")
+with open(sys.argv[1], "w") as f:  # oldest first: the viewer must sort newest first
+    for e in ev:
+        f.write(json.dumps({k: e[k] for k in KEYS}, separators=(",", ":")) + "\n")
+PY
+cat >"$SV/bin/po" <<'EOF'
+#!/usr/bin/env bash
+[[ $1 == events && $* == *--json* ]] || { echo "fake po: unexpected: $*" >&2; exit 9; }
+cat "$FAKE_EVENTS"
+EOF
+chmod +x "$SV/bin/po"
+
+# sv_start [po serve args...]: sets SV_URL and SV_PID, or SV_URL empty.
+sv_start() {
+	: >"$SV/out"
+	(cd "$SV/repo" && PATH="$SV/bin:$PATH" FAKE_EVENTS="$SV/events.json" exec "$PO" serve --port 0 "$@" >"$SV/out" 2>"$SV/err") &
+	SV_PID=$!
+	SV_URL=
+	local _
+	for _ in $(seq 1 100); do
+		SV_URL=$(sed -nE 's/^po serve: listening on (http:\/\/[^ ]+)\/$/\1/p' "$SV/out")
+		[[ -n $SV_URL ]] && return
+		kill -0 "$SV_PID" 2>/dev/null || return
+		sleep 0.1
+	done
+}
+sv_stop() { kill "$SV_PID" 2>/dev/null; wait "$SV_PID" 2>/dev/null; }
+# sv_req <method> <path>: first line "<status>", then the body.
+sv_req() {
+	python3 -I - "$1" "$SV_URL$2" <<'PY'
+import sys, urllib.request, urllib.error
+req = urllib.request.Request(sys.argv[2], method=sys.argv[1], data=b"x" if sys.argv[1] in ("POST", "PUT", "PATCH") else None)
+try:
+    r = urllib.request.urlopen(req, timeout=10)
+except urllib.error.HTTPError as e:
+    r = e
+print(r.status)
+sys.stdout.write(r.read().decode())
+PY
+}
+
+sv_start
+if [[ -z $SV_URL ]]; then
+	bad "po serve starts and prints its URL" "$(cat "$SV/out" "$SV/err")"
+else
+	[[ $SV_URL == http://127.0.0.1:* ]] && ok "po serve binds 127.0.0.1 by default" || bad "default bind" "$SV_URL"
+	out=$(sv_req GET /)
+	[[ $(head -1 <<<"$out") == 200 && $(grep -c '<td><time' <<<"$out") == 10 && $(grep -c '^<tr ' <<<"$out") == 10 ]] &&
+		ok "/ shows 10 rows after 12 events" || bad "/ rows" "$out"
+	first=$(grep -m1 '^<tr ' <<<"$out")
+	[[ $first == *1.11* && $first == *dev11* && $first == *demo* && $first == *stamp* && $first == *'class="r-pass"'* ]] &&
+		ok "/ lists item, project, kind, result, agent and time, newest on top" || bad "/ newest row" "$first"
+	[[ $out != *'>1.0<'* && $out != *'>1.1<'* && $out == *'>1.2<'* ]] &&
+		ok "/ drops the two oldest events" || bad "/ cut" "$out"
+	[[ $out == *'onclick="location=&apos;/all&apos;"'* || $out == *"onclick=\"location='/all'\""* ]] &&
+		ok "each / row links to /all" || bad "row link" "$first"
+	out=$(sv_req GET /all)
+	[[ $(head -1 <<<"$out") == 200 && $(grep -c '^<tr ' <<<"$out") == 12 && $(grep -m1 '^<tr ' <<<"$out") == *1.11* && $out == *'<td>lint:pass test:pass</td>'* && $out == *'<td>lint:pass test:fail</td>'* ]] &&
+		ok "/all lists all 12 events, newest on top, with legs" || bad "/all" "$out"
+	out=$(sv_req GET /events.json)
+	[[ $(head -1 <<<"$out") == 200 ]] &&
+		[[ $(tail -n +2 <<<"$out" | python3 -I -c 'import json,sys; d=json.load(sys.stdin); print(len(d), d[0]["item"], d[-1]["item"])') == "12 1.11 1.0" ]] &&
+		ok "/events.json serves all events, newest first" || bad "/events.json" "$out"
+	out=$(sv_req GET /all)
+	[[ $out == *'<script>alert'* ]] && bad "item name reached the page unescaped" "$out" ||
+		{ [[ $out == *'&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;&amp;'* && $out == *'&quot;&gt;&lt;img src=x&gt;'* ]] &&
+			ok "every field is HTML-escaped (names are data, not markup)" || bad "escaping" "$out"; }
+	[[ $out == *'<td>-</td>'* && $out == *'<td>open</td>'* && $out == *'&lt;b&gt;boom&lt;/b&gt;'* && $out != *'<b>boom'* ]] &&
+		ok "item null shows -, kind shows, detail is escaped" || bad "null item, kind, detail" "$out"
+	[[ $out == *'fetch("/events.json"'* && $out == *toLocaleString* && $out == *textContent* ]] &&
+		ok "pages poll /events.json and render times locally with textContent" || bad "page script"
+	for m in POST PUT DELETE PATCH OPTIONS; do
+		out=$(sv_req "$m" /)
+		[[ $(head -1 <<<"$out") == 405 ]] && ok "$m is 405" || bad "$m" "$out"
+	done
+	out=$(sv_req HEAD /)
+	[[ $(head -1 <<<"$out") == 405 ]] && ok "HEAD is 405" || bad "HEAD" "$out"
+	out=$(sv_req GET /nope)
+	[[ $(head -1 <<<"$out") == 404 ]] && ok "an unknown path is 404" || bad "404" "$out"
+	out=$(sv_req GET '/?x=1')
+	[[ $(head -1 <<<"$out") == 200 ]] && ok "a query string is ignored" || bad "query" "$out"
+	sv_stop
+fi
+
+# The viewer is live: a new event shows on the next request without a restart.
+cp "$SV/events.json" "$SV/events-live.json"
+(cd "$SV/repo" && PATH="$SV/bin:$PATH" FAKE_EVENTS="$SV/events-live.json" exec "$PO" serve --port 0 >"$SV/out" 2>"$SV/err") &
+SV_PID=$!
+for _ in $(seq 1 100); do
+	SV_URL=$(sed -nE 's/^po serve: listening on (http:\/\/[^ ]+)\/$/\1/p' "$SV/out")
+	[[ -n $SV_URL ]] && break
+	sleep 0.1
+done
+before=$(sv_req GET /events.json | tail -n +2 | python3 -I -c 'import json,sys; print(len(json.load(sys.stdin)))')
+python3 -I - "$SV/events-live.json" <<'PY'
+import json, sys
+e = {"time": "2026-10-24T00:00:00Z", "kind": "close", "item": "9.9", "project": "demo", "result": "pass", "agent": "x", "legs": [], "detail": ""}
+open(sys.argv[1], "a").write(json.dumps(e) + "\n")
+PY
+out=$(sv_req GET /)
+[[ $before == 12 && $(grep -m1 '^<tr ' <<<"$out") == *9.9* ]] &&
+	ok "a new event shows on the next request, newest on top" || bad "live update" "$out"
+# One JSON object per line is read as well as one array.
+python3 -I - "$SV/events-live.json" <<'PY'
+import json, sys
+d = [json.loads(l) for l in open(sys.argv[1])]
+json.dump(d[:3], open(sys.argv[1], "w"))
+PY
+out=$(sv_req GET /events.json)
+[[ $(tail -n +2 <<<"$out" | python3 -I -c 'import json,sys; print(len(json.load(sys.stdin)))') == 3 ]] &&
+	ok "po events --json as one array is read too" || bad "json lines" "$out"
+printf 'not json\n' >"$SV/events-live.json"
+out=$(sv_req GET /events.json)
+[[ $(head -1 <<<"$out") == 502 && $out == *'not JSON'* ]] && ok "unreadable po events output is a 502, not a crash" || bad "bad json" "$out"
+out=$(sv_req GET /)
+[[ $(head -1 <<<"$out") == 200 && $out == *'id="err">po events --json is not JSON'* ]] && ok "the page shows the error" || bad "page error" "$out"
+sv_stop
+
+# Refusals and usage.
+for a in 0.0.0.0 :: '[::]' 0; do
+	out=$(cd "$SV/repo" && PATH="$SV/bin:$PATH" "$PO" serve --bind "$a" --port 0 2>&1)
+	[[ $? == 1 ]] && grep -q 'refusing to bind' <<<"$out" && ok "--bind $a is refused" || bad "bind $a" "$out"
+done
+sv_start --bind ::1
+if [[ -n $SV_URL ]]; then
+	[[ $SV_URL == 'http://[::1]:'* ]] && [[ $(sv_req GET / | head -1) == 200 ]] && ok "--bind ::1 serves over IPv6" || bad "ipv6 bind" "$SV_URL"
+	sv_stop
+else
+	ok "--bind ::1 skipped: no IPv6 loopback here"
+fi
+expect "serve rejects an unknown argument" 1 "serve: unknown argument" -- -C "$SV/repo" serve --nope
+expect "serve --port needs a value" 1 "needs a value" -- -C "$SV/repo" serve --port
+out=$(cd "$SV/repo" && PATH="$SV/bin:$PATH" "$PO" serve --port 99999 2>&1)
+[[ $? == 1 ]] && ok "an out-of-range port is a usage error" || bad "port range" "$out"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 ((fail == 0))

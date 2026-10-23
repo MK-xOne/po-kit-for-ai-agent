@@ -14,6 +14,39 @@ Unreleased becomes `## Release N (YYYY-MM-DD): <theme>`.
 
 Nothing yet.
 
+## Release 2 (2026-10-23): gate events and a viewer
+
+Items v0.12 and v0.13.
+
+**Agents, in short:** nothing to do; `po stamp`, `po open` and `po close` now log
+each run, and `po events` reads the log. `po serve` is a read-only viewer that
+stays up until stopped: run it only when asked.
+
+**Adopt, in short:** nothing.
+
+### `po events` (v0.12)
+
+- `po stamp` logs every run, passing or failing, and `po open` and
+  `po close` log one event each after a complete `--commit`, as one JSON
+  object per line in `po-events.jsonl` in the common git dir. A log that
+  cannot be written warns and changes nothing else. `po events [--all]
+  [--json]` reads it back, newest first (last 10 by default; local time in
+  the table, UTC in `--json`).
+- **Agents:** none; stamp, open and close log by themselves. `po events`
+  is read-only and free to use.
+- **Adopt:** none.
+
+### `po serve` (v0.13)
+
+- `po serve [--bind <addr>] [--port <n>]` is a read-only web viewer of the
+  gate events: the last 10 at `/`, all at `/all`, JSON at `/events.json`. It
+  reads them only through `po events --json`, refreshes every 5 seconds, and
+  shows times in the browser's local zone. It binds 127.0.0.1:8765 by default
+  and refuses a wildcard address; GET only, every other method is 405.
+- **Agents:** `po serve` is read-only but stays up until stopped, so run it
+  only when asked.
+- **Adopt:** none.
+
 ## Release 1 (2026-10-22): reports, idle time, owners, installs, annotated tags
 
 Items v0.8, v0.9, v0.10, v0.11 and v0.4.1, the rest of the backlog after v0.7.

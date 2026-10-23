@@ -132,4 +132,5 @@ po_cmd_open() {
 	[[ $(git rev-parse "refs/heads/$main") == "$mtip" ]] || po_die "stopped before any write: $main moved since the plan"
 	po_write_admin "$msg" ''
 	po_make_worktree "$version"
+	po_event_log open "$version" pass '' "$title"
 }
