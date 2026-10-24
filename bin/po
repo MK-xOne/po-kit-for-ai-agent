@@ -80,15 +80,18 @@ commands:
                     worktree; without --commit, prints the plan; --for
                     defaults to the [layout] owner_column cell
   close <version> [--next <version> [--next-title <title>] [--for <name>]]
-        [--also-done <version>]... [--body-file <f>] [--commit]
+        [--also-done <version>]... [--body-file <f>] [--run-checklist]
+        [--commit]
                     close a DOING item: fast-forward main, bare tag, the
                     backlog edits as an admin commit (evidence quoted),
                     --next DOING, its worktree and branch removed; without
-                    --commit, prints the plan; a [hooks] on_close command
-                    then runs
+                    --commit, prints the plan; a [close] checklist from
+                    po.toml is printed (--run-checklist: run), then a
+                    [hooks] on_close command runs
   kickoff <version> the item's spec section verbatim, the standing-rules
                     pointer, and every admin/ruling commit on main from the
-                    previous boundary to its founding (read-only)
+                    previous boundary to its founding (read-only); a
+                    [kickoff] preamble from po.toml is printed first
   report [--note <text>]...
                     the item report as one markdown block: files changed,
                     the newest stamp verbatim, the notes numbered as

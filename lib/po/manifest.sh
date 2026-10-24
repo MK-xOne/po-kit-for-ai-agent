@@ -9,6 +9,8 @@
 #     values are shell commands, kept in file order
 #   - `key = "basic string"` or `key = 123`, optionally followed by a
 #     `# comment`; the only escapes are \" and \\
+#   - `key = ["a", "b"]`, a one-line array of basic strings, only for the
+#     keys in PO_ARRAYS; kept as its strings joined by newlines
 # Sections and keys are checked against the schema below: a typo is an
 # error, not a silently ignored setting.
 
@@ -33,6 +35,14 @@ declare -gA PO_SCHEMA=(
 	[docs.decisions]=0
 	[docs.rules]=0
 	[hooks.on_close]=0
+	[kickoff.preamble]=0
+	[close.checklist]=0
+)
+
+# The keys whose value is an array of strings, not a string or an integer.
+declare -gA PO_ARRAYS=(
+	[kickoff.preamble]=1
+	[close.checklist]=1
 )
 
 # Defaults for optional keys the kit reads.
@@ -88,7 +98,12 @@ po_manifest_load() {
 		[[ $section == gate.legs || -n ${PO_SCHEMA[$full]+x} ]] ||
 			po_die "$where: unknown key '$key' in [$section]"
 		[[ -n ${PO_MANIFEST[$full]+x} ]] && po_die "$where: key '$key' in [$section] set twice"
-		if [[ $rest == '"'* ]]; then
+		if [[ -n ${PO_ARRAYS[$full]+x} ]]; then
+			po_manifest_array "$rest" "$where" || exit 2
+			value=$PO_PARSED
+		elif [[ $rest == '['* ]]; then
+			po_die "$where: key '$key' in [$section] is not an array"
+		elif [[ $rest == '"'* ]]; then
 			po_manifest_string "$rest" "$where" || exit 2
 			value=$PO_PARSED
 		elif [[ $rest =~ ^([0-9]+)([[:blank:]]+#.*)?$ ]]; then
@@ -153,6 +168,64 @@ po_manifest_string() {
 			[[ -z $tail || $tail == '#'* ]] ||
 				po_die "$where: unexpected text after string: $tail"
 			PO_PARSED=$out
+			return 0
+		fi
+		out+=$c
+		i=$((i + 1))
+	done
+	po_die "$where: unterminated string"
+}
+
+# po_manifest_array <text> <where>: read `["a", "b"]` (one line, basic
+# strings, optional trailing comment) into PO_PARSED, the strings joined by
+# newlines. `[]` gives an empty PO_PARSED; an empty string is a blank line.
+po_manifest_array() {
+	local text=$1 where=$2 out='' sep='' s
+	[[ $text == '['* ]] || po_die "$where: value must be an array of \"strings\": $text"
+	text=${text:1}
+	text=${text#"${text%%[![:blank:]]*}"}
+	while :; do
+		if [[ $text == ']'* ]]; then
+			text=${text:1}
+			text=${text#"${text%%[![:blank:]]*}"}
+			[[ -z $text || $text == '#'* ]] ||
+				po_die "$where: unexpected text after array: $text"
+			PO_PARSED=$out
+			return 0
+		fi
+		[[ $text == '"'* ]] || po_die "$where: array elements must be \"quoted strings\": $text"
+		po_manifest_string_prefix "$text" "$where" || exit 2
+		s=$PO_PARSED text=$PO_REST
+		out+=$sep$s sep=$'\n'
+		text=${text#"${text%%[![:blank:]]*}"}
+		if [[ $text == ,* ]]; then
+			text=${text:1}
+			text=${text#"${text%%[![:blank:]]*}"}
+			[[ $text != ']'* ]] || po_die "$where: trailing comma in array"
+		elif [[ $text != ']'* ]]; then
+			po_die "$where: expected ',' or ']' in array: $text"
+		fi
+	done
+}
+
+# po_manifest_string_prefix <text> <where>: read one basic string from the
+# start of <text> into PO_PARSED, what follows its closing quote into PO_REST.
+po_manifest_string_prefix() {
+	local text=${1:1} where=$2 out='' c i=0 n
+	n=${#text}
+	while ((i < n)); do
+		c=${text:i:1}
+		if [[ $c == "\\" ]]; then
+			c=${text:i+1:1}
+			case $c in
+			'"' | "\\") out+=$c ;;
+			*) po_die "$where: unsupported escape \\$c in string" ;;
+			esac
+			i=$((i + 2))
+			continue
+		fi
+		if [[ $c == '"' ]]; then
+			PO_PARSED=$out PO_REST=${text:i+1}
 			return 0
 		fi
 		out+=$c

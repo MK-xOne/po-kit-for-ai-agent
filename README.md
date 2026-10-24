@@ -236,6 +236,27 @@ the same from any worktree.
   since its founding. The judgment layer stays the PO's. Exit 2 when a
   source is missing: no spec section (a founding in progress), no
   `[docs] rules`, or one not on main.
+- `[kickoff] preamble` — an optional manifest key, a one-line array of
+  strings (`preamble = ["Run pwd first.", "", "Read the rules."]`; an empty
+  string is a blank line). `po kickoff` prints its lines verbatim at the very
+  top of the brief, then a blank line, so a project's start-of-item steps are
+  part of the prompt. Absent or `[]`, the output is byte-identical to before.
+  A value that is not an array of quoted strings, or any other key under
+  `[kickoff]`, is a manifest error (2); `po doctor` lists the key as
+  `adopt [kickoff] preamble` for a manifest without it.
+- `[close] checklist` — an optional manifest key, a one-line array of strings
+  (`checklist = ["Post the close message.", "Propose the episode."]`), the
+  steps a project wants after every close. After a complete `po close
+  --commit` boundary, before any `[hooks] on_close` command, po prints the
+  lines under a `CHECKLIST` heading. With `--run-checklist` it also runs each
+  non-blank line (`sh -c` in the main worktree, stdin `/dev/null`, output to
+  stderr, `PO_VERSION`, `PO_TAG`, `PO_TITLE` and `PO_REPO` set), every line
+  even if one fails; a failure is a warning and exit 7, the boundary stands.
+  The dry run lists the checklist and runs nothing. Absent or `[]`, `po close`
+  behaves exactly as before (and `--run-checklist` is a usage error without
+  one). A value that is not an array of quoted strings, or any other key under
+  `[close]`, is a manifest error (2); `po doctor` lists the key as
+  `adopt [close] checklist` for a manifest without it.
 - The backlog edits both make are status words only — a spec heading's
   status word, a table row's Status cell, the one status word after the
   item's id in BACKLOG prose (`v1.9.11 parser TODO` → `DOING`; a close
@@ -261,7 +282,7 @@ the same from any worktree.
   interface's. There is no login, so bind only to an address whose reachers you
   trust. It prints `po serve: listening on http://<addr>:<port>/` and runs until
   stopped; `--port 0` picks a free port.
-- `po-dashboard [--url <url>] [--team-url <url>] [--view events|team] [--theme auto|light|dark] [--all] [--size WxH] [--check] [--screenshot <png>] [--screenshot-delay <s>]`
+- `po-dashboard [--url <url>] [--team-url <url>] [--decisions-url <url>] [--view events|team|decisions] [--theme auto|light|dark] [--all] [--size WxH] [--check] [--screenshot <png>] [--screenshot-delay <s>]`
   (`bin/po-dashboard`, not a `po` subcommand) — a desktop window for the same
   events: the last 10 as soft raised single-line cards (result, item, project,
   kind, checks, agent, time in the local zone, note) in fixed columns that line
@@ -293,8 +314,21 @@ the same from any worktree.
   `~/.config`; `PO_DASHBOARD_TEAM_ORDER` names another file), applied on every
   refresh and at start, and `--check` uses it too. Agents not in the saved order
   go last, in the feed's order; a missing or broken file is no order; the feed
-  itself is never written. Esc closes it. `--check` prints the rows the window would show, without a
-  display (`--all` for every event, then the team lines when a team feed is set; exit 2
+  itself is never written.
+  `--decisions-url` or `PO_DASHBOARD_DECISIONS_URL` (no default;
+  `--decisions-url` wins) adds a Decisions view to the same header toggle
+  (Events | Team | Decisions, each shown only when its feed is set): items
+  waiting on a decision, from a JSON array of `{project, item, title,
+  waiting_for, asked_at, thread_url?}`, one line per entry, oldest `asked_at`
+  first (entries without a readable one last). `asked_at` is shown relative
+  ("3h ago"), its local time in the tooltip; `thread_url`, when present, is
+  muted text you can select and copy, never opened from the window. Refreshed
+  with the events; a failed fetch keeps the last decisions data and says so.
+  The view is read-only. The feed is an http(s) URL or a file
+  (`examples/decisions-feed.json` is a sample); `--view decisions` starts in it.
+  Esc closes it. `--check` prints the rows the window would show, without a
+  display (`--all` for every event, then the team lines when a team feed is set, then the
+  decisions lines when a decisions feed is set; exit 2
   when a URL is unreachable);
   `--all` also starts the window with Show all on, `--size WxH` sets its size,
   and `--screenshot` saves the window to a PNG once it has data (after

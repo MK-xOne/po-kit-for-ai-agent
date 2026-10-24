@@ -17,6 +17,7 @@ LAST = 10
 INTERVAL_MS = 5000
 URL_ENV = "PO_DASHBOARD_URL"
 TEAM_URL_ENV = "PO_DASHBOARD_TEAM_URL"
+DECISIONS_URL_ENV = "PO_DASHBOARD_DECISIONS_URL"
 TEAM_ORDER_ENV = "PO_DASHBOARD_TEAM_ORDER"  # the saved order's file, instead of the default under the config dir
 FADE_SECONDS = 60
 FADE_STEPS = 60  # one CSS class per step, po-fade-<n>: n steps of highlight left
@@ -48,8 +49,18 @@ def resolve_team_url(arg, env=None):
 
     Besides http(s), a feed may be a file (file:// or a plain path), for a sample or a snapshot.
     """
+    return resolve_feed_url(arg, TEAM_URL_ENV, env)
+
+
+def resolve_decisions_url(arg, env=None):
+    """--decisions-url wins over the environment; neither is None (no Decisions view, no default address)."""
+    return resolve_feed_url(arg, DECISIONS_URL_ENV, env)
+
+
+def resolve_feed_url(arg, env_name, env=None):
+    """An optional feed: http(s), file:// or a plain path to a file; none is None."""
     env = os.environ if env is None else env
-    url = (arg or env.get(TEAM_URL_ENV) or "").strip()
+    url = (arg or env.get(env_name) or "").strip()
     if not url:
         return None
     parts = urllib.parse.urlsplit(url)
@@ -219,6 +230,81 @@ def team_check_lines(entries):
     return [
         " | ".join((r["agent"] + (" \u00b7 " + r["model"] if r["model"] else ""), r["state"], "now: " + (r["now"] or "-"), "owns: " + (r["owns"] or "-"), "FREE" if r["free"] else ""))
         for r in team_rows(entries)
+    ]
+
+
+# ---- the decisions view ----------------------------------------------------
+
+
+def parse_decisions(text):
+    """The decisions feed: a JSON array of {project, item, title, waiting_for, asked_at, thread_url?}. Raises DashboardError."""
+    text = text.strip()
+    if not text:
+        return []
+    try:
+        data = json.loads(text)
+    except ValueError as e:
+        raise DashboardError("not JSON: %s" % e)
+    if not isinstance(data, list):
+        raise DashboardError("expected a list of decisions")
+    return [e for e in data if isinstance(e, dict)]
+
+
+def parse_time(iso):
+    """An ISO time as an aware datetime (no zone = UTC), or None when it is not one."""
+    if not isinstance(iso, str) or not iso.strip():
+        return None
+    try:
+        d = datetime.datetime.fromisoformat(iso.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=datetime.timezone.utc)
+
+
+def sort_decisions(entries):
+    """Oldest asked first; an entry without a readable asked_at goes last; the sort is stable."""
+    far = datetime.datetime.max.replace(tzinfo=datetime.timezone.utc)
+    return sorted(entries, key=lambda e: parse_time(e.get("asked_at")) or far)
+
+
+def ago(then, now):
+    """How long ago then was, as '5m ago', '3h ago', '2d ago'; under a minute (or ahead) is 'just now'."""
+    secs = int((now - then).total_seconds())
+    if secs < 60:
+        return "just now"
+    for size, unit in ((86400, "d"), (3600, "h"), (60, "m")):
+        if secs >= size:
+            return "%d%s ago" % (secs // size, unit)
+
+
+def decision_row(entry, now=None, tz=None):
+    """One decision as the strings a line shows; asked is relative to now, asked_local the local time."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    asked = parse_time(entry.get("asked_at"))
+    url = entry.get("thread_url")
+    item = entry.get("item")
+    return {
+        "project": str(entry.get("project") or ""),
+        "item": "-" if item in (None, "") else str(item),
+        "title": str(entry.get("title") or ""),
+        "waiting_for": str(entry.get("waiting_for") or "?"),
+        "asked": ago(asked, now) if asked else str(entry.get("asked_at") or "?"),
+        "asked_local": local_time(entry.get("asked_at"), tz) if asked else "",
+        "thread_url": url.strip() if isinstance(url, str) else "",
+    }
+
+
+def decision_rows(entries, now=None, tz=None):
+    return [decision_row(e, now, tz) for e in sort_decisions(entries)]
+
+
+def decision_check_lines(entries, now=None, tz=None):
+    """What the Decisions view would show, one ' | ' line per entry, oldest asked first."""
+    return [
+        " | ".join((r["item"], r["project"], r["title"], "waiting for: " + r["waiting_for"],
+                    "asked " + r["asked"] + (" (%s)" % r["asked_local"] if r["asked_local"] else ""))
+                   + ((r["thread_url"],) if r["thread_url"] else ()))
+        for r in decision_rows(entries, now, tz)
     ]
 
 

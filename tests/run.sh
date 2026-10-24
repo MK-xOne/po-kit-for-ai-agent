@@ -1099,6 +1099,89 @@ mkdir "$B/.wt/item-v1.0.7"
 expect "a taken worktree path is refused" 6 '\.wt/item-v1\.0\.7 already exists' -- -C "$B" --manifest "$BM" open next Seven
 
 
+# [close] checklist (item U).
+CM=$TMP/ck.toml
+ck_manifest() { # <array text>: BM plus [close] checklist = <array text>
+	{ cat "$BM"; printf '\n[close]\nchecklist = %s\n' "$1"; } >"$CM"
+}
+ck_manifest '["Post the close message.", "", "Say \"hi\" # ok"]   # trailing'
+CB=$TMP/c1
+make_brepo "$CB"
+before=$(bsnap "$CB")
+out=$("$PO" -C "$CB" --manifest "$CM" close 1.0.3 2>&1)
+code=$?
+[[ $code == 0 ]] && grep -q '^CHECKLIST (printed after a complete --commit boundary' <<<"$out" &&
+	grep -qx '  Post the close message.' <<<"$out" && grep -qx '  Say "hi" # ok' <<<"$out" &&
+	ok "the dry run lists the checklist and says it runs nothing" || bad "checklist dry run (exit $code)" "$out"
+[[ $(bsnap "$CB") == "$before" ]] && ok "the checklist dry run changes nothing" || bad "checklist dry run wrote"
+out=$("$PO" -C "$CB" --manifest "$CM" close 1.0.3 --commit 2>"$TMP/ck.err")
+code=$?
+[[ $code == 0 ]] && grep -qx 'CHECKLIST' <<<"$out" && grep -qx '  Post the close message.' <<<"$out" &&
+	grep -qx '  Say "hi" # ok' <<<"$out" && ! grep -q 'running checklist' <<<"$out" &&
+	[[ $(sed -n '/^CHECKLIST$/,$p' <<<"$out" | wc -l) == 4 ]] &&
+	ok "close --commit prints the checklist after the boundary and runs nothing without the flag" || bad "checklist print (exit $code)" "$out"
+[[ $(grep -n '^tagged ' <<<"$out" | cut -d: -f1) -lt $(grep -n '^CHECKLIST$' <<<"$out" | cut -d: -f1) ]] &&
+	ok "the checklist comes after the boundary's steps" || bad "checklist order" "$out"
+# Absent or empty: output unchanged.
+CB=$TMP/c2
+make_brepo "$CB"
+base=$("$PO" -C "$CB" --manifest "$BM" close 1.0.3 2>&1)
+ck_manifest '[]'
+out=$("$PO" -C "$CB" --manifest "$CM" close 1.0.3 2>&1)
+[[ $out == "$base" ]] && ! grep -q CHECKLIST <<<"$out" &&
+	ok "an empty checklist leaves the close plan byte-identical" || bad "empty checklist" "$out"
+out=$("$PO" -C "$CB" --manifest "$BM" close 1.0.3 2>&1)
+[[ $out == "$base" ]] && ok "no [close] section: the close plan is unchanged" || bad "no checklist" "$out"
+out=$("$PO" -C "$CB" --manifest "$BM" close 1.0.3 --commit 2>&1)
+! grep -qi checklist <<<"$out" && ok "no [close] section: --commit prints no checklist" || bad "checklist without section" "$out"
+expect "--run-checklist without a checklist is a usage error" 1 'needs a \[close\] checklist' -- -C "$CB" --manifest "$BM" close 1.0.3 --run-checklist
+expect "--run-checklist with an empty checklist is a usage error" 1 'needs a \[close\] checklist' -- -C "$CB" --manifest "$CM" close 1.0.3 --run-checklist
+# --run-checklist: runs every non-blank line, environment set, in the main worktree.
+CKO=$TMP/ck.out
+rm -f "$CKO"
+ck_manifest "[\"printf '%s|%s|%s|' \\\"\$PO_VERSION\\\" \\\"\$PO_TAG\\\" \\\"\$PO_TITLE\\\" >> $CKO; pwd >> $CKO\", \"\", \"echo ck-stdout; cat >> $CKO\"]"
+CB=$TMP/c3
+make_brepo "$CB"
+out=$("$PO" -C "$CB" --manifest "$CM" close 1.0.3 --run-checklist 2>&1)
+code=$?
+[[ $code == 0 && ! -e $CKO ]] && grep -q '^CHECKLIST (printed, then each non-blank line run' <<<"$out" &&
+	ok "the dry run with --run-checklist says it would run, and runs nothing" || bad "checklist run dry (exit $code)" "$out"
+out=$("$PO" -C "$CB" --manifest "$CM" close 1.0.3 --run-checklist --commit 2>"$TMP/ck.err")
+code=$?
+[[ $code == 0 && $(head -1 "$CKO") == "1.0.3|v1.0.3|Third|$CB" ]] &&
+	ok "--run-checklist runs the lines in the main worktree with PO_VERSION, PO_TAG, PO_TITLE" || bad "checklist run (exit $code)" "$(cat "$CKO") / $out"
+grep -qx 'ck-stdout' "$TMP/ck.err" && ! grep -qx 'ck-stdout' <<<"$out" && grep -q '^running checklist: ' <<<"$out" &&
+	[[ $(grep -c '^running checklist: ' <<<"$out") == 2 ]] &&
+	ok "the lines' stdout goes to stderr, blank lines are not run, stdin is /dev/null" || bad "checklist output" "$out / $(cat "$TMP/ck.err")"
+# A failing line: the rest still run, exit 7, the boundary stands, the hook still runs.
+rm -f "$CKO" "$TMP/hook.kept"
+ck_manifest "[\"exit 3\", \"echo second >> $CKO\"]"
+{ cat "$CM"; printf '\n[hooks]\non_close = "echo ran > %s"\n' "$TMP/hook.kept"; } >"$TMP/ck2.toml"
+CB=$TMP/c4
+make_brepo "$CB"
+tip=$(git -C "$CB" rev-parse item-v1.0.3)
+out=$("$PO" -C "$CB" --manifest "$TMP/ck2.toml" close 1.0.3 --run-checklist --commit 2>&1)
+code=$?
+[[ $code == 7 && -f $CKO && -f $TMP/hook.kept ]] && grep -q 'warning: checklist line exited 3: exit 3' <<<"$out" &&
+	grep -q 'warning: 1 checklist line(s) failed; the boundary stands' <<<"$out" &&
+	ok "a failing checklist line is exit 7; later lines and the hook still run" || bad "failing checklist (exit $code)" "$out"
+[[ $(git -C "$CB" rev-parse v1.0.3) == "$tip" && ! -e $CB/.wt/item-v1.0.3 ]] &&
+	ok "after a failing checklist line the boundary stands" || bad "boundary after failing checklist"
+# Malformed.
+ckbad() {
+	printf '[close]\nchecklist = %s\n' "$2" | cat "$BM" - >"$TMP/ckb.toml"
+	expect "$1" 2 "$3" -- -C "$CB" --manifest "$TMP/ckb.toml" status
+}
+ckbad "a checklist that is a string, not an array, is a manifest error" '"one line"' 'value must be an array'
+ckbad "a checklist with an unquoted element is a manifest error" '[one]' 'array elements must be'
+ckbad "a checklist with a missing comma is a manifest error" '["a" "b"]' "expected ',' or ']'"
+ckbad "a checklist with a trailing comma is a manifest error" '["a",]' 'trailing comma'
+ckbad "a checklist with text after the array is a manifest error" '["a"] x' 'unexpected text after array'
+ckbad "a checklist element with a bad escape is a manifest error" '["a\n"]' 'unsupported escape'
+ckbad "a checklist given an integer is a manifest error" '3' 'value must be an array'
+printf '[close]\nother = "x"\n' | cat "$BM" - >"$TMP/ckb.toml"
+expect "an unknown [close] key is a manifest error" 2 "unknown key 'other' in \[close\]" -- -C "$CB" --manifest "$TMP/ckb.toml" status
+
 # ---- kickoff --------------------------------------------------------------
 K=$TMP/kick
 git init -q -b main "$K"
@@ -1298,6 +1381,36 @@ code=$?
 [[ $code == 0 ]] && grep -qx "boundary  (no tag) .. founded DOING at $(git -C "$P" rev-parse --short HEAD)" <<<"$out" &&
 	grep -q "^note      $early mentions v1.0.2 but po cannot read its backlog" <<<"$out" &&
 	ok "an unreadable older backlog is skipped and named" || bad "kickoff prelayout (exit $code)" "$out"
+
+# [kickoff] preamble: lines at the top of the brief.
+base=$("$PO" -C "$K" --manifest "$KM" kickoff 1.0.2 2>&1)
+printf '[kickoff]\n# a comment\npreamble = ["Read the rules first.", "", "Say \\"hi\\" \\\\ ok"]   # trailing\n' >"$TMP/kp.toml"
+cat "$KM" "$TMP/kp.toml" >"$TMP/kp1.toml"
+out=$("$PO" -C "$K" --manifest "$TMP/kp1.toml" kickoff 1.0.2 2>&1)
+code=$?
+want=$'Read the rules first.\n\nSay "hi" \\ ok\n\n'"$base"
+[[ $code == 0 && $out == "$want" ]] &&
+	ok "a kickoff preamble prints its lines, verbatim, at the top, then the unchanged brief" || bad "kickoff preamble (exit $code)" "$out"
+printf '[kickoff]\npreamble = []\n' | cat "$KM" - >"$TMP/kp2.toml"
+out=$("$PO" -C "$K" --manifest "$TMP/kp2.toml" kickoff 1.0.2 2>&1)
+[[ $out == "$base" ]] && ok "an empty preamble array leaves the brief byte-identical" || bad "kickoff empty preamble" "$out"
+kpbad() {
+	printf '[kickoff]\npreamble = %s\n' "$2" | cat "$KM" - >"$TMP/kpb.toml"
+	expect "$1" 2 "$3" -- -C "$K" --manifest "$TMP/kpb.toml" kickoff 1.0.2
+}
+kpbad "a preamble that is a string, not an array, is a manifest error" '"one line"' 'value must be an array'
+kpbad "a preamble with an unquoted element is a manifest error" '[one]' 'array elements must be'
+kpbad "a preamble with an unterminated array is a manifest error" '["a", "b"' 'unterminated string|expected|array elements'
+kpbad "a preamble with a missing comma is a manifest error" '["a" "b"]' "expected ',' or ']'"
+kpbad "a preamble with a trailing comma is a manifest error" '["a",]' 'trailing comma'
+kpbad "a preamble with text after the array is a manifest error" '["a"] x' 'unexpected text after array'
+kpbad "a preamble element with a bad escape is a manifest error" '["a\n"]' 'unsupported escape'
+kpbad "a preamble element unterminated is a manifest error" '["a' 'unterminated string'
+kpbad "a preamble given an integer is a manifest error" '3' 'value must be an array'
+printf '[kickoff]\nother = "x"\n' | cat "$KM" - >"$TMP/kpb.toml"
+expect "an unknown [kickoff] key is a manifest error" 2 "unknown key 'other' in \[kickoff\]" -- -C "$K" --manifest "$TMP/kpb.toml" kickoff 1.0.2
+printf '[gate]\ncommand = ["a"]\n' >"$TMP/kpg.toml"
+expect "an array for a key that is not an array key is a manifest error" 2 'is not an array' -- -C "$K" --manifest "$TMP/kpg.toml" status
 
 # ---- report ---------------------------------------------------------------
 HR=$TMP/report
@@ -1656,6 +1769,10 @@ code=$?
 block() { awk -v p="$1" '$1 == "adopter" { on = ($2 == p) } on' <<<"$out"; }
 block "$KH/ad1" | grep -q '^  adopt  *\[hooks\] on_close$' && block "$KH/ad1" | grep -q '^  adopt  *\[layout\] owner_column$' &&
 	ok "doctor lists the optional keys a manifest does not set" || bad "doctor adopt keys" "$out"
+block "$KH/ad1" | grep -q '^  adopt  *\[kickoff\] preamble$' &&
+	ok "doctor offers [kickoff] preamble to a manifest without it" || bad "doctor kickoff adopt" "$out"
+block "$KH/ad1" | grep -q '^  adopt  *\[close\] checklist$' &&
+	ok "doctor offers [close] checklist to a manifest without it" || bad "doctor close adopt" "$out"
 ! block "$TMP/ad2" | grep -q 'owner_column' && block "$TMP/ad2" | grep -q '^  adopt  *\[hooks\] on_close$' &&
 	ok "a key the manifest sets is not offered" || bad "doctor offered a set key" "$out"
 [[ $(dsnap) == "$before" ]] && ok "doctor is read-only" || bad "doctor wrote something"
@@ -1917,6 +2034,7 @@ out=$(cd "$SV/repo" && PATH="$SV/bin:$PATH" "$PO" serve --port 99999 2>&1)
 DB="$(dirname "$PO")/po-dashboard"
 DBLIB="$(dirname "$PO")/../lib/po"
 export PO_DASHBOARD_TEAM_ORDER="$TMP/no-team-order.json"  # never the tester's own saved order
+unset PO_DASHBOARD_DECISIONS_URL  # never the tester's own decisions feed
 while IFS=$'\t' read -r status name detail; do
 	[[ $status == ok ]] && ok "$name" || bad "$name" "$detail"
 done < <(python3 -B -I - "$DBLIB" <<'PY'
@@ -2069,6 +2187,52 @@ check("dashboard order: Alt+Up on the first line and Alt+Down on the last change
       c.move_agent(["a", "b"], "a", -1) == ["a", "b"] and c.move_agent(["a", "b"], "b", 2) == ["a", "b"])
 check("dashboard order: moving an agent not shown changes nothing", c.move_agent(["a", "b"], "z", 0) == ["a", "b"])
 check("dashboard order: the saved order keeps agents not shown now, after the shown ones", c.merge_team_order(["b", "a"], ["a", "x", "b"]) == ["b", "a", "x"])
+# The Decisions view: the feed option, parsing, oldest asked first, the asked time, the thread URL.
+check("dashboard decisions: --decisions-url wins over the environment", c.resolve_decisions_url("http://a/d", {"PO_DASHBOARD_DECISIONS_URL": "http://b/d"}) == "http://a/d")
+check("dashboard decisions: the environment is used without --decisions-url", c.resolve_decisions_url(None, {"PO_DASHBOARD_DECISIONS_URL": "http://b/d"}) == "http://b/d")
+check("dashboard decisions: no option and no environment is no feed (no default)", c.resolve_decisions_url(None, {}) is None and c.resolve_decisions_url(" ", {"PO_DASHBOARD_DECISIONS_URL": " "}) is None)
+check("dashboard decisions: the team variable is not the decisions variable", c.resolve_decisions_url(None, {"PO_DASHBOARD_TEAM_URL": "http://b/t"}) is None)
+check("dashboard decisions: a file:// feed is accepted", c.resolve_decisions_url("file:///tmp/d.json", {}) == "file:///tmp/d.json")
+try:
+    c.resolve_decisions_url("ftp://h/d", {})
+    check("dashboard decisions: ftp://h/d is refused", False)
+except c.DashboardError:
+    check("dashboard decisions: ftp://h/d is refused", True)
+dec = [{"project": "orchard", "item": "2.3", "title": "Pick a format", "waiting_for": "a ruling", "asked_at": "2026-10-24T09:00:00Z", "thread_url": "https://chat.example.org/t/1"},
+       {"project": "harbor", "item": "0.7", "title": "Accept the screen", "waiting_for": "an acceptance", "asked_at": "2026-10-24T11:30:00Z"},
+       {"project": "orchard", "item": "2.5", "title": "Unblock", "waiting_for": "a block to clear", "asked_at": "2026-10-23T12:00:00Z"}]
+check("dashboard decisions: a feed array is parsed", c.parse_decisions(json.dumps(dec)) == dec)
+check("dashboard decisions: empty input is no decisions", c.parse_decisions(" \n") == [])
+check("dashboard decisions: non-object entries are dropped", len(c.parse_decisions('[1, {"item": "x"}, null]')) == 1)
+for bad_feed, name in (("{not json", "bad JSON"), ('{"item": "x"}', "an object, not a list")):
+    try:
+        c.parse_decisions(bad_feed)
+        check("dashboard decisions: %s is a DashboardError" % name, False)
+    except c.DashboardError:
+        check("dashboard decisions: %s is a DashboardError" % name, True)
+now = datetime.datetime(2026, 10, 24, 12, 0, 0, tzinfo=utc)
+dr = c.decision_rows(dec, now, utc)
+check("dashboard decisions: oldest asked first", [r["item"] for r in dr] == ["2.5", "2.3", "0.7"])
+check("dashboard decisions: zones are compared as instants", [e["item"] for e in c.sort_decisions([{"item": "a", "asked_at": "2026-10-24T10:00:00+02:00"}, {"item": "b", "asked_at": "2026-10-24T09:00:00Z"}])] == ["a", "b"])
+check("dashboard decisions: a missing or unreadable asked_at goes last, in the feed's order",
+      [e["item"] for e in c.sort_decisions([{"item": "x"}, {"item": "y", "asked_at": "soon"}, {"item": "z", "asked_at": "2026-10-24T09:00:00Z"}])] == ["z", "x", "y"])
+check("dashboard decisions: asked_at is shown relative to now", [r["asked"] for r in dr] == ["1d ago", "3h ago", "30m ago"])
+check("dashboard decisions: under a minute, or ahead of the clock, is just now",
+      c.ago(now, now) == "just now" and c.ago(now - datetime.timedelta(seconds=59), now) == "just now" and c.ago(now + datetime.timedelta(hours=1), now) == "just now")
+check("dashboard decisions: the local time is kept for the tooltip", dr[1]["asked_local"] == "2026-10-24 09:00:00" and c.decision_row(dec[0], now, est)["asked_local"] == "2026-10-24 05:00:00")
+check("dashboard decisions: an unreadable asked_at is kept as text", c.decision_row({"asked_at": "soon"}, now)["asked"] == "soon" and c.decision_row({"asked_at": "soon"}, now)["asked_local"] == "")
+check("dashboard decisions: a sparse entry still has a row", c.decision_row({}, now) == {"project": "", "item": "-", "title": "", "waiting_for": "?", "asked": "?", "asked_local": "", "thread_url": ""})
+check("dashboard decisions: thread_url is kept as text, trimmed; absent or not a string is empty",
+      dr[1]["thread_url"] == "https://chat.example.org/t/1" and dr[0]["thread_url"] == "" and c.decision_row({"thread_url": 4}, now)["thread_url"] == ""
+      and c.decision_row({"thread_url": " https://x/t "}, now)["thread_url"] == "https://x/t")
+check("dashboard decisions: markup in a field stays text", c.decision_row({"title": "<b>x</b>"}, now)["title"] == "<b>x</b>")
+check("dashboard decisions: check lines show item project title waiting asked and the URL when there is one",
+      c.decision_check_lines(dec[:2], now, utc) == ["2.3 | orchard | Pick a format | waiting for: a ruling | asked 3h ago (2026-10-24 09:00:00) | https://chat.example.org/t/1",
+                                                   "0.7 | harbor | Accept the screen | waiting for: an acceptance | asked 30m ago (2026-10-24 11:30:00)"])
+check("dashboard decisions: the feed is never changed", [e["item"] for e in dec] == ["2.3", "0.7", "2.5"])
+ex = c.parse_decisions(open(sys.argv[1] + "/../../examples/decisions-feed.json").read())
+check("dashboard decisions: the example feed parses, with and without a thread URL",
+      len(ex) == 3 and all(k in e for e in ex for k in ("project", "item", "title", "waiting_for", "asked_at")) and sorted(bool(r["thread_url"]) for r in c.decision_rows(ex)) == [False, True, True])
 
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -2200,6 +2364,23 @@ out=$(PO_DASHBOARD_TEAM_URL="$TMP/none.json" python3 -B "$DB" --url "$CHK_URL" -
 [[ $out == *'team:'* ]] && ok "po-dashboard --team-url wins over PO_DASHBOARD_TEAM_URL" || bad "dashboard team precedence" "$out"
 out=$(env -u PO_DASHBOARD_TEAM_URL python3 -B "$DB" --url "$CHK_URL" --check 2>&1)
 [[ $out != *'team:'* ]] && ok "po-dashboard --check without a team feed prints no team section" || bad "dashboard no team" "$out"
+# --decisions-url: no default; --check prints the decisions, oldest asked first, after the events (and team).
+printf '[{"project":"harbor","item":"0.7","title":"Accept","waiting_for":"an acceptance","asked_at":"2026-10-24T11:30:00Z"},{"project":"orchard","item":"2.3","title":"Pick","waiting_for":"a ruling","asked_at":"2026-10-24T09:00:00Z","thread_url":"https://chat.example.org/t/1"}]\n' >"$TMP/decisions.json"
+out=$(python3 -B "$DB" --url http://h/x --decisions-url ftp://h/x 2>&1)
+[[ $? == 1 && $out == *'not an http'* ]] && ok "po-dashboard refuses a non-http decisions URL" || bad "dashboard decisions url" "$out"
+out=$(env -u PO_DASHBOARD_DECISIONS_URL python3 -B "$DB" --url http://h/x --view decisions 2>&1)
+[[ $? == 1 && $out == *'--decisions-url'* && $out == *PO_DASHBOARD_DECISIONS_URL* ]] &&
+	ok "po-dashboard --view decisions without a decisions feed is a usage error" || bad "dashboard view decisions" "$out"
+out=$(PO_DASHBOARD_DECISIONS_URL="$TMP/decisions.json" PO_DASHBOARD_TEAM_URL="$TMP/team.json" python3 -B "$DB" --url "$CHK_URL" --check 2>&1)
+[[ $(tail -3 <<<"$out" | head -1) == "decisions:" && $(tail -2 <<<"$out" | head -1) == "2.3 | orchard | Pick | waiting for: a ruling | asked "*" | https://chat.example.org/t/1" &&
+	$(tail -1 <<<"$out") == "0.7 | harbor | Accept | waiting for: an acceptance | asked "* && $out == *'team:'* ]] &&
+	ok "po-dashboard --check lists the decisions, oldest asked first, after the events and the team" || bad "dashboard check decisions" "$out"
+out=$(PO_DASHBOARD_DECISIONS_URL="$TMP/none.json" python3 -B "$DB" --url "$CHK_URL" --decisions-url "$TMP/decisions.json" --check 2>&1)
+[[ $out == *'decisions:'* ]] && ok "po-dashboard --decisions-url wins over PO_DASHBOARD_DECISIONS_URL" || bad "dashboard decisions precedence" "$out"
+out=$(env -u PO_DASHBOARD_DECISIONS_URL python3 -B "$DB" --url "$CHK_URL" --check 2>&1)
+[[ $out != *'decisions:'* ]] && ok "po-dashboard --check without a decisions feed prints no decisions section" || bad "dashboard no decisions" "$out"
+out=$(python3 -B "$DB" --url "$CHK_URL" --decisions-url "http://127.0.0.1:1/" --check 2>&1)
+[[ $? == 2 && $out == *'cannot reach'* ]] && ok "po-dashboard --check with an unreachable decisions feed exits 2" || bad "dashboard check decisions unreachable" "$out"
 kill "$CHK_PID" 2>/dev/null
 wait "$CHK_PID" 2>/dev/null
 out=$(python3 -B "$DB" --url "http://127.0.0.1:1/" --check 2>&1)
@@ -2207,7 +2388,7 @@ out=$(python3 -B "$DB" --url "http://127.0.0.1:1/" --check 2>&1)
 if python3 -c 'import gi; gi.require_version("Gtk", "4.0"); from gi.repository import Gtk' >/dev/null 2>&1; then
 	if [[ -n ${DISPLAY:-}${WAYLAND_DISPLAY:-} ]]; then
 		# UI smoke: the window comes up with data and saves a screenshot.
-		python3 -I - "$SV/events.json" "$TMP/shot.png" "$DB" <<'PY' &&
+		python3 -I - "$SV/events.json" "$TMP/shot.png" "$DB" "$TMP/decisions.json" "$TMP/shot-decisions.png" <<'PY' &&
 import http.server, subprocess, sys, threading
 body = open(sys.argv[1], "rb").read()
 class H(http.server.BaseHTTPRequestHandler):
@@ -2217,9 +2398,11 @@ class H(http.server.BaseHTTPRequestHandler):
 srv = http.server.HTTPServer(("127.0.0.1", 0), H)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 r = subprocess.run([sys.executable, sys.argv[3], "--url", "http://127.0.0.1:%d/" % srv.server_address[1], "--screenshot", sys.argv[2]], timeout=60)
+if r.returncode == 0 and len(sys.argv) > 4:
+    r = subprocess.run([sys.executable, sys.argv[3], "--url", "http://127.0.0.1:%d/" % srv.server_address[1], "--decisions-url", sys.argv[4], "--view", "decisions", "--screenshot", sys.argv[5]], timeout=60)
 sys.exit(r.returncode)
 PY
-			[[ -s $TMP/shot.png ]] && ok "po-dashboard opens, loads events and saves a screenshot" || bad "dashboard ui smoke"
+			[[ -s $TMP/shot.png && -s $TMP/shot-decisions.png ]] && ok "po-dashboard opens, loads events and saves a screenshot, also in the Decisions view" || bad "dashboard ui smoke"
 	else
 		ok "po-dashboard UI smoke skipped: no display"
 	fi

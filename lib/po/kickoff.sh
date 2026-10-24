@@ -22,6 +22,10 @@
 # highest tag below the item's version reachable from it. An item not yet DOING on main is listed to
 # main's tip; an open item also lists what main gained since its founding.
 #
+# An optional [kickoff] preamble = ["line", ...] in po.toml prints its lines,
+# verbatim, at the very top, followed by a blank line; without it the output
+# is exactly what it was.
+#
 # Writes nothing anywhere: no files, no refs, no index. Exit 0, 1 usage,
 # 2 a missing source — no spec section (a founding in progress), no
 # [docs] rules or one that is not on main, an unreadable backlog.
@@ -190,6 +194,9 @@ po_cmd_kickoff() {
 	rules=${PO_MANIFEST[docs.rules]}
 	[[ $(git cat-file -t "$mtip:$rules" 2>/dev/null) == blob ]] ||
 		po_die "[docs] rules '$rules' is not a file on $main"
+
+	# [kickoff] preamble: the project's own lines, first in the brief.
+	[[ -z ${PO_MANIFEST[kickoff.preamble]:-} ]] || printf '%s\n\n' "${PO_MANIFEST[kickoff.preamble]}"
 
 	title=$(po_item_title "$version")
 	says=$(po_item_statuses "$version" | sort -u | paste -sd/ -)

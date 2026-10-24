@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """po-dashboard: a desktop window showing the gate events of a po serve.
 
-    po-dashboard [--url <url>] [--team-url <url>] [--view events|team] [--theme auto|light|dark] [--all] [--size WxH] [--check] [--screenshot <png>] [--screenshot-delay <s>]
+    po-dashboard [--url <url>] [--team-url <url>] [--decisions-url <url>] [--view events|team|decisions] [--theme auto|light|dark] [--all] [--size WxH] [--check] [--screenshot <png>] [--screenshot-delay <s>]
 
 The URL is the events JSON (a JSON array or one object per line, e.g. the
 /events.json of `po serve`); --url or PO_DASHBOARD_URL, no default. GTK 4 and
@@ -9,7 +9,10 @@ PyGObject (pacman -S gtk4 python-gobject); the logic is lib/po/dashboard_core.py
 --team-url or PO_DASHBOARD_TEAM_URL (no default) adds a Team view, a header toggle Events | Team, reading a
 JSON array of {agent, model?, state, now, owns[], free}; without it there is no toggle. Drag a Team line
 (or Alt+Up/Down on a focused one) to reorder; the order is saved in $XDG_CONFIG_HOME/po-dashboard/team-order.json
-(default ~/.config; PO_DASHBOARD_TEAM_ORDER names another file). Esc closes the window. Exit codes: 1 usage, 2 GTK or PyGObject missing
+(default ~/.config; PO_DASHBOARD_TEAM_ORDER names another file).
+--decisions-url or PO_DASHBOARD_DECISIONS_URL (no default) adds a Decisions view to the toggle, read-only:
+a JSON array of {project, item, title, waiting_for, asked_at, thread_url?}, one line per entry, oldest asked
+first, asked_at as "3h ago" (local time in the tooltip), thread_url as copyable muted text. Esc closes the window. Exit codes: 1 usage, 2 GTK or PyGObject missing
 (or, with --check, the feed unreachable).
 """
 import argparse
@@ -44,7 +47,8 @@ def main():
     ap = argparse.ArgumentParser(prog="po-dashboard", add_help=True)
     ap.add_argument("--url", help="events JSON URL (default: $%s)" % core.URL_ENV)
     ap.add_argument("--team-url", help="team feed JSON URL or file (default: $%s; none = no Team view)" % core.TEAM_URL_ENV)
-    ap.add_argument("--view", choices=("events", "team"), default="events", help="the view to start in (team needs a team feed)")
+    ap.add_argument("--decisions-url", help="decisions feed JSON URL or file (default: $%s; none = no Decisions view)" % core.DECISIONS_URL_ENV)
+    ap.add_argument("--view", choices=("events", "team", "decisions"), default="events", help="the view to start in (team and decisions need their feed)")
     ap.add_argument("--theme", choices=("auto", "light", "dark"), default="auto")
     ap.add_argument("--all", action="store_true", help="start with every event shown (Show all on)")
     ap.add_argument("--size", metavar="WxH", default="760x640", help="initial window size (default 760x640)")
@@ -61,10 +65,13 @@ def main():
     try:
         url = core.resolve_url(a.url)
         team_url = core.resolve_team_url(a.team_url)
+        decisions_url = core.resolve_decisions_url(a.decisions_url)
     except core.DashboardError as e:
         die(str(e))
     if a.view == "team" and not team_url:
         die("--view team needs a team feed: pass --team-url or set %s" % core.TEAM_URL_ENV)
+    if a.view == "decisions" and not decisions_url:
+        die("--view decisions needs a decisions feed: pass --decisions-url or set %s" % core.DECISIONS_URL_ENV)
     if a.check:
         try:
             print("\n".join(core.check_lines(core.parse_events(core.fetch(url)), a.all)))
@@ -72,6 +79,9 @@ def main():
                 order = core.load_team_order(core.team_order_path())
                 print("team:")
                 print("\n".join(core.team_check_lines(core.apply_team_order(core.parse_team(core.fetch(team_url)), order))))
+            if decisions_url:
+                print("decisions:")
+                print("\n".join(core.decision_check_lines(core.parse_decisions(core.fetch(decisions_url)))))
         except core.DashboardError as e:
             die(str(e), 2)
         return
@@ -90,9 +100,12 @@ def main():
             self.team_order = core.load_team_order(self.order_path)  # saved agent names, the viewer's own order
             self.team_shown = []  # agent names as the Team view shows them now
             self.team_cards = {}  # agent name -> its card, to keep focus on a moved line
+            self.decisions = []
+            self.decisions_text = None
             self.view = "events"
             self.events_failed = False
             self.team_failed = False
+            self.decisions_failed = False
             self.last_text = None
             self.provider = None
             self.shot_done = False
@@ -118,14 +131,18 @@ def main():
                 self.toggle.set_label("Show last %d" % core.LAST)
             self.toggle.connect("toggled", self.on_toggle)
             header.append(texts)
-            if team_url:
+            self.view_buttons = {}
+            if team_url or decisions_url:
                 views = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, valign=Gtk.Align.CENTER)
-                self.btn_events = Gtk.ToggleButton(label="Events", active=True)
-                self.btn_team = Gtk.ToggleButton(label="Team", group=self.btn_events)
-                for b, name in ((self.btn_events, "events"), (self.btn_team, "team")):
+                shown = [("events", "Events")] + ([("team", "Team")] if team_url else []) + ([("decisions", "Decisions")] if decisions_url else [])
+                first = None
+                for name, text in shown:
+                    b = Gtk.ToggleButton(label=text, active=first is None, group=first)
+                    first = first or b
                     b.add_css_class("po-view")
                     b.connect("toggled", self.on_view, name)
                     views.append(b)
+                    self.view_buttons[name] = b
                 header.append(views)
             header.append(self.toggle)
 
@@ -143,17 +160,26 @@ def main():
             self.stack = Gtk.Stack(vexpand=True)
             self.stack.add_named(scroll, "events")
             self.stack.add_named(team_scroll, "team")
+            self.decisions_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            self.decisions_list.add_css_class("po-list")
+            decisions_scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.AUTOMATIC)
+            decisions_scroll.set_child(self.decisions_list)
+            self.stack.add_named(decisions_scroll, "decisions")
             self.team_error = Gtk.Label(label="", xalign=0, wrap=True, margin_start=36, margin_end=36)
             self.team_error.add_css_class("po-error")
             self.team_error.set_visible(False)
+            self.decisions_error = Gtk.Label(label="", xalign=0, wrap=True, margin_start=36, margin_end=36)
+            self.decisions_error.add_css_class("po-error")
+            self.decisions_error.set_visible(False)
 
             outer.append(header)
             outer.append(self.error)
             outer.append(self.team_error)
+            outer.append(self.decisions_error)
             outer.append(self.stack)
             self.win.set_child(outer)
-            if team_url and a.view == "team":
-                self.btn_team.set_active(True)
+            if a.view in self.view_buttons:
+                self.view_buttons[a.view].set_active(True)
 
             keys = Gtk.EventControllerKey()
             keys.connect("key-pressed", self.on_key)
@@ -223,6 +249,30 @@ def main():
             threading.Thread(target=self.fetch_worker, daemon=True).start()
             if team_url:
                 threading.Thread(target=self.team_worker, daemon=True).start()
+            if decisions_url:
+                threading.Thread(target=self.decisions_worker, daemon=True).start()
+
+        def decisions_worker(self):
+            try:
+                text = core.fetch(decisions_url)
+                GLib.idle_add(self.on_decisions, text, core.parse_decisions(text))
+            except core.DashboardError as e:
+                GLib.idle_add(self.on_decisions_error, str(e))
+
+        def on_decisions_error(self, msg):
+            self.decisions_error.set_text(msg + " (showing the last decisions data)" if self.decisions_text is not None else msg)
+            self.decisions_failed = True
+            self.decisions_error.set_visible(self.view == "decisions")
+            self.show_status()
+            return False
+
+        def on_decisions(self, text, decisions):
+            self.decisions_failed = False
+            self.decisions_error.set_visible(False)
+            self.decisions_text, self.decisions = text, decisions
+            self.redraw_decisions()  # every refresh: the "asked … ago" text moves on with the clock
+            self.show_status()
+            return False
 
         def team_worker(self):
             try:
@@ -248,7 +298,12 @@ def main():
             return False
 
         def show_status(self):
-            if self.view == "team":
+            if self.view == "decisions":
+                if self.decisions_failed:
+                    self.status.set_text("decisions not updated")
+                else:
+                    self.status.set_text("%d waiting" % len(self.decisions) if self.decisions_text is not None else "loading…")
+            elif self.view == "team":
                 if self.team_failed:
                     self.status.set_text("team not updated")
                 else:
@@ -266,10 +321,11 @@ def main():
                 self.born.clear()
                 self.fade_tick()
             self.stack.set_visible_child_name(name)
-            self.title_label.set_text("Team" if name == "team" else "Gate events")
+            self.title_label.set_text({"team": "Team", "decisions": "Decisions"}.get(name, "Gate events"))
             self.toggle.set_visible(name == "events")
             self.error.set_visible(name == "events" and self.events_failed)
             self.team_error.set_visible(name == "team" and self.team_failed)
+            self.decisions_error.set_visible(name == "decisions" and self.decisions_failed)
             self.show_status()
 
         def fetch_worker(self):
@@ -405,6 +461,35 @@ def main():
                     card.append(w)
                 self.team_list.append(card)
                 self.team_cards[r["agent"]] = card
+
+        def redraw_decisions(self):
+            child = self.decisions_list.get_first_child()
+            while child is not None:
+                nxt = child.get_next_sibling()
+                self.decisions_list.remove(child)
+                child = nxt
+            groups = [Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL) for _ in range(4)]
+            for r in core.decision_rows(self.decisions):
+                card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+                card.add_css_class("po-card")
+                top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+                item = self.label(r["item"], "po-text", width_chars=6, max_width_chars=10, ellipsize=3)
+                project = self.label(r["project"], "po-muted", width_chars=8, max_width_chars=20, ellipsize=3)
+                title = self.label(r["title"], "po-text", hexpand=True, ellipsize=3)
+                title.set_tooltip_text(r["title"] or None)
+                waiting = self.label("waiting for " + r["waiting_for"], "po-muted", max_width_chars=24, ellipsize=3)
+                asked = self.label("asked " + r["asked"], "po-muted", width_chars=14, max_width_chars=20, ellipsize=3)
+                asked.set_tooltip_text(r["asked_local"] or None)
+                for w, g in zip((item, project, waiting, asked), groups):
+                    g.add_widget(w)
+                for w in (item, project, title, waiting, asked):
+                    top.append(w)
+                card.append(top)
+                if r["thread_url"]:  # text to copy, never opened from here
+                    url = self.label(r["thread_url"], "po-muted", selectable=True, ellipsize=2)
+                    url.set_tooltip_text(r["thread_url"])
+                    card.append(url)
+                self.decisions_list.append(card)
 
         def make_movable(self, card, agent):
             """Drag the line onto another to take its place; Alt+Up/Down moves the focused line."""

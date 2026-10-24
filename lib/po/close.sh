@@ -17,19 +17,23 @@
 # item's branch and worktree at the admin commit; the closed item's stamp
 # files, worktree (`git worktree remove`, never --force) and branch.
 # A [hooks] on_close command then runs (exit 7 when it fails; the boundary
-# stands). Without --commit the whole plan is printed, admin message included, and
+# stands). An optional [close] checklist = ["line", ...] is printed after a
+# complete --commit boundary (before the hook); with --run-checklist each
+# non-blank line also runs, one `sh -c` each, and a failure is exit 7 once all
+# have run. Without --commit the whole plan is printed, admin message included, and
 # nothing changes. Never pushes.
 
 po_close_usage() {
-	po_usage_die "usage: po close <version> [--next <version> [--next-title <title>] [--for <name>]] [--also-done <version>]... [--body-file <file>] [--commit]"
+	po_usage_die "usage: po close <version> [--next <version> [--next-title <title>] [--for <name>]] [--also-done <version>]... [--body-file <file>] [--run-checklist] [--commit]"
 }
 
 po_cmd_close() {
-	local commit=0 version='' next='' next_title='' for_name='' body_file='' x
+	local commit=0 runlist=0 version='' next='' next_title='' for_name='' body_file='' x
 	local -a also=()
 	while (($# > 0)); do
 		case $1 in
 		--commit) commit=1 ;;
+		--run-checklist) runlist=1 ;;
 		--next | --next-title | --also-done | --for | --body-file)
 			(($# >= 2)) || po_usage_die "close: $1 needs a value"
 			case $1 in
@@ -54,6 +58,7 @@ po_cmd_close() {
 	[[ -z $for_name || -n $next ]] || po_usage_die "close: --for names who the --next item is for; it needs --next"
 	[[ -z $for_name || $for_name != *[$'\t\n\r']* ]] || po_usage_die "close: --for must be one line"
 	[[ -z $next_title ]] || po_check_title "$next_title"
+	((runlist == 0)) || [[ -n ${PO_MANIFEST[close.checklist]:-} ]] || po_usage_die "close: --run-checklist needs a [close] checklist in the manifest"
 	[[ -z $body_file || -f $body_file ]] || po_usage_die "close: --body-file $body_file is not a file"
 	[[ -z $body_file ]] || body_file=$(readlink -f -- "$body_file")
 
@@ -223,6 +228,7 @@ po_cmd_close() {
 		printf '  %s. then run the on_close hook (sh -c in %s, stdin /dev/null, output to stderr); a non-zero exit is a warning and exit 7, the boundary stands\n' $((s++)) "$PO_MAIN_WT"
 		po_close_hook_plan "$hook" "$version" "$tag" "$title" "$tip" "$body_file" "$next"
 	fi
+	[[ -z ${PO_MANIFEST[close.checklist]:-} ]] || po_close_checklist_plan "$runlist"
 	po_print_plan_tail "$msg"
 	if ((commit == 0)); then
 		po_readiness
@@ -271,7 +277,53 @@ po_cmd_close() {
 		fi
 	fi
 	po_event_log close "$version" pass '' "$title"
+	local ckcode=0
+	[[ -z ${PO_MANIFEST[close.checklist]:-} ]] || po_close_checklist "$runlist" "$version" "$tag" "$title" || ckcode=$?
 	[[ -z $hook ]] || po_close_hook "$hook" "$version" "$tag" "$title" "$tip" "$body_file" "$next" "$block"
+	if ((ckcode != 0)); then
+		printf 'po: warning: %s checklist line(s) failed; the boundary stands, nothing is rolled back\n' "$ckcode" >&2
+		exit 7
+	fi
+}
+
+# po_close_checklist_plan <run>: the dry run's listing of the [close] checklist.
+po_close_checklist_plan() {
+	local line
+	if (($1)); then
+		printf '\nCHECKLIST (printed, then each non-blank line run with sh -c in %s, after a complete --commit boundary)\n' "$PO_MAIN_WT"
+	else
+		printf '\nCHECKLIST (printed after a complete --commit boundary; --run-checklist would also run it)\n'
+	fi
+	while IFS= read -r line; do
+		printf '  %s\n' "$line"
+	done <<<"${PO_MANIFEST[close.checklist]}"
+}
+
+# po_close_checklist <run> <version> <tag> <title>: print the [close] checklist;
+# with <run>, run every non-blank line (sh -c in the main worktree, stdin
+# /dev/null, output to stderr, PO_VERSION/PO_TAG/PO_TITLE/PO_REPO set). A failing
+# line does not stop the rest. Returns the number of lines that failed.
+po_close_checklist() {
+	local run=$1 line failed=0 code
+	printf '\nCHECKLIST\n'
+	while IFS= read -r line; do
+		printf '  %s\n' "$line"
+	done <<<"${PO_MANIFEST[close.checklist]}"
+	((run)) || return 0
+	while IFS= read -r line; do
+		[[ -n ${line//[[:space:]]/} ]] || continue
+		printf 'running checklist: %s\n' "$line"
+		code=0
+		(
+			cd "$PO_MAIN_WT" || exit 2
+			exec env PO_VERSION="$2" PO_TAG="$3" PO_TITLE="$4" PO_REPO="$PO_MAIN_WT" sh -c "$line" </dev/null >&2
+		) || code=$?
+		((code == 0)) || {
+			printf 'po: warning: checklist line exited %s: %s\n' "$code" "$line" >&2
+			failed=$((failed + 1))
+		}
+	done <<<"${PO_MANIFEST[close.checklist]}"
+	return "$failed"
 }
 
 # po_close_hook_plan <cmd> <version> <tag> <title> <item-commit> <body-file> <next>:

@@ -14,6 +14,38 @@ Unreleased becomes `## Release N (YYYY-MM-DD): <theme>`.
 
 Nothing yet.
 
+## Release 9 (2026-10-24): manifest-driven briefs and closes, Decisions view
+
+Items v0.20, v0.21, v0.22.
+
+**Agents, in short:** nothing to do; when a project sets `[kickoff] preamble`, it is the first lines of `po kickoff`, and a `[close] checklist` is printed after `po close --commit` (`--run-checklist` runs it).
+
+**Adopt, in short:** optional: `[kickoff] preamble = [...]` and `[close] checklist = [...]` in `po.toml`; `--decisions-url` for the dashboard's Decisions view.
+
+### Dashboard: Decisions view (v0.22, 2026-10-24)
+
+`po-dashboard` gets a third view, **Decisions**, shown in the header toggle only when `--decisions-url` (or `PO_DASHBOARD_DECISIONS_URL`) names a JSON array of `{project, item, title, waiting_for, asked_at, thread_url?}`; there is no default. One line per entry, oldest `asked_at` first (a missing or unreadable one goes last), shown relative with the local time as tooltip; `thread_url` is muted, copyable text, never opened. It refreshes with the events; a failed fetch keeps the last data and says so. Read-only. `--check` prints the entries too; `--view decisions` without a feed exits 1. See `examples/decisions-feed.json`.
+
+**Agents:** nothing to do.
+
+**Adopt:** optional: point `--decisions-url` at a feed of items waiting on a human decision.
+
+### Close: a checklist from the manifest (v0.21, 2026-10-24)
+
+An optional `[close] checklist = ["line", ...]` in `po.toml` (a one-line array of quoted strings, like `[kickoff] preamble`) is printed by `po close --commit` under a `CHECKLIST` heading once the boundary is complete, before any `[hooks] on_close` command. With the new `--run-checklist` flag each non-blank line is also run (`sh -c` in the main worktree, output to stderr; `PO_VERSION`, `PO_TAG`, `PO_TITLE`, `PO_REPO` set); all lines run even if one fails, and a failure is a warning and exit 7 with the boundary standing. The dry run lists the checklist and runs nothing. Without the section, or with `[]`, `po close` is unchanged; `--run-checklist` without one is a usage error. A value that is not an array of quoted strings, or another key under `[close]`, is a manifest error (exit 2). `po doctor` lists the key as available to adopt.
+
+**Agents:** nothing to do unless a project's checklist says so; the PO reads the printed lines after a close.
+
+**Adopt:** optional: add `[close] checklist = [...]` to `po.toml`.
+
+### Kickoff: a preamble from the manifest (v0.20, 2026-10-24)
+
+An optional `[kickoff] preamble = ["line", ...]` in `po.toml` (a one-line array of quoted strings; an empty string is a blank line) is printed by `po kickoff` verbatim at the top of every brief, followed by a blank line, so a project can make its start-of-item steps part of the prompt. Without the section, or with `[]`, the output is byte-identical to before. A value that is not an array of quoted strings, or another key under `[kickoff]`, is a manifest error (exit 2). `po doctor` lists the key as available to adopt.
+
+**Agents:** nothing to do; the preamble, when a project sets one, is the first lines of the brief.
+
+**Adopt:** optional: add `[kickoff] preamble = [...]` to `po.toml`.
+
 ## Release 8 (2026-10-24): reorder the Team view
 
 Item v0.19.
