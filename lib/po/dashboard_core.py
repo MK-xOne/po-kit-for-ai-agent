@@ -15,6 +15,7 @@ import urllib.request
 LAST = 10
 INTERVAL_MS = 5000
 URL_ENV = "PO_DASHBOARD_URL"
+TEAM_URL_ENV = "PO_DASHBOARD_TEAM_URL"
 CUES = {"pass": "✔ pass", "fail": "✘ fail", "skip": "– skip"}  # check, cross, en dash
 
 
@@ -35,6 +36,25 @@ def resolve_url(arg, env=None):
     if parts.scheme not in ("http", "https") or not parts.netloc:
         raise DashboardError("not an http(s) URL: %s" % url)
     return url
+
+
+def resolve_team_url(arg, env=None):
+    """--team-url wins over the environment; neither is None (no team feed, no default address).
+
+    Besides http(s), a feed may be a file (file:// or a plain path), for a sample or a snapshot.
+    """
+    env = os.environ if env is None else env
+    url = (arg or env.get(TEAM_URL_ENV) or "").strip()
+    if not url:
+        return None
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme in ("http", "https") and parts.netloc:
+        return url
+    if parts.scheme == "file" and parts.path:
+        return url
+    if not parts.scheme and os.path.isfile(url):
+        return "file://" + urllib.parse.quote(os.path.abspath(url))
+    raise DashboardError("not an http(s) URL or a file: %s" % url)
 
 
 def fetch(url, timeout=5):
@@ -150,6 +170,51 @@ def check_lines(events, show_all=False, tz=None):
     return [" | ".join((r["item"], r["project"], r["kind"], r["result"], r["agent"], r["time"])) for r in rows(events, show_all, tz)]
 
 
+# ---- the team view ---------------------------------------------------------
+
+
+def parse_team(text):
+    """The team feed: a JSON array of {agent, state, now, owns[], free}. Raises DashboardError."""
+    text = text.strip()
+    if not text:
+        return []
+    try:
+        data = json.loads(text)
+    except ValueError as e:
+        raise DashboardError("not JSON: %s" % e)
+    if not isinstance(data, list):
+        raise DashboardError("expected a list of agents")
+    return [e for e in data if isinstance(e, dict)]
+
+
+def team_row(entry):
+    """One agent as the strings a team line shows; state is shown as given."""
+    state = str(entry.get("state") or "")
+    owns = entry.get("owns")
+    owns = [str(o) for o in owns] if isinstance(owns, list) else []
+    now = entry.get("now")
+    return {
+        "agent": str(entry.get("agent") or "?"),
+        "state": state or "?",
+        "working": state.strip().upper().startswith("WORKING"),
+        "now": "" if now in (None, "") else str(now),
+        "owns": ", ".join(owns),
+        "free": bool(entry.get("free")),
+    }
+
+
+def team_rows(entries):
+    return [team_row(e) for e in entries]
+
+
+def team_check_lines(entries):
+    """What the Team view would show, one ' | ' line per agent."""
+    return [
+        " | ".join((r["agent"], r["state"], "now: " + (r["now"] or "-"), "owns: " + (r["owns"] or "-"), "FREE" if r["free"] else ""))
+        for r in team_rows(entries)
+    ]
+
+
 # ---- the neumorphic style --------------------------------------------------
 # One base colour per variant; surfaces are raised (outer light + dark shadow)
 # or pressed (inset). Text and status colours are checked against the base by
@@ -189,6 +254,13 @@ window.po-dashboard { background-color: %(base)s; color: %(text)s; }
 .po-pass { color: %(pass)s; font-weight: 700; }
 .po-fail { color: %(fail)s; font-weight: 700; }
 .po-skip { color: %(skip)s; font-weight: 700; }
+.po-live { color: %(pass)s; font-weight: 700; }
+.po-free { color: %(pass)s; font-weight: 700; border-radius: 10px; padding: 2px 10px;
+  box-shadow: inset 3px 3px 6px %(dark)s, inset -3px -3px 6px %(light)s; }
+.po-view { background-color: %(base)s; background-image: none; color: %(text)s; border: none; border-radius: 14px;
+  padding: 8px 16px; box-shadow: 4px 4px 8px %(dark)s, -4px -4px 8px %(light)s; }
+.po-view:checked { box-shadow: inset 4px 4px 8px %(dark)s, inset -4px -4px 8px %(light)s; }
+.po-view:focus-visible { outline: 2px solid %(text)s; outline-offset: 2px; }
 """
 
 # (foreground selector, background selector, role): each pair must reach 4.5:1.
@@ -199,6 +271,9 @@ CONTRAST_PAIRS = [
     (".po-pass", ".po-card", "pass status"),
     (".po-fail", ".po-card", "fail status"),
     (".po-skip", ".po-card", "skip status"),
+    (".po-live", ".po-card", "working dot"),
+    (".po-free", ".po-card", "free badge"),
+    (".po-view", ".po-view", "view toggle label"),
     (".po-title", ".po-header", "header title"),
     (".po-status", ".po-header", "header status line"),
     (".po-toggle", ".po-toggle", "toggle label"),

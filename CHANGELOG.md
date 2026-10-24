@@ -14,6 +14,28 @@ Unreleased becomes `## Release N (YYYY-MM-DD): <theme>`.
 
 Nothing yet.
 
+## Release 5 (2026-10-24): dashboard Team view
+
+Item v0.16.
+
+**Agents, in short:** nothing to do.
+
+**Adopt, in short:** optional: point `po-dashboard` at a team feed with `--team-url` or `PO_DASHBOARD_TEAM_URL`.
+
+### Dashboard: Team view (v0.16, 2026-10-24)
+
+- `po-dashboard` gets a second view, toggled from the header (Events | Team),
+  when a team feed is set with `--team-url <url-or-file>` or
+  `PO_DASHBOARD_TEAM_URL` (no default; without it there is no toggle).
+  `--view team` starts in it.
+- The feed is a JSON array of `{agent, state, now, owns[], free}`. Each agent
+  is one neumorphic line: name, state (a live dot when it starts with WORKING,
+  otherwise as given), the item it works on now, the items it owns, and a FREE
+  badge. It refreshes with the events; a failed fetch keeps the last data and
+  says so. `--check` prints the team lines too. `examples/team-feed.json` is a
+  sample.
+- **Agents:** nothing. **Adopt:** the option above.
+
 ## Release 4 (2026-10-24): one line per event, note icon
 
 Item v0.15.

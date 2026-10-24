@@ -261,7 +261,7 @@ the same from any worktree.
   interface's. There is no login, so bind only to an address whose reachers you
   trust. It prints `po serve: listening on http://<addr>:<port>/` and runs until
   stopped; `--port 0` picks a free port.
-- `po-dashboard [--url <url>] [--theme auto|light|dark] [--all] [--size WxH] [--check] [--screenshot <png>]`
+- `po-dashboard [--url <url>] [--team-url <url>] [--view events|team] [--theme auto|light|dark] [--all] [--size WxH] [--check] [--screenshot <png>]`
   (`bin/po-dashboard`, not a `po` subcommand) — a desktop window for the same
   events: the last 10 as soft raised single-line cards (result, item, project,
   kind, checks, agent, time in the local zone, note) in fixed columns that line
@@ -279,8 +279,16 @@ the same from any worktree.
   light or dark variant follows the desktop's setting (`--theme` overrides it).
   Needs GTK 4 and PyGObject (`pacman -S gtk4 python-gobject`; exit 2 without
   them); the logic is `lib/po/dashboard_core.py`, which needs neither.
-  Esc closes it. `--check` prints the rows the window would show, without a
-  display (`--all` for every event; exit 2 when the URL is unreachable);
+  `--team-url` or `PO_DASHBOARD_TEAM_URL` (no default; `--team-url` wins) adds a
+  Team view, a header toggle Events | Team: one line per agent from a JSON
+  array of `{agent, state, now, owns[], free}` (name, `state` as given with a
+  live dot when it starts with WORKING, the `now` item, the `owns` items, a FREE
+  badge when `free`), refreshed with the events; a failed fetch keeps the last
+  team data and says so. The feed is an http(s) URL or a file
+  (`examples/team-feed.json` is a sample); without the option there is no
+  toggle; `--view team` starts in it. Esc closes it. `--check` prints the rows the window would show, without a
+  display (`--all` for every event, then the team lines when a team feed is set; exit 2
+  when a URL is unreachable);
   `--all` also starts the window with Show all on, `--size WxH` sets its size,
   and `--screenshot` saves the window to a PNG once it has data, then quits.
 - `po version` — the tag this po-kit checkout is at (`git describe --tags

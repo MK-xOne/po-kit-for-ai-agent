@@ -1996,6 +1996,38 @@ for bad_url in ("file:///etc/passwd", "ftp://h/x", "notaurl"):
     except c.DashboardError:
         check("dashboard: %s is refused" % bad_url, True)
 
+# The team view: feed parsing and the URL option/environment precedence.
+team = [{"agent": "ada", "state": "WORKING", "now": "1.4", "owns": ["1.4", "1.5"], "free": False},
+        {"agent": "bo", "state": "idle 22m", "now": None, "owns": [], "free": True}]
+check("dashboard team: --team-url wins over the environment", c.resolve_team_url("http://a/t", {"PO_DASHBOARD_TEAM_URL": "http://b/t"}) == "http://a/t")
+check("dashboard team: the environment is used without --team-url", c.resolve_team_url(None, {"PO_DASHBOARD_TEAM_URL": "http://b/t"}) == "http://b/t")
+check("dashboard team: no option and no environment is no feed", c.resolve_team_url(None, {}) is None and c.resolve_team_url(" ", {"PO_DASHBOARD_TEAM_URL": " "}) is None)
+check("dashboard team: a file:// feed is accepted", c.resolve_team_url("file:///tmp/t.json", {}) == "file:///tmp/t.json")
+for bad_url in ("ftp://h/x", "no-such-file.json"):
+    try:
+        c.resolve_team_url(bad_url, {})
+        check("dashboard team: %s is refused" % bad_url, False)
+    except c.DashboardError:
+        check("dashboard team: %s is refused" % bad_url, True)
+check("dashboard team: the events variable is not the team variable", c.resolve_team_url(None, {"PO_DASHBOARD_URL": "http://b/e"}) is None)
+check("dashboard team: a feed array is parsed", c.parse_team(json.dumps(team)) == team)
+check("dashboard team: empty input is no agents", c.parse_team(" \n") == [])
+check("dashboard team: non-object entries are dropped", len(c.parse_team('[1, {"agent": "x"}, null]')) == 1)
+for bad_feed, name in (("{not json", "bad JSON"), ('{"agent": "x"}', "an object instead of an array")):
+    try:
+        c.parse_team(bad_feed)
+        check("dashboard team: %s is a DashboardError" % name, False)
+    except c.DashboardError:
+        check("dashboard team: %s is a DashboardError" % name, True)
+tr = c.team_rows(team)
+check("dashboard team: WORKING is working, idle is not", tr[0]["working"] and not tr[1]["working"])
+check("dashboard team: state is shown as given", tr[1]["state"] == "idle 22m")
+check("dashboard team: owns are joined, none is empty", tr[0]["owns"] == "1.4, 1.5" and tr[1]["owns"] == "")
+check("dashboard team: a null now is empty", tr[1]["now"] == "" and tr[0]["now"] == "1.4")
+check("dashboard team: free sets the badge", tr[1]["free"] and not tr[0]["free"])
+check("dashboard team: a sparse entry still has a row", c.team_row({})["agent"] == "?" and c.team_row({})["state"] == "?")
+check("dashboard team: check lines show name state now owns and FREE", c.team_check_lines(team) == ["ada | WORKING | now: 1.4 | owns: 1.4, 1.5 | ", "bo | idle 22m | now: - | owns: - | FREE"])
+
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/ok":
@@ -2052,6 +2084,10 @@ out=$(python3 -B "$DB" --theme neon --url http://h/x 2>&1)
 [[ $? == 2 && $out == *'--theme'* ]] && ok "po-dashboard rejects an unknown theme" || bad "dashboard theme" "$out"
 out=$(python3 -B "$DB" --size 10x10 --url http://h/x 2>&1)
 [[ $? == 2 && $out == *'--size'* ]] && ok "po-dashboard rejects a window size below 200" || bad "dashboard size" "$out"
+# --team-url: a bad value is a usage error; --check prints the team lines after the events.
+out=$(python3 -B "$DB" --url http://h/x --team-url ftp://h/x 2>&1)
+[[ $? == 1 && $out == *'not an http'* ]] && ok "po-dashboard refuses a non-http team URL" || bad "dashboard team url" "$out"
+printf '[{"agent":"ada","state":"WORKING","now":"1.4","owns":["1.4"],"free":false},{"agent":"cy","state":"idle 3h","now":null,"owns":[],"free":true}]\n' >"$TMP/team.json"
 # --check prints the rows without a display (and needs no GTK).
 python3 -I - "$SV/events.json" "$TMP/chk.port" <<'PY' &
 import http.server, sys, threading, time
@@ -2067,11 +2103,18 @@ PY
 CHK_PID=$!
 for _ in $(seq 1 50); do [[ -s $TMP/chk.port ]] && break; sleep 0.1; done
 CHK_URL="http://127.0.0.1:$(cat "$TMP/chk.port")/"
-out=$(python3 -B "$DB" --url "$CHK_URL" --check 2>&1)
+out=$(env -u PO_DASHBOARD_TEAM_URL python3 -B "$DB" --url "$CHK_URL" --check 2>&1)
 [[ $(wc -l <<<"$out") == 10 ]] &&
 	[[ $(head -1 <<<"$out") == "1.11 | demo | stamp | "* ]] && ok "po-dashboard --check prints the last 10 rows, newest first" || bad "dashboard check" "$out"
 out=$(python3 -B "$DB" --url "$CHK_URL" --check --all 2>&1)
 [[ $(wc -l <<<"$out") == 12 ]] && ok "po-dashboard --check --all prints every event" || bad "dashboard check all" "$out"
+out=$(PO_DASHBOARD_TEAM_URL="$TMP/team.json" python3 -B "$DB" --url "$CHK_URL" --check 2>&1)
+[[ $(tail -2 <<<"$out" | head -1) == "ada | WORKING | now: 1.4 | owns: 1.4 | " && $(tail -1 <<<"$out") == "cy | idle 3h | now: - | owns: - | FREE" ]] &&
+	ok "po-dashboard --check lists the team after the events when a team feed is set" || bad "dashboard check team" "$out"
+out=$(PO_DASHBOARD_TEAM_URL="$TMP/none.json" python3 -B "$DB" --url "$CHK_URL" --team-url "$TMP/team.json" --check 2>&1)
+[[ $out == *'team:'* ]] && ok "po-dashboard --team-url wins over PO_DASHBOARD_TEAM_URL" || bad "dashboard team precedence" "$out"
+out=$(env -u PO_DASHBOARD_TEAM_URL python3 -B "$DB" --url "$CHK_URL" --check 2>&1)
+[[ $out != *'team:'* ]] && ok "po-dashboard --check without a team feed prints no team section" || bad "dashboard no team" "$out"
 kill "$CHK_PID" 2>/dev/null
 wait "$CHK_PID" 2>/dev/null
 out=$(python3 -B "$DB" --url "http://127.0.0.1:1/" --check 2>&1)

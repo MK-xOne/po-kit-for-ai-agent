@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """po-dashboard: a desktop window showing the gate events of a po serve.
 
-    po-dashboard [--url <url>] [--theme auto|light|dark] [--all] [--size WxH] [--check] [--screenshot <png>]
+    po-dashboard [--url <url>] [--team-url <url>] [--view events|team] [--theme auto|light|dark] [--all] [--size WxH] [--check] [--screenshot <png>]
 
 The URL is the events JSON (a JSON array or one object per line, e.g. the
 /events.json of `po serve`); --url or PO_DASHBOARD_URL, no default. GTK 4 and
 PyGObject (pacman -S gtk4 python-gobject); the logic is lib/po/dashboard_core.py.
-Esc closes the window. Exit codes: 1 usage, 2 GTK or PyGObject missing
+--team-url or PO_DASHBOARD_TEAM_URL (no default) adds a Team view, a header toggle Events | Team, reading a
+JSON array of {agent, state, now, owns[], free}; without it there is no toggle. Esc closes the window. Exit codes: 1 usage, 2 GTK or PyGObject missing
 (or, with --check, the feed unreachable).
 """
 import argparse
@@ -39,6 +40,8 @@ def load_gtk():
 def main():
     ap = argparse.ArgumentParser(prog="po-dashboard", add_help=True)
     ap.add_argument("--url", help="events JSON URL (default: $%s)" % core.URL_ENV)
+    ap.add_argument("--team-url", help="team feed JSON URL or file (default: $%s; none = no Team view)" % core.TEAM_URL_ENV)
+    ap.add_argument("--view", choices=("events", "team"), default="events", help="the view to start in (team needs a team feed)")
     ap.add_argument("--theme", choices=("auto", "light", "dark"), default="auto")
     ap.add_argument("--all", action="store_true", help="start with every event shown (Show all on)")
     ap.add_argument("--size", metavar="WxH", default="760x640", help="initial window size (default 760x640)")
@@ -53,11 +56,17 @@ def main():
         ap.error("--size must be WxH, both at least 200")
     try:
         url = core.resolve_url(a.url)
+        team_url = core.resolve_team_url(a.team_url)
     except core.DashboardError as e:
         die(str(e))
+    if a.view == "team" and not team_url:
+        die("--view team needs a team feed: pass --team-url or set %s" % core.TEAM_URL_ENV)
     if a.check:
         try:
             print("\n".join(core.check_lines(core.parse_events(core.fetch(url)), a.all)))
+            if team_url:
+                print("team:")
+                print("\n".join(core.team_check_lines(core.parse_team(core.fetch(team_url)))))
         except core.DashboardError as e:
             die(str(e), 2)
         return
@@ -67,6 +76,11 @@ def main():
         def __init__(self, app):
             self.show_all = a.all
             self.events = []
+            self.team = []
+            self.team_text = None
+            self.view = "events"
+            self.events_failed = False
+            self.team_failed = False
             self.last_text = None
             self.provider = None
             self.shot_done = False
@@ -78,7 +92,7 @@ def main():
             header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
             header.add_css_class("po-header")
             texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
-            title = Gtk.Label(label="Gate events", xalign=0)
+            title = self.title_label = Gtk.Label(label="Gate events", xalign=0)
             title.add_css_class("po-title")
             self.status = Gtk.Label(label="loading…", xalign=0)
             self.status.add_css_class("po-status")
@@ -92,6 +106,15 @@ def main():
                 self.toggle.set_label("Show last %d" % core.LAST)
             self.toggle.connect("toggled", self.on_toggle)
             header.append(texts)
+            if team_url:
+                views = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, valign=Gtk.Align.CENTER)
+                self.btn_events = Gtk.ToggleButton(label="Events", active=True)
+                self.btn_team = Gtk.ToggleButton(label="Team", group=self.btn_events)
+                for b, name in ((self.btn_events, "events"), (self.btn_team, "team")):
+                    b.add_css_class("po-view")
+                    b.connect("toggled", self.on_view, name)
+                    views.append(b)
+                header.append(views)
             header.append(self.toggle)
 
             self.error = Gtk.Label(label="", xalign=0, wrap=True, margin_start=36, margin_end=36)
@@ -101,11 +124,24 @@ def main():
             self.list.add_css_class("po-list")
             scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.AUTOMATIC)
             scroll.set_child(self.list)
+            self.team_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            self.team_list.add_css_class("po-list")
+            team_scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.AUTOMATIC)
+            team_scroll.set_child(self.team_list)
+            self.stack = Gtk.Stack(vexpand=True)
+            self.stack.add_named(scroll, "events")
+            self.stack.add_named(team_scroll, "team")
+            self.team_error = Gtk.Label(label="", xalign=0, wrap=True, margin_start=36, margin_end=36)
+            self.team_error.add_css_class("po-error")
+            self.team_error.set_visible(False)
 
             outer.append(header)
             outer.append(self.error)
-            outer.append(scroll)
+            outer.append(self.team_error)
+            outer.append(self.stack)
             self.win.set_child(outer)
+            if team_url and a.view == "team":
+                self.btn_team.set_active(True)
 
             keys = Gtk.EventControllerKey()
             keys.connect("key-pressed", self.on_key)
@@ -153,6 +189,53 @@ def main():
 
         def refresh(self):
             threading.Thread(target=self.fetch_worker, daemon=True).start()
+            if team_url:
+                threading.Thread(target=self.team_worker, daemon=True).start()
+
+        def team_worker(self):
+            try:
+                text = core.fetch(team_url)
+                GLib.idle_add(self.on_team, text, core.parse_team(text))
+            except core.DashboardError as e:
+                GLib.idle_add(self.on_team_error, str(e))
+
+        def on_team_error(self, msg):
+            self.team_error.set_text(msg + " (showing the last team data)" if self.team_text is not None else msg)
+            self.team_failed = True
+            self.team_error.set_visible(self.view == "team")
+            self.show_status()
+            return False
+
+        def on_team(self, text, team):
+            self.team_failed = False
+            self.team_error.set_visible(False)
+            if text != self.team_text:
+                self.team_text, self.team = text, team
+                self.redraw_team()
+            self.show_status()
+            return False
+
+        def show_status(self):
+            if self.view == "team":
+                if self.team_failed:
+                    self.status.set_text("team not updated")
+                else:
+                    self.status.set_text("%d agents" % len(self.team) if self.team_text is not None else "loading…")
+            elif self.events_failed:
+                self.status.set_text("not updated")
+            else:
+                self.status.set_text("%d events · %s" % (len(self.events), "all" if self.show_all else "last %d" % core.LAST))
+
+        def on_view(self, button, name):
+            if not button.get_active():
+                return
+            self.view = name
+            self.stack.set_visible_child_name(name)
+            self.title_label.set_text("Team" if name == "team" else "Gate events")
+            self.toggle.set_visible(name == "events")
+            self.error.set_visible(name == "events" and self.events_failed)
+            self.team_error.set_visible(name == "team" and self.team_failed)
+            self.show_status()
 
         def fetch_worker(self):
             try:
@@ -164,16 +247,18 @@ def main():
 
         def on_error(self, msg):
             self.error.set_text(msg + " (showing the last data)" if self.events else msg)
-            self.error.set_visible(True)
-            self.status.set_text("not updated")
+            self.events_failed = True
+            self.error.set_visible(self.view == "events")
+            self.show_status()
             return False
 
         def on_data(self, text, events):
+            self.events_failed = False
             self.error.set_visible(False)
             if text != self.last_text:
                 self.last_text, self.events = text, events
                 self.redraw()
-            self.status.set_text("%d events · %s" % (len(self.events), "all" if self.show_all else "last %d" % core.LAST))
+            self.show_status()
             if a.screenshot and not self.shot_done:
                 self.shot_done = True
                 GLib.timeout_add(600, self.screenshot)
@@ -189,7 +274,7 @@ def main():
             self.show_all = button.get_active()
             button.set_label("Show last %d" % core.LAST if self.show_all else "Show all")
             self.redraw()
-            self.status.set_text("%d events · %s" % (len(self.events), "all" if self.show_all else "last %d" % core.LAST))
+            self.show_status()
 
         # -- drawing --
         def label(self, text, *classes, **kw):
@@ -236,6 +321,35 @@ def main():
                 slot.set_size_request(24, -1)
                 card.append(slot)
                 self.list.append(card)
+
+        def redraw_team(self):
+            child = self.team_list.get_first_child()
+            while child is not None:
+                nxt = child.get_next_sibling()
+                self.team_list.remove(child)
+                child = nxt
+            groups = [Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL) for _ in range(4)]
+            for r in core.team_rows(self.team):
+                card = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+                card.add_css_class("po-card")
+                name = self.label(r["agent"], "po-text", width_chars=10, max_width_chars=16, ellipsize=3)
+                state = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                if r["working"]:
+                    state.append(self.label("\u25cf", "po-live"))
+                    state.append(self.label(r["state"], "po-live", ellipsize=3, max_width_chars=24))
+                else:
+                    state.append(self.label(r["state"], "po-muted", ellipsize=3, max_width_chars=24))
+                now = self.label(("now " + r["now"]) if r["now"] else "", "po-text", width_chars=10, max_width_chars=16, ellipsize=3)
+                owns = self.label(("owns " + r["owns"]) if r["owns"] else "owns nothing", "po-muted", hexpand=True, ellipsize=3)
+                owns.set_tooltip_text(r["owns"])
+                badge = Gtk.Box(halign=Gtk.Align.END)
+                if r["free"]:
+                    badge.append(self.label("FREE", "po-free"))
+                for w, g in zip((name, state, now, badge), groups):
+                    g.add_widget(w)
+                for w in (name, state, now, owns, badge):
+                    card.append(w)
+                self.team_list.append(card)
 
         def screenshot(self):
             w, h = self.win.get_width(), self.win.get_height()

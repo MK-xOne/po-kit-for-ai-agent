@@ -21,7 +21,7 @@ every backlog status; **devs** each work one item in its own worktree.
   `--all`, `--json`), `po serve [--bind <addr>] [--port <n>]` (a read-only web
   viewer of those events, loopback by default; run it only when asked, it stays
   up until stopped; `po-dashboard --url <events url>` is the same as a desktop
-  window, also only when asked), `po version` (the installed tag), `po doctor` (does
+  window, also only when asked; `--team-url <feed>` or `PO_DASHBOARD_TEAM_URL` adds its Team view), `po version` (the installed tag), `po doctor` (does
   every adopter's manifest still work under the installed po, and which optional
   keys could it adopt).
 - **The PO's only:** `po open`, `po close`, `po prune` with `--commit`, and every
