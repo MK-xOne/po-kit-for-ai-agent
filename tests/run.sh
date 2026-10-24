@@ -2027,6 +2027,12 @@ check("dashboard team: a null now is empty", tr[1]["now"] == "" and tr[0]["now"]
 check("dashboard team: free sets the badge", tr[1]["free"] and not tr[0]["free"])
 check("dashboard team: a sparse entry still has a row", c.team_row({})["agent"] == "?" and c.team_row({})["state"] == "?")
 check("dashboard team: check lines show name state now owns and FREE", c.team_check_lines(team) == ["ada | WORKING | now: 1.4 | owns: 1.4, 1.5 | ", "bo | idle 22m | now: - | owns: - | FREE"])
+mt = c.team_rows([{"agent": "ada", "model": " Big Model (API) ", "state": "WORKING"}, {"agent": "bo", "state": "idle"}, {"agent": "cy", "model": None}, {"agent": "di", "model": 4}])
+check("dashboard team: a model string is kept, trimmed", mt[0]["model"] == "Big Model (API)")
+check("dashboard team: an absent, null or non-string model is empty", mt[1]["model"] == "" and mt[2]["model"] == "" and mt[3]["model"] == "")
+check("dashboard team: a check line shows the model after the name", c.team_check_lines([{"agent": "ada", "model": "Big Model (API)", "state": "WORKING", "now": "1.4", "owns": ["1.4"]}]) == ["ada \u00b7 Big Model (API) | WORKING | now: 1.4 | owns: 1.4 | "])
+check("dashboard team: a check line without a model is unchanged", c.team_check_lines([{"agent": "bo", "model": "", "state": "idle 22m", "free": True}]) == ["bo | idle 22m | now: - | owns: - | FREE"])
+check("dashboard team: the example feed parses, with and without a model", [r["model"] != "" for r in c.team_rows(c.parse_team(open(sys.argv[1] + "/../../examples/team-feed.json").read()))] == [True, True, False])
 
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):

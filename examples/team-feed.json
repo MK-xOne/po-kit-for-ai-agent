@@ -1,5 +1,5 @@
 [
-  {"agent": "ada", "state": "WORKING", "now": "1.4", "owns": ["1.4"], "free": false},
-  {"agent": "bo", "state": "idle 22m", "now": null, "owns": ["1.5", "1.6"], "free": false},
+  {"agent": "ada", "model": "Big Model (API)", "state": "WORKING", "now": "1.4", "owns": ["1.4"], "free": false},
+  {"agent": "bo", "model": "small-model (local GPU)", "state": "idle 22m", "now": null, "owns": ["1.5", "1.6"], "free": false},
   {"agent": "cy", "state": "idle 3h", "now": null, "owns": [], "free": true}
 ]

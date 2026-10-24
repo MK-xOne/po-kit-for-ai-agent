@@ -14,6 +14,22 @@ Unreleased becomes `## Release N (YYYY-MM-DD): <theme>`.
 
 Nothing yet.
 
+## Release 7 (2026-10-24): model in the Team view
+
+Item v0.18.
+
+**Agents, in short:** nothing to do.
+
+**Adopt, in short:** optional: add a `model` string to the team feed rows.
+
+### Dashboard: model in the Team view (v0.18, 2026-10-24)
+
+The team feed's rows gain an optional `model` string (a short label such as "Big Model (API)"). `po-dashboard` shows it on each agent's line, after the name, in the muted text style, and shows nothing when it is absent or not a string. `--check` lines show `name · model`. Feed shape is now `{agent, model?, state, now, owns[], free}`; `examples/team-feed.json` and the README are updated.
+
+**Agents:** nothing to do.
+
+**Adopt:** optional: have the team feed serve `model`.
+
 ## Release 6 (2026-10-24): new events fade in
 
 Item v0.17.

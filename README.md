@@ -281,7 +281,8 @@ the same from any worktree.
   them); the logic is `lib/po/dashboard_core.py`, which needs neither.
   `--team-url` or `PO_DASHBOARD_TEAM_URL` (no default; `--team-url` wins) adds a
   Team view, a header toggle Events | Team: one line per agent from a JSON
-  array of `{agent, state, now, owns[], free}` (name, `state` as given with a
+  array of `{agent, model?, state, now, owns[], free}` (name, then the optional
+  `model` string in muted text, nothing when absent; `state` as given with a
   live dot when it starts with WORKING, the `now` item, the `owns` items, a FREE
   badge when `free`), refreshed with the events; a failed fetch keeps the last
   team data and says so. The feed is an http(s) URL or a file

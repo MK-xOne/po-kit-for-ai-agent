@@ -7,7 +7,7 @@ The URL is the events JSON (a JSON array or one object per line, e.g. the
 /events.json of `po serve`); --url or PO_DASHBOARD_URL, no default. GTK 4 and
 PyGObject (pacman -S gtk4 python-gobject); the logic is lib/po/dashboard_core.py.
 --team-url or PO_DASHBOARD_TEAM_URL (no default) adds a Team view, a header toggle Events | Team, reading a
-JSON array of {agent, state, now, owns[], free}; without it there is no toggle. Esc closes the window. Exit codes: 1 usage, 2 GTK or PyGObject missing
+JSON array of {agent, model?, state, now, owns[], free}; without it there is no toggle. Esc closes the window. Exit codes: 1 usage, 2 GTK or PyGObject missing
 (or, with --check, the feed unreachable).
 """
 import argparse
@@ -367,11 +367,15 @@ def main():
                 nxt = child.get_next_sibling()
                 self.team_list.remove(child)
                 child = nxt
-            groups = [Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL) for _ in range(4)]
-            for r in core.team_rows(self.team):
+            groups = [Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL) for _ in range(5)]
+            rows = core.team_rows(self.team)
+            any_model = any(r["model"] for r in rows)
+            for r in rows:
                 card = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
                 card.add_css_class("po-card")
                 name = self.label(r["agent"], "po-text", width_chars=10, max_width_chars=16, ellipsize=3)
+                model = self.label(r["model"], "po-muted", max_width_chars=28, ellipsize=3)
+                model.set_tooltip_text(r["model"] or None)
                 state = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
                 if r["working"]:
                     state.append(self.label("\u25cf", "po-live"))
@@ -384,9 +388,9 @@ def main():
                 badge = Gtk.Box(halign=Gtk.Align.END)
                 if r["free"]:
                     badge.append(self.label("FREE", "po-free"))
-                for w, g in zip((name, state, now, badge), groups):
+                for w, g in zip((name, model, state, now, badge), groups):
                     g.add_widget(w)
-                for w in (name, state, now, owns, badge):
+                for w in (name, model, state, now, owns, badge) if any_model else (name, state, now, owns, badge):
                     card.append(w)
                 self.team_list.append(card)
 

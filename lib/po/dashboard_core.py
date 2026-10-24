@@ -178,7 +178,7 @@ def check_lines(events, show_all=False, tz=None):
 
 
 def parse_team(text):
-    """The team feed: a JSON array of {agent, state, now, owns[], free}. Raises DashboardError."""
+    """The team feed: a JSON array of {agent, model?, state, now, owns[], free}. Raises DashboardError."""
     text = text.strip()
     if not text:
         return []
@@ -197,8 +197,10 @@ def team_row(entry):
     owns = entry.get("owns")
     owns = [str(o) for o in owns] if isinstance(owns, list) else []
     now = entry.get("now")
+    model = entry.get("model")
     return {
         "agent": str(entry.get("agent") or "?"),
+        "model": model.strip() if isinstance(model, str) else "",
         "state": state or "?",
         "working": state.strip().upper().startswith("WORKING"),
         "now": "" if now in (None, "") else str(now),
@@ -212,9 +214,9 @@ def team_rows(entries):
 
 
 def team_check_lines(entries):
-    """What the Team view would show, one ' | ' line per agent."""
+    """What the Team view would show, one ' | ' line per agent; a model follows the name after ' · '."""
     return [
-        " | ".join((r["agent"], r["state"], "now: " + (r["now"] or "-"), "owns: " + (r["owns"] or "-"), "FREE" if r["free"] else ""))
+        " | ".join((r["agent"] + (" \u00b7 " + r["model"] if r["model"] else ""), r["state"], "now: " + (r["now"] or "-"), "owns: " + (r["owns"] or "-"), "FREE" if r["free"] else ""))
         for r in team_rows(entries)
     ]
 
