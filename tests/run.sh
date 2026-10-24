@@ -2069,6 +2069,45 @@ for variant in sorted(c.PALETTES):
           and "inset" in props[".po-toggle:checked"]["box-shadow"])
     check("dashboard css %s: one base colour for window, header, card, toggle" % variant,
           len({props[s]["background-color"] for s in ("window.po-dashboard", ".po-header", ".po-card", ".po-toggle")}) == 1)
+# The new-event highlight: the maths, and AA text at every step read back from the CSS.
+check("dashboard fade: a first fetch has no new events", c.new_keys(None, ev) == [])
+seen = {c.event_key(e) for e in ev[:10]}
+check("dashboard fade: only events not seen before are new", c.new_keys(seen, ev) == [c.event_key(e) for e in ev[10:]])
+check("dashboard fade: an event is its content, key order aside", c.event_key({"a": 1, "b": 2}) == c.event_key({"b": 2, "a": 1}))
+check("dashboard fade: starts at full strength", c.fade_step(0) == c.FADE_STEPS)
+check("dashboard fade: back to normal after 60 s", c.fade_step(60) == 0 and c.fade_step(600) == 0 and c.FADE_SECONDS == 60)
+check("dashboard fade: halfway is half the steps", c.fade_step(30) == c.FADE_STEPS // 2)
+check("dashboard fade: the steps only go down", all(c.fade_step(t / 4) >= c.fade_step((t + 1) / 4) for t in range(240)))
+check("dashboard fade: reduced motion keeps the full highlight until 60 s", c.fade_step(0, True) == c.fade_step(59.9, True) == c.FADE_STEPS and c.fade_step(60, True) == 0)
+check("dashboard fade: light cards start 25% darker", c.card_color("light", c.FADE_STEPS) == c.mix(c.PALETTES["light"]["base"], "#000000", 0.25))
+check("dashboard fade: dark cards start 25% lighter", c.card_color("dark", c.FADE_STEPS) == c.mix(c.PALETTES["dark"]["base"], "#ffffff", 0.25))
+check("dashboard fade: step 0 is the normal card colour", all(c.card_color(v, 0) == c.PALETTES[v]["base"] for v in c.PALETTES))
+for variant in sorted(c.PALETTES):
+    props = c.css_properties(c.css(variant))
+    lum = [c.luminance(props[".po-card.po-fade-%d" % n]["background-color"]) for n in range(1, c.FADE_STEPS + 1)]
+    check("dashboard fade css %s: the card colour eases monotonically to the base" % variant,
+          lum == sorted(lum, reverse=variant == "light") and lum[-1] != c.luminance(c.PALETTES[variant]["base"]))
+    for n in (c.FADE_STEPS, c.FADE_STEPS // 2, 1):
+        bg = props[".po-card.po-fade-%d" % n]["background-color"]
+        for cls, _key in c.FADE_TEXT:
+            ratio = c.contrast(props[".po-fade-%d .%s" % (n, cls)]["color"], bg)
+            check("dashboard fade css %s: %s keeps contrast >= 4.5 at step %d (%.2f)" % (variant, cls, n, ratio), ratio >= 4.5)
+    worst = min(c.contrast(props[".po-fade-%d .%s" % (n, cls)]["color"], props[".po-card.po-fade-%d" % n]["background-color"])
+                for n in range(1, c.FADE_STEPS + 1) for cls, _k in c.FADE_TEXT)
+    check("dashboard fade css %s: every step, every text colour is >= 4.5 (%.2f)" % (variant, worst), worst >= 4.5)
+# po serve pages: the same highlight, as a CSS animation with a reduced-motion fallback.
+import serve as sv
+pg = sv.page(ev[:3], None, False)
+check("serve page: a row that appears fades over 60 s, from the page's own animation", "animation:fade 60s linear" in pg and sv.FADE_SECONDS == 60)
+check("serve page: reduced motion drops the animation but keeps the highlight", pg.count("prefers-reduced-motion:reduce") == 2 and "tr.new td{animation:none}" in pg)
+check("serve page: rows rendered by the server start normal", 'class="new"' not in pg and "<tr class" not in pg)
+check("serve page: the script marks only events seen after the first fetch", "if (seen) for (const k of keys) if (!seen.has(k)) born.set" in pg)
+for variant, base, target, normal in (("light", "#ffffff", "#000000", {"text": "#222222", "muted": "#555555"}), ("dark", "#181818", "#ffffff", {"text": "#dddddd", "muted": "#aaaaaa"})):
+    start = c.mix(base, target, 0.25)
+    for role, col in sv.NEW_TEXT[variant].items():
+        ratio = c.contrast(col, start)
+        check("serve page %s: %s text keeps contrast >= 4.5 on the strongest highlight (%.2f)" % (variant, role, ratio), ratio >= 4.5)
+        check("serve page %s: %s text is in the page's CSS" % (variant, role), col in pg)
 check("dashboard css: the two variants differ", c.css("light") != c.css("dark"))
 check("dashboard: contrast of black on white is 21", round(c.contrast("#000000", "#ffffff")) == 21)
 PY

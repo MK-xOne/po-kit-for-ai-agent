@@ -261,7 +261,7 @@ the same from any worktree.
   interface's. There is no login, so bind only to an address whose reachers you
   trust. It prints `po serve: listening on http://<addr>:<port>/` and runs until
   stopped; `--port 0` picks a free port.
-- `po-dashboard [--url <url>] [--team-url <url>] [--view events|team] [--theme auto|light|dark] [--all] [--size WxH] [--check] [--screenshot <png>]`
+- `po-dashboard [--url <url>] [--team-url <url>] [--view events|team] [--theme auto|light|dark] [--all] [--size WxH] [--check] [--screenshot <png>] [--screenshot-delay <s>]`
   (`bin/po-dashboard`, not a `po` subcommand) — a desktop window for the same
   events: the last 10 as soft raised single-line cards (result, item, project,
   kind, checks, agent, time in the local zone, note) in fixed columns that line
@@ -290,7 +290,17 @@ the same from any worktree.
   display (`--all` for every event, then the team lines when a team feed is set; exit 2
   when a URL is unreachable);
   `--all` also starts the window with Show all on, `--size WxH` sets its size,
-  and `--screenshot` saves the window to a PNG once it has data, then quits.
+  and `--screenshot` saves the window to a PNG once it has data (after
+  `--screenshot-delay` seconds, 0.6 by default), then quits.
+  An event that appears while the Events view is open starts with its card 25%
+  darker (25% lighter in the dark theme) and eases back to the normal card
+  colour over 60 seconds, text colours adjusting to stay AA at every step;
+  events there when the window opens, and every event after a switch back from
+  Team, start normal. With the desktop's animations off (reduced motion) the
+  highlight stays at full strength and drops after 60 seconds. The pages of
+  `po serve` do the same (a CSS animation; `prefers-reduced-motion` keeps the
+  highlight without animating). `examples/events-demo-server.py` is a sample
+  feed that adds an event every 15 seconds to watch it on.
 - `po version` — the tag this po-kit checkout is at (`git describe --tags
   --exact-match`; else `git describe --tags --always --dirty`). Works from
   anywhere, reads no manifest.

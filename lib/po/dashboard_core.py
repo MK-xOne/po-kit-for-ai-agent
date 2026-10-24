@@ -6,6 +6,7 @@ Standard library only.
 """
 import datetime
 import json
+import math
 import os
 import re
 import urllib.error
@@ -16,6 +17,9 @@ LAST = 10
 INTERVAL_MS = 5000
 URL_ENV = "PO_DASHBOARD_URL"
 TEAM_URL_ENV = "PO_DASHBOARD_TEAM_URL"
+FADE_SECONDS = 60
+FADE_STEPS = 60  # one CSS class per step, po-fade-<n>: n steps of highlight left
+FADE_AMOUNT = 0.25  # a new card starts 25% darker (lighter in the dark theme)
 CUES = {"pass": "✔ pass", "fail": "✘ fail", "skip": "– skip"}  # check, cross, en dash
 
 
@@ -215,6 +219,71 @@ def team_check_lines(entries):
     ]
 
 
+# ---- the new-event highlight -------------------------------------------------
+
+
+def event_key(event):
+    """The identity of an event across fetches: its whole content."""
+    return json.dumps(event, sort_keys=True, separators=(",", ":"))
+
+
+def new_keys(seen, events):
+    """The keys of events not in seen (a set, or None before the first fetch, when nothing is new)."""
+    keys = [event_key(e) for e in events]
+    return [] if seen is None else [k for k in keys if k not in seen]
+
+
+def fade_step(elapsed, reduced=False):
+    """Highlight steps left, FADE_STEPS (just appeared) down to 0 (normal), after elapsed seconds.
+
+    With reduced motion the highlight stays at full strength and drops to 0 at FADE_SECONDS.
+    """
+    if elapsed >= FADE_SECONDS:
+        return 0
+    if reduced:
+        return FADE_STEPS
+    return max(0, min(FADE_STEPS, math.ceil(FADE_STEPS * (1 - max(elapsed, 0) / FADE_SECONDS))))
+
+
+def mix(c1, c2, t):
+    """'#rrggbb' t of the way from c1 to c2."""
+    out = [round(int(c1[i:i + 2], 16) * (1 - t) + int(c2[i:i + 2], 16) * t) for i in (1, 3, 5)]
+    return "#%02x%02x%02x" % tuple(out)
+
+
+def fade_target(variant):
+    return "#ffffff" if variant == "dark" else "#000000"
+
+
+def card_color(variant, step):
+    """The card colour with step highlight steps left: FADE_AMOUNT toward the target at FADE_STEPS, the base at 0."""
+    return mix(PALETTES[variant]["base"], fade_target(variant), FADE_AMOUNT * step / FADE_STEPS)
+
+
+def readable(fg, bg, variant, need=4.5):
+    """fg, moved toward the variant's extreme in small steps until it reaches contrast need on bg."""
+    for _ in range(40):
+        if contrast(fg, bg) >= need:
+            break
+        fg = mix(fg, fade_target(variant), 0.1)
+    return fg
+
+
+FADE_TEXT = (("po-text", "text"), ("po-muted", "muted"), ("po-note", "muted"),
+             ("po-pass", "pass"), ("po-fail", "fail"), ("po-skip", "skip"))
+
+
+def fade_css(variant):
+    """One rule set per highlight step: the card colour and text colours that stay AA on it."""
+    pal, out = PALETTES[variant], []
+    for n in range(1, FADE_STEPS + 1):
+        bg = card_color(variant, n)
+        out.append(".po-card.po-fade-%d { background-color: %s; }" % (n, bg))
+        for cls, key in FADE_TEXT:
+            out.append(".po-fade-%d .%s { color: %s; }" % (n, cls, readable(pal[key], bg, variant)))
+    return "\n".join(out) + "\n"
+
+
 # ---- the neumorphic style --------------------------------------------------
 # One base colour per variant; surfaces are raised (outer light + dark shadow)
 # or pressed (inset). Text and status colours are checked against the base by
@@ -283,7 +352,7 @@ CONTRAST_PAIRS = [
 
 
 def css(variant):
-    return CSS_TEMPLATE % PALETTES[variant]
+    return CSS_TEMPLATE % PALETTES[variant] + fade_css(variant)
 
 
 def css_properties(text):

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """po-dashboard: a desktop window showing the gate events of a po serve.
 
-    po-dashboard [--url <url>] [--team-url <url>] [--view events|team] [--theme auto|light|dark] [--all] [--size WxH] [--check] [--screenshot <png>]
+    po-dashboard [--url <url>] [--team-url <url>] [--view events|team] [--theme auto|light|dark] [--all] [--size WxH] [--check] [--screenshot <png>] [--screenshot-delay <s>]
 
 The URL is the events JSON (a JSON array or one object per line, e.g. the
 /events.json of `po serve`); --url or PO_DASHBOARD_URL, no default. GTK 4 and
@@ -14,6 +14,7 @@ import argparse
 import os
 import sys
 import threading
+import time
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib", "po"))
@@ -47,6 +48,7 @@ def main():
     ap.add_argument("--size", metavar="WxH", default="760x640", help="initial window size (default 760x640)")
     ap.add_argument("--check", action="store_true", help="print the rows the window would show, without a display")
     ap.add_argument("--screenshot", metavar="PNG", help="save the window once it has data, then quit")
+    ap.add_argument("--screenshot-delay", metavar="SECONDS", type=float, default=0.6, help="wait this long after the first data before the screenshot (default 0.6)")
     a = ap.parse_args()
     try:
         width, height = (int(n) for n in a.size.lower().split("x"))
@@ -76,6 +78,9 @@ def main():
         def __init__(self, app):
             self.show_all = a.all
             self.events = []
+            self.seen = None  # event keys already shown; None until the first fetch, so nothing is new then
+            self.born = {}  # event key -> time.monotonic() when it appeared while the window was open
+            self.cards = []  # (card, event key, highlight step now) of the Events view
             self.team = []
             self.team_text = None
             self.view = "events"
@@ -157,6 +162,7 @@ def main():
             self.win.present()
             self.refresh()
             GLib.timeout_add(core.INTERVAL_MS, self.tick)
+            GLib.timeout_add(500, self.fade_tick)
 
         # -- style --
         def dark(self):
@@ -181,6 +187,25 @@ def main():
             else:
                 self.provider.load_from_data(text.encode("utf-8"))
             Gtk.StyleContext.add_provider_for_display(display, self.provider, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+
+        # -- the new-event highlight --
+        def step_of(self, key):
+            born = self.born.get(key)
+            if born is None:
+                return 0
+            reduced = not self.settings.get_property("gtk-enable-animations")
+            return core.fade_step(time.monotonic() - born, reduced)
+
+        def fade_tick(self):
+            for i, (card, key, step) in enumerate(self.cards):
+                n = self.step_of(key)
+                if n != step:
+                    if step:
+                        card.remove_css_class("po-fade-%d" % step)
+                    if n:
+                        card.add_css_class("po-fade-%d" % n)
+                    self.cards[i] = (card, key, n)
+            return True
 
         # -- data --
         def tick(self):
@@ -230,6 +255,9 @@ def main():
             if not button.get_active():
                 return
             self.view = name
+            if name == "events":  # a view switch starts every card normal
+                self.born.clear()
+                self.fade_tick()
             self.stack.set_visible_child_name(name)
             self.title_label.set_text("Team" if name == "team" else "Gate events")
             self.toggle.set_visible(name == "events")
@@ -256,12 +284,16 @@ def main():
             self.events_failed = False
             self.error.set_visible(False)
             if text != self.last_text:
+                now = time.monotonic()
+                for k in core.new_keys(self.seen, events):
+                    self.born[k] = now
+                self.seen = {core.event_key(e) for e in events} | (self.seen or set())
                 self.last_text, self.events = text, events
                 self.redraw()
             self.show_status()
             if a.screenshot and not self.shot_done:
                 self.shot_done = True
-                GLib.timeout_add(600, self.screenshot)
+                GLib.timeout_add(int(a.screenshot_delay * 1000), self.screenshot)
             return False
 
         def on_key(self, _ctrl, keyval, _code, _state):
@@ -305,9 +337,16 @@ def main():
                 child = nxt
             groups = [Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL) for _ in core.COLUMNS]
             note_group = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)
-            for r in core.rows(self.events, self.show_all):
+            self.cards = []
+            for ev in core.visible(self.events, self.show_all):
+                r = core.row(ev)
                 card = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
                 card.add_css_class("po-card")
+                key = core.event_key(ev)
+                step = self.step_of(key)
+                if step:
+                    card.add_css_class("po-fade-%d" % step)
+                self.cards.append((card, key, step))
                 for (key, _title, width, widest, grow), group in zip(core.COLUMNS, groups):
                     cls = "po-" + r["result_class"] if key == "result" else "po-muted" if key in ("kind", "legs", "agent", "time") else "po-text"
                     lab = self.label(r[key], cls, width_chars=width, max_width_chars=widest, hexpand=grow, ellipsize=3)

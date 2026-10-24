@@ -18,6 +18,11 @@ LAST = 10
 COLUMNS = ("result", "item", "project", "kind", "checks", "agent", "time", "note")
 CUES = {"pass": "\u2714 pass", "fail": "\u2718 fail", "skip": "\u2013 skip"}
 WIDTHS = {"result": 9, "item": 8, "kind": 7, "agent": 10, "time": 20, "note": 4}  # ch; project and checks share the rest
+FADE_SECONDS = 60  # a row that appears while the page is open starts 25% darker (lighter in dark) and eases back
+# Text colours inside a highlighted row: darker (lighter in dark) than the normal ones, so they stay AA
+# (4.5:1) on the strongest highlight; the tests check them against it.
+NEW_TEXT = {"light": {"text": "#222222", "muted": "#333333", "pass": "#06471a", "fail": "#7a1610"},
+            "dark": {"text": "#f2f2f2", "muted": "#e6e6e6", "pass": "#8ff0b0", "fail": "#ffc2bd"}}
 PO_CMD = ("po", "events", "--all", "--json")
 
 
@@ -137,11 +142,21 @@ tbody tr{{cursor:pointer}} tbody tr:hover{{background:#f3f3f3}}
 .r-pass,.r-ok{{color:#0a7a2f;font-weight:600}} .r-fail{{color:#b3261e;font-weight:600}} .r-skip{{color:#555;font-weight:600}}
 .c-kind,.c-checks,.c-agent,.c-time{{color:#555}} .note{{color:#555;cursor:help}}
 .note:focus-visible{{outline:2px solid currentColor;outline-offset:2px}}
+tbody tr.new td{{background-color:rgba(0,0,0,.25);animation:fade {fade}s linear forwards;color:{lt[muted]}}}
+tbody tr.new .c-item,tbody tr.new .c-project,tbody tr.new .c-note,tbody tr.new .note{{color:{lt[text]}}}
+tbody tr.new .r-pass,tbody tr.new .r-ok{{color:{lt[pass]}}} tbody tr.new .r-fail{{color:{lt[fail]}}} tbody tr.new .r-skip{{color:{lt[muted]}}}
+@keyframes fade{{from{{background-color:rgba(0,0,0,.25)}}to{{background-color:rgba(0,0,0,0)}}}}
+@keyframes fade-dark{{from{{background-color:rgba(255,255,255,.25)}}to{{background-color:rgba(255,255,255,0)}}}}
+@media(prefers-reduced-motion:reduce){{tbody tr.new td{{animation:none}}}}
 .sr{{position:absolute;left:-9999px}}
 #err{{color:#b3261e}} nav a{{margin-right:1rem}}
 @media(prefers-color-scheme:dark){{body{{color:#ddd;background:#181818}}
 th,td{{border-color:#444}} tbody tr:hover{{background:#262626}}
-.r-pass,.r-ok{{color:#5fd38a}} .r-fail,#err{{color:#ff8a80}} .r-skip,.c-kind,.c-checks,.c-agent,.c-time,.note{{color:#aaa}}}}
+.r-pass,.r-ok{{color:#5fd38a}} .r-fail,#err{{color:#ff8a80}} .r-skip,.c-kind,.c-checks,.c-agent,.c-time,.note{{color:#aaa}}
+tbody tr.new td{{background-color:rgba(255,255,255,.25);animation-name:fade-dark;color:{dk[muted]}}}
+tbody tr.new .c-item,tbody tr.new .c-project,tbody tr.new .c-note,tbody tr.new .note{{color:{dk[text]}}}
+tbody tr.new .r-pass,tbody tr.new .r-ok{{color:{dk[pass]}}} tbody tr.new .r-fail{{color:{dk[fail]}}} tbody tr.new .r-skip{{color:{dk[muted]}}}
+@media(prefers-reduced-motion:reduce){{tbody tr.new td{{animation:none}}}}}}
 </style></head>
 <body data-limit="{limit}">
 <h1>{title}</h1>
@@ -168,7 +183,9 @@ function field(c, e) {{
   if (c === "item" && e.item == null) return "-";
   return str(e[c]);
 }}
-let last = null;
+const fadeMs = {fade} * 1000;
+let last = null, seen = null;
+const born = new Map();  // event JSON -> Date.now() when it appeared while the page was open
 function local() {{
   for (const t of document.querySelectorAll("time")) {{
     const d = new Date(t.getAttribute("datetime"));
@@ -180,6 +197,12 @@ function render(events) {{
   tb.replaceChildren();
   for (const e of (limit ? events.slice(0, limit) : events)) {{
     const tr = document.createElement("tr");
+    const age = Date.now() - (born.get(JSON.stringify(e)) ?? -Infinity);
+    if (age < fadeMs) {{
+      tr.className = "new";
+      tr.style.animationDelay = "-" + age / 1000 + "s";
+      setTimeout(() => tr.classList.remove("new"), fadeMs - age);
+    }}
     tr.onclick = () => {{ location = "/all"; }};
     for (const c of cols) {{
       const td = document.createElement("td");
@@ -224,7 +247,13 @@ async function poll() {{
     const text = await r.text();
     if (!r.ok) throw new Error(text);
     err.textContent = "";
-    if (text !== last) {{ last = text; render(JSON.parse(text)); }}
+    if (text !== last) {{
+      last = text;
+      const events = JSON.parse(text), keys = events.map(e => JSON.stringify(e));
+      if (seen) for (const k of keys) if (!seen.has(k)) born.set(k, Date.now());
+      seen = new Set([...(seen || []), ...keys]);
+      render(events);
+    }}
   }} catch (x) {{ err.textContent = String(x.message || x); }}
 }}
 local();
@@ -246,6 +275,9 @@ def page(events, error, full):
         rows=rows_html(events if full else events[:LAST]),
         cols=json.dumps(list(COLUMNS)),
         cues=json.dumps(CUES),
+        fade=FADE_SECONDS,
+        lt=NEW_TEXT["light"],
+        dk=NEW_TEXT["dark"],
     )
 
 

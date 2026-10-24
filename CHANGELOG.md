@@ -14,6 +14,22 @@ Unreleased becomes `## Release N (YYYY-MM-DD): <theme>`.
 
 Nothing yet.
 
+## Release 6 (2026-10-24): new events fade in
+
+Item v0.17.
+
+**Agents, in short:** nothing to do.
+
+**Adopt, in short:** nothing.
+
+### Dashboard: new events fade in (v0.17, 2026-10-24)
+
+In the Events view of `po-dashboard`, an event that appears while the window is open starts with its card 25% darker (25% lighter in the dark theme) and eases back to the normal card colour over 60 s. Events present at window open or at a view switch start normal. Text keeps WCAG AA contrast at every step. With reduced motion the highlight stays and drops after 60 s without animating. `po serve` pages do the same in CSS. New `--screenshot-delay <s>` option and `examples/events-demo-server.py` (a sample feed with a new event every N s).
+
+**Agents:** nothing to do.
+
+**Adopt:** nothing.
+
 ## Release 5 (2026-10-24): dashboard Team view
 
 Item v0.16.
