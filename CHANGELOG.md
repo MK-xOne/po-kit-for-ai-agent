@@ -14,6 +14,22 @@ Unreleased becomes `## Release N (YYYY-MM-DD): <theme>`.
 
 Nothing yet.
 
+## Release 10 (2026-10-24): usage limit in the Team view
+
+Item v0.23.
+
+**Agents, in short:** nothing to do.
+
+**Adopt, in short:** optional: add `limit_until` and `usage` to the team feed rows.
+
+### Dashboard: one Status column in the Team view (v0.23, 2026-10-24)
+
+The Team view's separate state and FREE columns become one **Status** column: `LIMIT until <time>` (the viewer's local time, with the date when not today; fail colour; wins over the rest), WORKING (live dot), FREE, or the state as given (`idle 22m`, muted). Rows may carry `limit_until` (ISO time or null; a past, null, absent or unparseable value is no limit) and `usage` (`{five_hour, seven_day}`, each 0-1, shown after the status as muted percentages, only the valid parts). Old feeds work unchanged. `--check` prints the status and usage too.
+
+**Agents:** nothing to do.
+
+**Adopt:** optional: add `limit_until` and `usage` to the team feed rows.
+
 ## Release 9 (2026-10-24): manifest-driven briefs and closes, Decisions view
 
 Items v0.20, v0.21, v0.22.

@@ -2139,19 +2139,37 @@ for bad_feed, name in (("{not json", "bad JSON"), ('{"agent": "x"}', "an object 
     except c.DashboardError:
         check("dashboard team: %s is a DashboardError" % name, True)
 tr = c.team_rows(team)
-check("dashboard team: WORKING is working, idle is not", tr[0]["working"] and not tr[1]["working"])
-check("dashboard team: state is shown as given", tr[1]["state"] == "idle 22m")
+check("dashboard team: WORKING is working, FREE is free", tr[0]["kind"] == "working" and tr[0]["status"] == "WORKING" and tr[1]["kind"] == "free" and tr[1]["status"] == "FREE")
+check("dashboard team: an idle agent shows its state as given", c.team_row({"agent": "x", "state": "idle 22m"})["status"] == "idle 22m" and c.team_row({"agent": "x", "state": "idle 22m"})["kind"] == "idle")
 check("dashboard team: owns are joined, none is empty", tr[0]["owns"] == "1.4, 1.5" and tr[1]["owns"] == "")
 check("dashboard team: a null now is empty", tr[1]["now"] == "" and tr[0]["now"] == "1.4")
-check("dashboard team: free sets the badge", tr[1]["free"] and not tr[0]["free"])
-check("dashboard team: a sparse entry still has a row", c.team_row({})["agent"] == "?" and c.team_row({})["state"] == "?")
-check("dashboard team: check lines show name state now owns and FREE", c.team_check_lines(team) == ["ada | WORKING | now: 1.4 | owns: 1.4, 1.5 | ", "bo | idle 22m | now: - | owns: - | FREE"])
+check("dashboard team: a sparse entry still has a row", c.team_row({})["agent"] == "?" and c.team_row({})["status"] == "?")
+check("dashboard team: check lines show name status now and owns", c.team_check_lines(team) == ["ada | WORKING | now: 1.4 | owns: 1.4, 1.5", "bo | FREE | now: - | owns: -"])
 mt = c.team_rows([{"agent": "ada", "model": " Big Model (API) ", "state": "WORKING"}, {"agent": "bo", "state": "idle"}, {"agent": "cy", "model": None}, {"agent": "di", "model": 4}])
 check("dashboard team: a model string is kept, trimmed", mt[0]["model"] == "Big Model (API)")
 check("dashboard team: an absent, null or non-string model is empty", mt[1]["model"] == "" and mt[2]["model"] == "" and mt[3]["model"] == "")
-check("dashboard team: a check line shows the model after the name", c.team_check_lines([{"agent": "ada", "model": "Big Model (API)", "state": "WORKING", "now": "1.4", "owns": ["1.4"]}]) == ["ada \u00b7 Big Model (API) | WORKING | now: 1.4 | owns: 1.4 | "])
-check("dashboard team: a check line without a model is unchanged", c.team_check_lines([{"agent": "bo", "model": "", "state": "idle 22m", "free": True}]) == ["bo | idle 22m | now: - | owns: - | FREE"])
-check("dashboard team: the example feed parses, with and without a model", [r["model"] != "" for r in c.team_rows(c.parse_team(open(sys.argv[1] + "/../../examples/team-feed.json").read()))] == [True, True, False])
+check("dashboard team: a check line shows the model after the name", c.team_check_lines([{"agent": "ada", "model": "Big Model (API)", "state": "WORKING", "now": "1.4", "owns": ["1.4"]}]) == ["ada \u00b7 Big Model (API) | WORKING | now: 1.4 | owns: 1.4"])
+check("dashboard team: a check line without a model is unchanged", c.team_check_lines([{"agent": "bo", "model": "", "state": "idle 22m"}]) == ["bo | idle 22m | now: - | owns: -"])
+check("dashboard team: the example feed parses, with and without a model", [r["model"] != "" for r in c.team_rows(c.parse_team(open(sys.argv[1] + "/../../examples/team-feed.json").read()))] == [True, True, False, True])
+# Status: LIMIT wins; the time is the viewer's local time; usage only when present.
+import datetime as dt
+NOW = dt.datetime(2030, 5, 1, 14, 0, tzinfo=dt.timezone.utc)
+EST = dt.timezone(dt.timedelta(hours=-5))
+lim = {"agent": "a", "state": "WORKING", "free": True, "limit_until": "2030-05-01T18:30:00Z"}
+lr = c.team_row(lim, NOW, EST)
+check("dashboard team: LIMIT wins over WORKING and FREE", lr["kind"] == "limit" and lr["status"] == "LIMIT until 13:30")
+check("dashboard team: LIMIT shows the viewer's local time", c.team_row(lim, NOW, dt.timezone.utc)["status"] == "LIMIT until 18:30")
+check("dashboard team: LIMIT on another day shows the date", c.team_row(dict(lim, limit_until="2030-05-02T03:00:00Z"), NOW, EST)["status"] == "LIMIT until 22:00" and c.team_row(dict(lim, limit_until="2030-05-02T12:00:00Z"), NOW, EST)["status"] == "LIMIT until 2030-05-02 07:00")
+for name, v in (("null", None), ("absent", "ABSENT"), ("past", "2030-05-01T13:00:00Z"), ("unparseable", "soon"), ("non-string", 5)):
+    e = {"agent": "a", "state": "idle 3h", "free": True}
+    if v != "ABSENT":
+        e["limit_until"] = v
+    check("dashboard team: a %s limit_until is no limit" % name, c.team_row(e, NOW, EST)["status"] == "FREE")
+check("dashboard team: usage is shown as muted percentages", c.team_row({"usage": {"five_hour": 0.42, "seven_day": 0.185}})["usage"] == "5h 42% \u00b7 7d 18%")
+check("dashboard team: only the usage parts present are shown", c.team_row({"usage": {"seven_day": 1}})["usage"] == "7d 100%" and c.team_row({"usage": {"five_hour": 0}})["usage"] == "5h 0%")
+check("dashboard team: no, empty or bad usage shows nothing", all(c.team_row({"usage": u})["usage"] == "" for u in (None, {}, [], "x", {"five_hour": "a", "seven_day": 2}, {"five_hour": True, "seven_day": -1})) and c.team_row({})["usage"] == "")
+check("dashboard team: a check line shows LIMIT and usage", c.team_check_lines([dict(lim, usage={"five_hour": 1, "seven_day": 0.5})], NOW, EST) == ["a | LIMIT until 13:30 (5h 100% \u00b7 7d 50%) | now: - | owns: -"])
+check("dashboard team: an old feed row shows as before", c.team_row({"agent": "a", "state": "idle 3h", "free": False}, NOW, EST)["status"] == "idle 3h")
 # The Team view's saved order: where it lives, load and save, merged with the feed.
 import os, tempfile
 check("dashboard order: PO_DASHBOARD_TEAM_ORDER names the file", c.team_order_path({"PO_DASHBOARD_TEAM_ORDER": "/t/o.json", "XDG_CONFIG_HOME": "/x"}) == "/t/o.json")
@@ -2354,11 +2372,15 @@ out=$(env -u PO_DASHBOARD_TEAM_URL python3 -B "$DB" --url "$CHK_URL" --check 2>&
 out=$(python3 -B "$DB" --url "$CHK_URL" --check --all 2>&1)
 [[ $(wc -l <<<"$out") == 12 ]] && ok "po-dashboard --check --all prints every event" || bad "dashboard check all" "$out"
 out=$(PO_DASHBOARD_TEAM_URL="$TMP/team.json" python3 -B "$DB" --url "$CHK_URL" --check 2>&1)
-[[ $(tail -2 <<<"$out" | head -1) == "ada | WORKING | now: 1.4 | owns: 1.4 | " && $(tail -1 <<<"$out") == "cy | idle 3h | now: - | owns: - | FREE" ]] &&
+[[ $(tail -2 <<<"$out" | head -1) == "ada | WORKING | now: 1.4 | owns: 1.4" && $(tail -1 <<<"$out") == "cy | FREE | now: - | owns: -" ]] &&
 	ok "po-dashboard --check lists the team after the events when a team feed is set" || bad "dashboard check team" "$out"
+printf '[{"agent":"ada","state":"WORKING","owns":[],"usage":{"five_hour":0.5}},{"agent":"cy","state":"idle 3h","free":true,"limit_until":"2099-01-01T12:00:00Z","usage":{"seven_day":0.25}}]\n' >"$TMP/team-limit.json"
+out=$(TZ=UTC PO_DASHBOARD_TEAM_ORDER="$TMP/none-order.json" PO_DASHBOARD_TEAM_URL="$TMP/team-limit.json" python3 -B "$DB" --url "$CHK_URL" --check 2>&1)
+[[ $(tail -2 <<<"$out" | head -1) == "ada | WORKING (5h 50%) | now: - | owns: -" && $(tail -1 <<<"$out") == "cy | LIMIT until 2099-01-01 12:00 (7d 25%) | now: - | owns: -" ]] &&
+	ok "po-dashboard --check shows LIMIT in local time and usage when present" || bad "dashboard check limit" "$out"
 printf '{"order": ["cy"]}\n' >"$TMP/team-order.json"
 out=$(PO_DASHBOARD_TEAM_ORDER="$TMP/team-order.json" PO_DASHBOARD_TEAM_URL="$TMP/team.json" python3 -B "$DB" --url "$CHK_URL" --check 2>&1)
-[[ $(tail -2 <<<"$out" | head -1) == "cy | idle 3h | now: - | owns: - | FREE" && $(tail -1 <<<"$out") == "ada | WORKING | now: 1.4 | owns: 1.4 | " ]] &&
+[[ $(tail -2 <<<"$out" | head -1) == "cy | FREE | now: - | owns: -" && $(tail -1 <<<"$out") == "ada | WORKING | now: 1.4 | owns: 1.4" ]] &&
 	ok "po-dashboard --check applies the saved team order" || bad "dashboard check team order" "$out"
 out=$(PO_DASHBOARD_TEAM_URL="$TMP/none.json" python3 -B "$DB" --url "$CHK_URL" --team-url "$TMP/team.json" --check 2>&1)
 [[ $out == *'team:'* ]] && ok "po-dashboard --team-url wins over PO_DASHBOARD_TEAM_URL" || bad "dashboard team precedence" "$out"
@@ -2388,7 +2410,7 @@ out=$(python3 -B "$DB" --url "http://127.0.0.1:1/" --check 2>&1)
 if python3 -c 'import gi; gi.require_version("Gtk", "4.0"); from gi.repository import Gtk' >/dev/null 2>&1; then
 	if [[ -n ${DISPLAY:-}${WAYLAND_DISPLAY:-} ]]; then
 		# UI smoke: the window comes up with data and saves a screenshot.
-		python3 -I - "$SV/events.json" "$TMP/shot.png" "$DB" "$TMP/decisions.json" "$TMP/shot-decisions.png" <<'PY' &&
+		python3 -I - "$SV/events.json" "$TMP/shot.png" "$DB" "$TMP/decisions.json" "$TMP/shot-decisions.png" "$TMP/team-limit.json" "$TMP/shot-team.png" <<'PY' &&
 import http.server, subprocess, sys, threading
 body = open(sys.argv[1], "rb").read()
 class H(http.server.BaseHTTPRequestHandler):
@@ -2400,9 +2422,11 @@ threading.Thread(target=srv.serve_forever, daemon=True).start()
 r = subprocess.run([sys.executable, sys.argv[3], "--url", "http://127.0.0.1:%d/" % srv.server_address[1], "--screenshot", sys.argv[2]], timeout=60)
 if r.returncode == 0 and len(sys.argv) > 4:
     r = subprocess.run([sys.executable, sys.argv[3], "--url", "http://127.0.0.1:%d/" % srv.server_address[1], "--decisions-url", sys.argv[4], "--view", "decisions", "--screenshot", sys.argv[5]], timeout=60)
+if r.returncode == 0 and len(sys.argv) > 6:
+    r = subprocess.run([sys.executable, sys.argv[3], "--url", "http://127.0.0.1:%d/" % srv.server_address[1], "--team-url", sys.argv[6], "--view", "team", "--screenshot", sys.argv[7]], timeout=60)
 sys.exit(r.returncode)
 PY
-			[[ -s $TMP/shot.png && -s $TMP/shot-decisions.png ]] && ok "po-dashboard opens, loads events and saves a screenshot, also in the Decisions view" || bad "dashboard ui smoke"
+			[[ -s $TMP/shot.png && -s $TMP/shot-decisions.png && -s $TMP/shot-team.png ]] && ok "po-dashboard opens, loads events and saves a screenshot, also in the Decisions and Team views (LIMIT and usage rows)" || bad "dashboard ui smoke"
 	else
 		ok "po-dashboard UI smoke skipped: no display"
 	fi

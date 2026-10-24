@@ -190,7 +190,7 @@ def check_lines(events, show_all=False, tz=None):
 
 
 def parse_team(text):
-    """The team feed: a JSON array of {agent, model?, state, now, owns[], free}. Raises DashboardError."""
+    """The team feed: a JSON array of {agent, model?, state, now, owns[], free, limit_until?, usage?}. Raises DashboardError."""
     text = text.strip()
     if not text:
         return []
@@ -203,33 +203,76 @@ def parse_team(text):
     return [e for e in data if isinstance(e, dict)]
 
 
-def team_row(entry):
-    """One agent as the strings a team line shows; state is shown as given."""
+def _usage_part(value):
+    """A 0-1 fraction as '37%', or None when it is not a number in that range."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1:
+        return None
+    return "%d%%" % round(value * 100)
+
+
+def team_usage(entry):
+    """'5h 37% \u00b7 7d 12%' from usage {five_hour, seven_day}; only the parts present, '' when none."""
+    usage = entry.get("usage")
+    if not isinstance(usage, dict):
+        return ""
+    parts = [(label, _usage_part(usage.get(key))) for label, key in (("5h", "five_hour"), ("7d", "seven_day"))]
+    return " \u00b7 ".join("%s %s" % (label, text) for label, text in parts if text)
+
+
+def limit_text(entry, now=None, tz=None):
+    """'LIMIT until <local time>' while limit_until is a time still ahead; '' otherwise.
+
+    The time is in tz (default: the viewer's zone), with the date when it is not today."""
+    until = parse_time(entry.get("limit_until"))
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    if until is None or until <= now:
+        return ""
+    until, today = until.astimezone(tz), now.astimezone(tz).date()
+    return "LIMIT until " + until.strftime("%H:%M" if until.date() == today else "%Y-%m-%d %H:%M")
+
+
+def team_row(entry, now=None, tz=None):
+    """One agent as the strings a team line shows.
+
+    status is one of LIMIT until <time> (kind 'limit', wins over the rest), WORKING... (kind 'working'),
+    FREE (kind 'free', the free flag), else the state as given (kind 'idle')."""
     state = str(entry.get("state") or "")
     owns = entry.get("owns")
     owns = [str(o) for o in owns] if isinstance(owns, list) else []
-    now = entry.get("now")
+    now_item = entry.get("now")
     model = entry.get("model")
+    working = state.strip().upper().startswith("WORKING")
+    limit = limit_text(entry, now, tz)
+    if limit:
+        kind, status = "limit", limit
+    elif working:
+        kind, status = "working", state
+    elif entry.get("free"):
+        kind, status = "free", "FREE"
+    else:
+        kind, status = "idle", state or "?"
     return {
         "agent": str(entry.get("agent") or "?"),
         "model": model.strip() if isinstance(model, str) else "",
-        "state": state or "?",
-        "working": state.strip().upper().startswith("WORKING"),
-        "now": "" if now in (None, "") else str(now),
+        "status": status,
+        "kind": kind,
+        "usage": team_usage(entry),
+        "now": "" if now_item in (None, "") else str(now_item),
         "owns": ", ".join(owns),
-        "free": bool(entry.get("free")),
     }
 
 
-def team_rows(entries):
-    return [team_row(e) for e in entries]
+def team_rows(entries, now=None, tz=None):
+    return [team_row(e, now, tz) for e in entries]
 
 
-def team_check_lines(entries):
+def team_check_lines(entries, now=None, tz=None):
     """What the Team view would show, one ' | ' line per agent; a model follows the name after ' · '."""
     return [
-        " | ".join((r["agent"] + (" \u00b7 " + r["model"] if r["model"] else ""), r["state"], "now: " + (r["now"] or "-"), "owns: " + (r["owns"] or "-"), "FREE" if r["free"] else ""))
-        for r in team_rows(entries)
+        " | ".join(
+            (r["agent"] + (" \u00b7 " + r["model"] if r["model"] else ""), r["status"] + (" (" + r["usage"] + ")" if r["usage"] else ""), "now: " + (r["now"] or "-"), "owns: " + (r["owns"] or "-"))
+        )
+        for r in team_rows(entries, now, tz)
     ]
 
 

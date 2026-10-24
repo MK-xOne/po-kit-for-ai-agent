@@ -1,5 +1,6 @@
 [
-  {"agent": "ada", "model": "Big Model (API)", "state": "WORKING", "now": "1.4", "owns": ["1.4"], "free": false},
+  {"agent": "ada", "model": "Big Model (API)", "state": "WORKING", "now": "1.4", "owns": ["1.4"], "free": false, "limit_until": null, "usage": {"five_hour": 0.42, "seven_day": 0.18}},
   {"agent": "bo", "model": "small-model (local GPU)", "state": "idle 22m", "now": null, "owns": ["1.5", "1.6"], "free": false},
-  {"agent": "cy", "state": "idle 3h", "now": null, "owns": [], "free": true}
+  {"agent": "cy", "state": "idle 3h", "now": null, "owns": [], "free": true},
+  {"agent": "di", "model": "Big Model (API)", "state": "idle 5m", "now": null, "owns": ["1.7"], "free": false, "limit_until": "2099-01-01T15:30:00Z", "usage": {"five_hour": 1.0, "seven_day": 0.64}}
 ]

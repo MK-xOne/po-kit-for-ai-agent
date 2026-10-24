@@ -7,7 +7,7 @@ The URL is the events JSON (a JSON array or one object per line, e.g. the
 /events.json of `po serve`); --url or PO_DASHBOARD_URL, no default. GTK 4 and
 PyGObject (pacman -S gtk4 python-gobject); the logic is lib/po/dashboard_core.py.
 --team-url or PO_DASHBOARD_TEAM_URL (no default) adds a Team view, a header toggle Events | Team, reading a
-JSON array of {agent, model?, state, now, owns[], free}; without it there is no toggle. Drag a Team line
+JSON array of {agent, model?, state, now, owns[], free, limit_until?, usage?}; without it there is no toggle. Drag a Team line
 (or Alt+Up/Down on a focused one) to reorder; the order is saved in $XDG_CONFIG_HOME/po-dashboard/team-order.json
 (default ~/.config; PO_DASHBOARD_TEAM_ORDER names another file).
 --decisions-url or PO_DASHBOARD_DECISIONS_URL (no default) adds a Decisions view to the toggle, read-only:
@@ -430,7 +430,7 @@ def main():
                 nxt = child.get_next_sibling()
                 self.team_list.remove(child)
                 child = nxt
-            groups = [Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL) for _ in range(5)]
+            groups = [Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL) for _ in range(4)]
             rows = core.team_rows(core.apply_team_order(self.team, self.team_order))
             any_model = any(r["model"] for r in rows)
             self.team_shown = [r["agent"] for r in rows]
@@ -444,20 +444,18 @@ def main():
                 model = self.label(r["model"], "po-muted", max_width_chars=28, ellipsize=3)
                 model.set_tooltip_text(r["model"] or None)
                 state = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-                if r["working"]:
+                if r["kind"] == "working":
                     state.append(self.label("\u25cf", "po-live"))
-                    state.append(self.label(r["state"], "po-live", ellipsize=3, max_width_chars=24))
-                else:
-                    state.append(self.label(r["state"], "po-muted", ellipsize=3, max_width_chars=24))
+                style = {"working": "po-live", "free": "po-free", "limit": "po-fail"}.get(r["kind"], "po-muted")
+                state.append(self.label(r["status"], style, ellipsize=3, max_width_chars=28))
+                if r["usage"]:
+                    state.append(self.label(r["usage"], "po-muted", ellipsize=3, max_width_chars=20))
                 now = self.label(("now " + r["now"]) if r["now"] else "", "po-text", width_chars=10, max_width_chars=16, ellipsize=3)
                 owns = self.label(("owns " + r["owns"]) if r["owns"] else "owns nothing", "po-muted", hexpand=True, ellipsize=3)
                 owns.set_tooltip_text(r["owns"])
-                badge = Gtk.Box(halign=Gtk.Align.END)
-                if r["free"]:
-                    badge.append(self.label("FREE", "po-free"))
-                for w, g in zip((name, model, state, now, badge), groups):
+                for w, g in zip((name, model, state, now), groups):
                     g.add_widget(w)
-                for w in (name, model, state, now, owns, badge) if any_model else (name, state, now, owns, badge):
+                for w in (name, model, state, now, owns) if any_model else (name, state, now, owns):
                     card.append(w)
                 self.team_list.append(card)
                 self.team_cards[r["agent"]] = card

@@ -302,10 +302,17 @@ the same from any worktree.
   them); the logic is `lib/po/dashboard_core.py`, which needs neither.
   `--team-url` or `PO_DASHBOARD_TEAM_URL` (no default; `--team-url` wins) adds a
   Team view, a header toggle Events | Team: one line per agent from a JSON
-  array of `{agent, model?, state, now, owns[], free}` (name, then the optional
-  `model` string in muted text, nothing when absent; `state` as given with a
-  live dot when it starts with WORKING, the `now` item, the `owns` items, a FREE
-  badge when `free`), refreshed with the events; a failed fetch keeps the last
+  array of `{agent, model?, state, now, owns[], free, limit_until?, usage?}`
+  (name, then the optional `model` string in muted text, nothing when absent;
+  one Status column, then the `now` item and the `owns` items). Status is
+  `LIMIT until <time>` (in the viewer's local time, with the date when not
+  today; red; it wins over the rest) while `limit_until`, an ISO time, is still
+  ahead (null, absent, past or unparseable is no limit); else `state` as given
+  with a live dot when it starts with WORKING; else a FREE badge when `free`;
+  else `state` in muted text (`idle 22m`). `usage` is
+  `{five_hour, seven_day}`, each 0-1, shown after the status as muted
+  percentages (`5h 42% · 7d 18%`), only the parts present; old feeds without
+  `limit_until` or `usage` show as before. It is refreshed with the events; a failed fetch keeps the last
   team data and says so. The feed is an http(s) URL or a file
   (`examples/team-feed.json` is a sample); without the option there is no
   toggle; `--view team` starts in it. Drag a Team line onto another to take its
