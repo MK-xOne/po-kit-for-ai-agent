@@ -14,6 +14,27 @@ Unreleased becomes `## Release N (YYYY-MM-DD): <theme>`.
 
 Nothing yet.
 
+## Release 3 (2026-10-24): the desktop event viewer
+
+Item v0.14.
+
+**Agents, in short:** nothing to do; `po-dashboard` is a window for the person
+who wants to watch the gate events, read-only: run it only when asked.
+
+**Adopt, in short:** `pacman -S gtk4 python-gobject`, only where the window is
+wanted.
+
+### `po-dashboard` (v0.14)
+
+- `bin/po-dashboard` is a desktop window (GTK 4, own neumorphic CSS, light
+  and dark following the desktop) for the gate events of a `po serve`: the
+  last 10 as cards, a "Show all" toggle, a refresh every 5 seconds, an error
+  line that keeps the last data. The URL comes from `--url` or
+  `PO_DASHBOARD_URL`; there is no default address.
+- **Agents:** it is read-only but stays open until closed, so run it only
+  when asked.
+- **Adopt:** `pacman -S gtk4 python-gobject`, only where the window is wanted.
+
 ## Release 2 (2026-10-23): gate events and a viewer
 
 Items v0.12 and v0.13.

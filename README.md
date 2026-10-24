@@ -48,6 +48,7 @@ by hand from the same instructions, and compare the two sessions' token counts.
 - macOS is not supported yet: its stock bash 3.2 and BSD tools differ. With
   Homebrew's `bash` and `coreutils` first on `PATH` it may work, untested.
 - `python3` (3.8 or newer, standard library only) for `po serve`.
+- `gtk4` and `python-gobject` (`pacman -S gtk4 python-gobject`) only for `po-dashboard`, the desktop viewer.
 - `shellcheck` only to run the kit's own lint.
 
 ## Install
@@ -258,6 +259,24 @@ the same from any worktree.
   interface's. There is no login, so bind only to an address whose reachers you
   trust. It prints `po serve: listening on http://<addr>:<port>/` and runs until
   stopped; `--port 0` picks a free port.
+- `po-dashboard [--url <url>] [--theme auto|light|dark] [--all] [--size WxH] [--check] [--screenshot <png>]`
+  (`bin/po-dashboard`, not a `po` subcommand) — a desktop window for the same
+  events: the last 10 as soft raised cards (item, project, kind, result, agent,
+  time in the local zone, legs, detail), a "Show all" toggle for every event, a
+  refresh every 5 seconds. The URL is the events JSON, for example the
+  `/events.json` of a `po serve`; `--url` or `PO_DASHBOARD_URL`, with no
+  default, and neither is an error (exit 1). It accepts a JSON array or one
+  object per line. An unreachable URL shows an error line and keeps the last
+  data. The window has the desktop's own title bar and a neumorphic style (GTK
+  CSS, one base colour per variant); pass and fail carry a symbol and a word
+  as well as a colour, text and status colours meet WCAG AA (4.5:1), and the
+  light or dark variant follows the desktop's setting (`--theme` overrides it).
+  Needs GTK 4 and PyGObject (`pacman -S gtk4 python-gobject`; exit 2 without
+  them); the logic is `lib/po/dashboard_core.py`, which needs neither.
+  Esc closes it. `--check` prints the rows the window would show, without a
+  display (`--all` for every event; exit 2 when the URL is unreachable);
+  `--all` also starts the window with Show all on, `--size WxH` sets its size,
+  and `--screenshot` saves the window to a PNG once it has data, then quits.
 - `po version` — the tag this po-kit checkout is at (`git describe --tags
   --exact-match`; else `git describe --tags --always --dirty`). Works from
   anywhere, reads no manifest.

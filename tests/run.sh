@@ -1899,5 +1899,185 @@ expect "serve --port needs a value" 1 "needs a value" -- -C "$SV/repo" serve --p
 out=$(cd "$SV/repo" && PATH="$SV/bin:$PATH" "$PO" serve --port 99999 2>&1)
 [[ $? == 1 ]] && ok "an out-of-range port is a usage error" || bad "port range" "$out"
 
+# ---- the desktop viewer (item N) -------------------------------------------
+# The logic is lib/po/dashboard_core.py (no GTK); bin/po-dashboard draws it.
+DB="$(dirname "$PO")/po-dashboard"
+DBLIB="$(dirname "$PO")/../lib/po"
+while IFS=$'\t' read -r status name detail; do
+	[[ $status == ok ]] && ok "$name" || bad "$name" "$detail"
+done < <(python3 -B -I - "$DBLIB" <<'PY'
+import datetime, http.server, json, sys, threading
+sys.path.insert(0, sys.argv[1])
+import dashboard_core as c
+
+def check(name, cond, detail=""):
+    print("%s\t%s\t%s" % ("ok" if cond else "FAIL", name, detail.replace("\n", " | ")))
+
+KEYS = ("time", "kind", "item", "project", "result", "agent", "legs", "detail")
+ev = [{"time": "2026-10-23T%02d:00:00Z" % i, "kind": "stamp", "item": "1.%d" % i, "project": "demo",
+       "result": "pass" if i % 4 else "fail", "agent": "dev%d" % i,
+       "legs": [{"name": "lint", "result": "pass"}, {"name": "test", "result": "pass" if i % 4 else "fail"}],
+       "detail": "d%d" % i} for i in range(12)]
+ev[5]["item"] = None
+ev[6].update(kind="open", legs=[])
+lines = "".join(json.dumps({k: e[k] for k in KEYS}) + "\n" for e in ev)
+
+check("dashboard: one object per line is parsed", len(c.parse_events(lines)) == 12)
+check("dashboard: a JSON array is parsed", len(c.parse_events(json.dumps(ev))) == 12)
+check("dashboard: one lone object is one event", len(c.parse_events(json.dumps(ev[0]))) == 1)
+check("dashboard: empty input is no events", c.parse_events("  \n") == [])
+try:
+    c.parse_events("not json\n")
+    check("dashboard: bad JSON is a DashboardError", False)
+except c.DashboardError as e:
+    check("dashboard: bad JSON is a DashboardError", "not JSON" in str(e))
+try:
+    c.parse_events('"text"')
+    check("dashboard: JSON that is not a list is refused", False)
+except c.DashboardError:
+    check("dashboard: JSON that is not a list is refused", True)
+check("dashboard: non-object entries are dropped", len(c.parse_events('[1, {"time": "x"}, null]')) == 1)
+
+shuffled = ev[::-1][6:] + ev[::-1][:6]
+check("dashboard: sorted newest first", [e["time"] for e in c.sort_events(shuffled)] == sorted((e["time"] for e in ev), reverse=True))
+same = [{"time": "t", "item": "a"}, {"time": "t", "item": "b"}]
+check("dashboard: equal times keep the source order", [e["item"] for e in c.sort_events(same)] == ["a", "b"])
+check("dashboard: the default view is the last 10", len(c.visible(ev, False)) == 10 and c.visible(ev, False)[0]["item"] == "1.11")
+check("dashboard: Show all lists every event", len(c.visible(ev, True)) == 12)
+check("dashboard: fewer than 10 events show them all", len(c.visible(ev[:3], False)) == 3)
+
+utc = datetime.timezone.utc
+est = datetime.timezone(datetime.timedelta(hours=-4))
+check("dashboard: time is shown in the given zone", c.local_time("2026-10-23T22:36:42Z", est) == "2026-10-23 18:36:42")
+check("dashboard: an unparseable time is kept as text", c.local_time("soon", utc) == "soon")
+check("dashboard: a missing time is empty", c.local_time(None, utc) == "")
+r = c.row(ev[5], utc)
+check("dashboard: item null is shown as -", r["item"] == "-")
+check("dashboard: legs are name:result", c.row(ev[0], utc)["legs"] == "lint:pass test:fail")
+check("dashboard: no legs is empty", c.row(ev[6], utc)["legs"] == "")
+check("dashboard: kind is shown", c.row(ev[6], utc)["kind"] == "open")
+check("dashboard: pass has a symbol and a word", c.row(ev[1], utc)["result"] == "✔ pass")
+check("dashboard: fail has a symbol and a word", c.row(ev[0], utc)["result"] == "✘ fail" and c.row(ev[0], utc)["result_class"] == "fail")
+check("dashboard: an unknown result keeps its word", c.row({"result": "weird"}, utc)["result"] == "– weird")
+check("dashboard: markup in a field stays text", c.row({"item": "<b>x</b>"}, utc)["item"] == "<b>x</b>")
+
+check("dashboard: --url wins over the environment", c.resolve_url("http://a/x", {"PO_DASHBOARD_URL": "http://b"}) == "http://a/x")
+check("dashboard: the environment is used without --url", c.resolve_url(None, {"PO_DASHBOARD_URL": "http://b/e"}) == "http://b/e")
+for env, name in (({}, "dashboard: no URL is a clear error"), ({"PO_DASHBOARD_URL": " "}, "dashboard: a blank URL is a clear error")):
+    try:
+        c.resolve_url(None, env)
+        check(name, False)
+    except c.DashboardError as e:
+        check(name, "PO_DASHBOARD_URL" in str(e) and "--url" in str(e))
+for bad_url in ("file:///etc/passwd", "ftp://h/x", "notaurl"):
+    try:
+        c.resolve_url(bad_url, {})
+        check("dashboard: %s is refused" % bad_url, False)
+    except c.DashboardError:
+        check("dashboard: %s is refused" % bad_url, True)
+
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/ok":
+            body = json.dumps(ev).encode()
+            self.send_response(200)
+        else:
+            body = b"boom"
+            self.send_response(502)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+base = "http://127.0.0.1:%d" % srv.server_address[1]
+check("dashboard: fetch and parse a served list", len(c.parse_events(c.fetch(base + "/ok"))) == 12)
+try:
+    c.fetch(base + "/bad")
+    check("dashboard: an HTTP error is a DashboardError", False)
+except c.DashboardError as e:
+    check("dashboard: an HTTP error is a DashboardError", "502" in str(e))
+srv.shutdown()
+srv.server_close()
+try:
+    c.fetch(base + "/ok", timeout=2)
+    check("dashboard: an unreachable URL is a DashboardError", False)
+except c.DashboardError as e:
+    check("dashboard: an unreachable URL is a DashboardError", "cannot reach" in str(e))
+
+# The style: contrast of the palette, read back from the generated CSS.
+for variant in sorted(c.PALETTES):
+    props = c.css_properties(c.css(variant))
+    for fg, bg, role in c.CONTRAST_PAIRS:
+        ratio = c.contrast(props[fg]["color"], props[bg]["background-color"])
+        check("dashboard css %s: %s has contrast >= 4.5 (%.2f)" % (variant, role, ratio), ratio >= 4.5)
+    check("dashboard css %s: cards and toggle are raised, a pressed toggle is inset" % variant,
+          "inset" not in props[".po-card"]["box-shadow"] and "inset" not in props[".po-toggle"]["box-shadow"]
+          and "inset" in props[".po-toggle:checked"]["box-shadow"])
+    check("dashboard css %s: one base colour for window, header, card, toggle" % variant,
+          len({props[s]["background-color"] for s in ("window.po-dashboard", ".po-header", ".po-card", ".po-toggle")}) == 1)
+check("dashboard css: the two variants differ", c.css("light") != c.css("dark"))
+check("dashboard: contrast of black on white is 21", round(c.contrast("#000000", "#ffffff")) == 21)
+PY
+)
+
+# bin/po-dashboard: argument handling needs no display.
+out=$(env -u PO_DASHBOARD_URL python3 -B "$DB" 2>&1)
+[[ $? == 1 && $out == *'no URL'* && $out == *PO_DASHBOARD_URL* ]] &&
+	ok "po-dashboard without a URL is a usage error naming --url and PO_DASHBOARD_URL" || bad "dashboard no url" "$out"
+out=$(python3 -B "$DB" --url ftp://h/x 2>&1)
+[[ $? == 1 && $out == *'not an http'* ]] && ok "po-dashboard refuses a non-http URL" || bad "dashboard bad url" "$out"
+out=$(python3 -B "$DB" --theme neon --url http://h/x 2>&1)
+[[ $? == 2 && $out == *'--theme'* ]] && ok "po-dashboard rejects an unknown theme" || bad "dashboard theme" "$out"
+out=$(python3 -B "$DB" --size 10x10 --url http://h/x 2>&1)
+[[ $? == 2 && $out == *'--size'* ]] && ok "po-dashboard rejects a window size below 200" || bad "dashboard size" "$out"
+# --check prints the rows without a display (and needs no GTK).
+python3 -I - "$SV/events.json" "$TMP/chk.port" <<'PY' &
+import http.server, sys, threading, time
+body = open(sys.argv[1], "rb").read()
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def log_message(self, *a): pass
+srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+open(sys.argv[2], "w").write(str(srv.server_address[1]))
+srv.serve_forever()
+PY
+CHK_PID=$!
+for _ in $(seq 1 50); do [[ -s $TMP/chk.port ]] && break; sleep 0.1; done
+CHK_URL="http://127.0.0.1:$(cat "$TMP/chk.port")/"
+out=$(python3 -B "$DB" --url "$CHK_URL" --check 2>&1)
+[[ $(wc -l <<<"$out") == 10 ]] &&
+	[[ $(head -1 <<<"$out") == "1.11 | demo | stamp | "* ]] && ok "po-dashboard --check prints the last 10 rows, newest first" || bad "dashboard check" "$out"
+out=$(python3 -B "$DB" --url "$CHK_URL" --check --all 2>&1)
+[[ $(wc -l <<<"$out") == 12 ]] && ok "po-dashboard --check --all prints every event" || bad "dashboard check all" "$out"
+kill "$CHK_PID" 2>/dev/null
+wait "$CHK_PID" 2>/dev/null
+out=$(python3 -B "$DB" --url "http://127.0.0.1:1/" --check 2>&1)
+[[ $? == 2 && $out == *'cannot reach'* ]] && ok "po-dashboard --check with an unreachable URL exits 2" || bad "dashboard check unreachable" "$out"
+if python3 -c 'import gi; gi.require_version("Gtk", "4.0"); from gi.repository import Gtk' >/dev/null 2>&1; then
+	if [[ -n ${DISPLAY:-}${WAYLAND_DISPLAY:-} ]]; then
+		# UI smoke: the window comes up with data and saves a screenshot.
+		python3 -I - "$SV/events.json" "$TMP/shot.png" "$DB" <<'PY' &&
+import http.server, subprocess, sys, threading
+body = open(sys.argv[1], "rb").read()
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def log_message(self, *a): pass
+srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+r = subprocess.run([sys.executable, sys.argv[3], "--url", "http://127.0.0.1:%d/" % srv.server_address[1], "--screenshot", sys.argv[2]], timeout=60)
+sys.exit(r.returncode)
+PY
+			[[ -s $TMP/shot.png ]] && ok "po-dashboard opens, loads events and saves a screenshot" || bad "dashboard ui smoke"
+	else
+		ok "po-dashboard UI smoke skipped: no display"
+	fi
+else
+	ok "po-dashboard UI smoke skipped: GTK 4 or PyGObject missing"
+fi
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 ((fail == 0))
