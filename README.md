@@ -287,7 +287,13 @@ the same from any worktree.
   badge when `free`), refreshed with the events; a failed fetch keeps the last
   team data and says so. The feed is an http(s) URL or a file
   (`examples/team-feed.json` is a sample); without the option there is no
-  toggle; `--view team` starts in it. Esc closes it. `--check` prints the rows the window would show, without a
+  toggle; `--view team` starts in it. Drag a Team line onto another to take its
+  place, or press Alt+Up/Down on a focused line; the order is saved on the
+  viewer's machine in `$XDG_CONFIG_HOME/po-dashboard/team-order.json` (default
+  `~/.config`; `PO_DASHBOARD_TEAM_ORDER` names another file), applied on every
+  refresh and at start, and `--check` uses it too. Agents not in the saved order
+  go last, in the feed's order; a missing or broken file is no order; the feed
+  itself is never written. Esc closes it. `--check` prints the rows the window would show, without a
   display (`--all` for every event, then the team lines when a team feed is set; exit 2
   when a URL is unreachable);
   `--all` also starts the window with Show all on, `--size WxH` sets its size,

@@ -17,6 +17,7 @@ LAST = 10
 INTERVAL_MS = 5000
 URL_ENV = "PO_DASHBOARD_URL"
 TEAM_URL_ENV = "PO_DASHBOARD_TEAM_URL"
+TEAM_ORDER_ENV = "PO_DASHBOARD_TEAM_ORDER"  # the saved order's file, instead of the default under the config dir
 FADE_SECONDS = 60
 FADE_STEPS = 60  # one CSS class per step, po-fade-<n>: n steps of highlight left
 FADE_AMOUNT = 0.25  # a new card starts 25% darker (lighter in the dark theme)
@@ -221,6 +222,74 @@ def team_check_lines(entries):
     ]
 
 
+# ---- the Team view's order, saved on the viewer's machine -------------------
+
+
+def team_order_path(env=None):
+    """$PO_DASHBOARD_TEAM_ORDER, else $XDG_CONFIG_HOME (default ~/.config)/po-dashboard/team-order.json."""
+    env = os.environ if env is None else env
+    path = (env.get(TEAM_ORDER_ENV) or "").strip()
+    if path:
+        return path
+    base = (env.get("XDG_CONFIG_HOME") or "").strip()
+    if not os.path.isabs(base):  # the XDG spec: a relative value is ignored
+        base = os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "po-dashboard", "team-order.json")
+
+
+def load_team_order(path):
+    """The saved agent names, in order; a missing, unreadable or malformed file is no order."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+    if isinstance(data, dict):
+        data = data.get("order")
+    if not isinstance(data, list):
+        return []
+    out = []
+    for n in data:
+        if isinstance(n, str) and n not in out:
+            out.append(n)
+    return out
+
+
+def save_team_order(path, order):
+    """Write the order atomically, creating the directory. Raises DashboardError."""
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"order": list(order)}, f, indent=1)
+            f.write("\n")
+        os.replace(tmp, path)
+    except OSError as e:
+        raise DashboardError("cannot save the team order: %s" % e)
+
+
+def apply_team_order(entries, order):
+    """The feed's entries in the saved order; agents not in it follow, in the feed's order."""
+    rank = {n: i for i, n in enumerate(order)}
+    last = len(rank)
+    keyed = sorted(enumerate(entries), key=lambda p: (rank.get(str(p[1].get("agent") or "?"), last), p[0]))
+    return [e for _, e in keyed]
+
+
+def move_agent(shown, name, index):
+    """The shown names with name moved to index (clamped); unchanged when name is not shown."""
+    if name not in shown:
+        return list(shown)
+    out = [n for n in shown if n != name]
+    out.insert(max(0, min(index, len(out))), name)
+    return out
+
+
+def merge_team_order(shown, order):
+    """The order to save after a move: the shown names, then saved names not shown now (kept for later)."""
+    return list(shown) + [n for n in order if n not in shown]
+
+
 # ---- the new-event highlight -------------------------------------------------
 
 
@@ -332,6 +401,8 @@ window.po-dashboard { background-color: %(base)s; color: %(text)s; }
   padding: 8px 16px; box-shadow: 4px 4px 8px %(dark)s, -4px -4px 8px %(light)s; }
 .po-view:checked { box-shadow: inset 4px 4px 8px %(dark)s, inset -4px -4px 8px %(light)s; }
 .po-view:focus-visible { outline: 2px solid %(text)s; outline-offset: 2px; }
+.po-team:focus-visible { outline: 2px solid %(text)s; outline-offset: 2px; }
+.po-team.po-drop { box-shadow: inset 4px 4px 8px %(dark)s, inset -4px -4px 8px %(light)s; }
 """
 
 # (foreground selector, background selector, role): each pair must reach 4.5:1.

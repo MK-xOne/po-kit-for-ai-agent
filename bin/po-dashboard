@@ -7,7 +7,9 @@ The URL is the events JSON (a JSON array or one object per line, e.g. the
 /events.json of `po serve`); --url or PO_DASHBOARD_URL, no default. GTK 4 and
 PyGObject (pacman -S gtk4 python-gobject); the logic is lib/po/dashboard_core.py.
 --team-url or PO_DASHBOARD_TEAM_URL (no default) adds a Team view, a header toggle Events | Team, reading a
-JSON array of {agent, model?, state, now, owns[], free}; without it there is no toggle. Esc closes the window. Exit codes: 1 usage, 2 GTK or PyGObject missing
+JSON array of {agent, model?, state, now, owns[], free}; without it there is no toggle. Drag a Team line
+(or Alt+Up/Down on a focused one) to reorder; the order is saved in $XDG_CONFIG_HOME/po-dashboard/team-order.json
+(default ~/.config; PO_DASHBOARD_TEAM_ORDER names another file). Esc closes the window. Exit codes: 1 usage, 2 GTK or PyGObject missing
 (or, with --check, the feed unreachable).
 """
 import argparse
@@ -67,8 +69,9 @@ def main():
         try:
             print("\n".join(core.check_lines(core.parse_events(core.fetch(url)), a.all)))
             if team_url:
+                order = core.load_team_order(core.team_order_path())
                 print("team:")
-                print("\n".join(core.team_check_lines(core.parse_team(core.fetch(team_url)))))
+                print("\n".join(core.team_check_lines(core.apply_team_order(core.parse_team(core.fetch(team_url)), order))))
         except core.DashboardError as e:
             die(str(e), 2)
         return
@@ -83,6 +86,10 @@ def main():
             self.cards = []  # (card, event key, highlight step now) of the Events view
             self.team = []
             self.team_text = None
+            self.order_path = core.team_order_path()
+            self.team_order = core.load_team_order(self.order_path)  # saved agent names, the viewer's own order
+            self.team_shown = []  # agent names as the Team view shows them now
+            self.team_cards = {}  # agent name -> its card, to keep focus on a moved line
             self.view = "events"
             self.events_failed = False
             self.team_failed = False
@@ -368,11 +375,15 @@ def main():
                 self.team_list.remove(child)
                 child = nxt
             groups = [Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL) for _ in range(5)]
-            rows = core.team_rows(self.team)
+            rows = core.team_rows(core.apply_team_order(self.team, self.team_order))
             any_model = any(r["model"] for r in rows)
+            self.team_shown = [r["agent"] for r in rows]
+            self.team_cards = {}
             for r in rows:
                 card = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
                 card.add_css_class("po-card")
+                card.add_css_class("po-team")
+                self.make_movable(card, r["agent"])
                 name = self.label(r["agent"], "po-text", width_chars=10, max_width_chars=16, ellipsize=3)
                 model = self.label(r["model"], "po-muted", max_width_chars=28, ellipsize=3)
                 model.set_tooltip_text(r["model"] or None)
@@ -393,6 +404,49 @@ def main():
                 for w in (name, model, state, now, owns, badge) if any_model else (name, state, now, owns, badge):
                     card.append(w)
                 self.team_list.append(card)
+                self.team_cards[r["agent"]] = card
+
+        def make_movable(self, card, agent):
+            """Drag the line onto another to take its place; Alt+Up/Down moves the focused line."""
+            from gi.repository import GObject
+
+            card.set_focusable(True)
+            card.set_tooltip_text("%s: drag, or Alt+Up/Down, to reorder" % agent)
+            src = Gtk.DragSource(actions=Gdk.DragAction.MOVE)
+            src.connect("prepare", lambda *_: Gdk.ContentProvider.new_for_value(agent))
+            src.connect("drag-begin", lambda s, _drag: s.set_icon(Gtk.WidgetPaintable.new(card), 20, 20))
+            card.add_controller(src)
+            dst = Gtk.DropTarget.new(GObject.TYPE_STRING, Gdk.DragAction.MOVE)
+            dst.connect("enter", lambda *_: card.add_css_class("po-drop") or Gdk.DragAction.MOVE)
+            dst.connect("leave", lambda *_: card.remove_css_class("po-drop"))
+            dst.connect("drop", lambda _t, value, _x, _y: self.move_team(value, self.team_shown.index(agent)) if agent in self.team_shown else False)
+            card.add_controller(dst)
+            keys = Gtk.EventControllerKey()
+            keys.connect("key-pressed", self.on_team_key, agent)
+            card.add_controller(keys)
+
+        def on_team_key(self, _ctrl, keyval, _code, state, agent):
+            if not state & Gdk.ModifierType.ALT_MASK or keyval not in (Gdk.KEY_Up, Gdk.KEY_Down) or agent not in self.team_shown:
+                return False
+            self.move_team(agent, self.team_shown.index(agent) + (-1 if keyval == Gdk.KEY_Up else 1))
+            return True
+
+        def move_team(self, agent, index):
+            """Move agent to index, save the order on this machine, redraw and keep the focus on its line."""
+            shown = core.move_agent(self.team_shown, agent, index)
+            if shown == self.team_shown:
+                return True
+            self.team_order = core.merge_team_order(shown, self.team_order)
+            try:
+                core.save_team_order(self.order_path, self.team_order)
+            except core.DashboardError as e:
+                self.team_error.set_text(str(e))
+                self.team_error.set_visible(True)
+            self.redraw_team()
+            card = self.team_cards.get(agent)
+            if card is not None:
+                GLib.idle_add(card.grab_focus)
+            return True
 
         def screenshot(self):
             w, h = self.win.get_width(), self.win.get_height()

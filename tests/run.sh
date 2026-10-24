@@ -1916,6 +1916,7 @@ out=$(cd "$SV/repo" && PATH="$SV/bin:$PATH" "$PO" serve --port 99999 2>&1)
 # The logic is lib/po/dashboard_core.py (no GTK); bin/po-dashboard draws it.
 DB="$(dirname "$PO")/po-dashboard"
 DBLIB="$(dirname "$PO")/../lib/po"
+export PO_DASHBOARD_TEAM_ORDER="$TMP/no-team-order.json"  # never the tester's own saved order
 while IFS=$'\t' read -r status name detail; do
 	[[ $status == ok ]] && ok "$name" || bad "$name" "$detail"
 done < <(python3 -B -I - "$DBLIB" <<'PY'
@@ -2033,6 +2034,41 @@ check("dashboard team: an absent, null or non-string model is empty", mt[1]["mod
 check("dashboard team: a check line shows the model after the name", c.team_check_lines([{"agent": "ada", "model": "Big Model (API)", "state": "WORKING", "now": "1.4", "owns": ["1.4"]}]) == ["ada \u00b7 Big Model (API) | WORKING | now: 1.4 | owns: 1.4 | "])
 check("dashboard team: a check line without a model is unchanged", c.team_check_lines([{"agent": "bo", "model": "", "state": "idle 22m", "free": True}]) == ["bo | idle 22m | now: - | owns: - | FREE"])
 check("dashboard team: the example feed parses, with and without a model", [r["model"] != "" for r in c.team_rows(c.parse_team(open(sys.argv[1] + "/../../examples/team-feed.json").read()))] == [True, True, False])
+# The Team view's saved order: where it lives, load and save, merged with the feed.
+import os, tempfile
+check("dashboard order: PO_DASHBOARD_TEAM_ORDER names the file", c.team_order_path({"PO_DASHBOARD_TEAM_ORDER": "/t/o.json", "XDG_CONFIG_HOME": "/x"}) == "/t/o.json")
+check("dashboard order: XDG_CONFIG_HOME is honoured", c.team_order_path({"XDG_CONFIG_HOME": "/x"}) == "/x/po-dashboard/team-order.json")
+check("dashboard order: the default is ~/.config, a relative XDG_CONFIG_HOME is ignored",
+      c.team_order_path({}) == os.path.join(os.path.expanduser("~"), ".config", "po-dashboard", "team-order.json") == c.team_order_path({"XDG_CONFIG_HOME": "rel"}))
+od = tempfile.mkdtemp()
+op = os.path.join(od, "sub", "dir", "team-order.json")
+check("dashboard order: a missing file is no order", c.load_team_order(op) == [])
+for name, body in (("corrupt JSON", "{not json"), ("a non-list", '"ada"'), ("an empty file", "")):
+    with open(os.path.join(od, "bad.json"), "w") as f:
+        f.write(body)
+    check("dashboard order: %s is no order" % name, c.load_team_order(os.path.join(od, "bad.json")) == [])
+with open(os.path.join(od, "mixed.json"), "w") as f:
+    f.write('{"order": ["bo", 3, null, "ada", "bo"]}')
+check("dashboard order: non-names and repeats are dropped", c.load_team_order(os.path.join(od, "mixed.json")) == ["bo", "ada"])
+c.save_team_order(op, ["cy", "ada"])
+check("dashboard order: a saved order survives a restart (written, directory made, read back)", c.load_team_order(op) == ["cy", "ada"] and not os.path.exists(op + ".tmp"))
+try:
+    c.save_team_order(os.path.join(od, "mixed.json", "x.json"), ["ada"])
+    check("dashboard order: a failed save is a DashboardError", False)
+except c.DashboardError:
+    check("dashboard order: a failed save is a DashboardError", True)
+feed = [{"agent": "ada"}, {"agent": "bo"}, {"agent": "cy"}, {"agent": "di"}]
+names = lambda es: [e["agent"] for e in es]
+check("dashboard order: no saved order keeps the feed's order", names(c.apply_team_order(feed, [])) == ["ada", "bo", "cy", "di"])
+check("dashboard order: the saved order wins over the feed's", names(c.apply_team_order(feed, ["di", "cy", "bo", "ada"])) == ["di", "cy", "bo", "ada"])
+check("dashboard order: agents not in the saved order go last, in the feed's order", names(c.apply_team_order(feed, ["cy", "gone"])) == ["cy", "ada", "bo", "di"])
+check("dashboard order: applying it leaves the feed untouched", names(feed) == ["ada", "bo", "cy", "di"] and c.apply_team_order(feed, ["bo"])[0] is feed[1])
+check("dashboard order: a line moves to the place it is dropped on, up or down",
+      c.move_agent(["a", "b", "c"], "a", 2) == ["b", "c", "a"] and c.move_agent(["a", "b", "c"], "c", 0) == ["c", "a", "b"] and c.move_agent(["a", "b", "c"], "a", 1) == ["b", "a", "c"])
+check("dashboard order: Alt+Up on the first line and Alt+Down on the last change nothing",
+      c.move_agent(["a", "b"], "a", -1) == ["a", "b"] and c.move_agent(["a", "b"], "b", 2) == ["a", "b"])
+check("dashboard order: moving an agent not shown changes nothing", c.move_agent(["a", "b"], "z", 0) == ["a", "b"])
+check("dashboard order: the saved order keeps agents not shown now, after the shown ones", c.merge_team_order(["b", "a"], ["a", "x", "b"]) == ["b", "a", "x"])
 
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -2156,6 +2192,10 @@ out=$(python3 -B "$DB" --url "$CHK_URL" --check --all 2>&1)
 out=$(PO_DASHBOARD_TEAM_URL="$TMP/team.json" python3 -B "$DB" --url "$CHK_URL" --check 2>&1)
 [[ $(tail -2 <<<"$out" | head -1) == "ada | WORKING | now: 1.4 | owns: 1.4 | " && $(tail -1 <<<"$out") == "cy | idle 3h | now: - | owns: - | FREE" ]] &&
 	ok "po-dashboard --check lists the team after the events when a team feed is set" || bad "dashboard check team" "$out"
+printf '{"order": ["cy"]}\n' >"$TMP/team-order.json"
+out=$(PO_DASHBOARD_TEAM_ORDER="$TMP/team-order.json" PO_DASHBOARD_TEAM_URL="$TMP/team.json" python3 -B "$DB" --url "$CHK_URL" --check 2>&1)
+[[ $(tail -2 <<<"$out" | head -1) == "cy | idle 3h | now: - | owns: - | FREE" && $(tail -1 <<<"$out") == "ada | WORKING | now: 1.4 | owns: 1.4 | " ]] &&
+	ok "po-dashboard --check applies the saved team order" || bad "dashboard check team order" "$out"
 out=$(PO_DASHBOARD_TEAM_URL="$TMP/none.json" python3 -B "$DB" --url "$CHK_URL" --team-url "$TMP/team.json" --check 2>&1)
 [[ $out == *'team:'* ]] && ok "po-dashboard --team-url wins over PO_DASHBOARD_TEAM_URL" || bad "dashboard team precedence" "$out"
 out=$(env -u PO_DASHBOARD_TEAM_URL python3 -B "$DB" --url "$CHK_URL" --check 2>&1)

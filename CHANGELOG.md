@@ -14,6 +14,22 @@ Unreleased becomes `## Release N (YYYY-MM-DD): <theme>`.
 
 Nothing yet.
 
+## Release 8 (2026-10-24): reorder the Team view
+
+Item v0.19.
+
+**Agents, in short:** nothing to do.
+
+**Adopt, in short:** nothing.
+
+### Dashboard: reorder the Team view (v0.19, 2026-10-24)
+
+In the Team view of `po-dashboard`, drag a line onto another to take its place, or press Alt+Up/Down on a focused line. The order is saved on the viewer's machine in `$XDG_CONFIG_HOME/po-dashboard/team-order.json` (default `~/.config`; `PO_DASHBOARD_TEAM_ORDER` names another file), applied on every refresh and at start, and survives restarts. Agents not in the saved order go last, in the feed's order; a missing or corrupt file means no order. The feed stays read-only. `--check` applies the saved order too.
+
+**Agents:** nothing to do.
+
+**Adopt:** nothing.
+
 ## Release 7 (2026-10-24): model in the Team view
 
 Item v0.18.
