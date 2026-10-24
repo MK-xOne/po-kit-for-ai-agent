@@ -15,8 +15,9 @@ import subprocess
 import sys
 
 LAST = 10
-COLUMNS = ("item", "project", "kind", "result", "agent", "time")
-EXTRA = ("legs", "detail")  # /all only
+COLUMNS = ("result", "item", "project", "kind", "checks", "agent", "time", "note")
+CUES = {"pass": "\u2714 pass", "fail": "\u2718 fail", "skip": "\u2013 skip"}
+WIDTHS = {"result": 9, "item": 8, "kind": 7, "agent": 10, "time": 20, "note": 4}  # ch; project and checks share the rest
 PO_CMD = ("po", "events", "--all", "--json")
 
 
@@ -71,32 +72,55 @@ def load_events(repo):
     return events
 
 
-def cell(value, col=""):
-    if col == "legs" and isinstance(value, list):
-        return " ".join(
-            "%s:%s" % (l.get("name", "?"), l.get("result", "?")) if isinstance(l, dict) else str(l) for l in value
-        )
-    if col == "item" and value is None:
-        return "-"
+def legs_text(legs):
+    if not isinstance(legs, list):
+        return ""
+    return " ".join("%s:%s" % (l.get("name", "?"), l.get("result", "?")) if isinstance(l, dict) else str(l) for l in legs)
+
+
+def text(value):
     if isinstance(value, (list, dict)):
         value = json.dumps(value, separators=(",", ":"))
     return "" if value is None else str(value)
 
 
-def rows_html(events, with_legs):
+def field(e, col):
+    """The text of one column of event e."""
+    if col == "result":
+        r = text(e.get("result"))
+        return CUES.get(r.lower(), "\u2013 %s" % (r or "?"))
+    if col == "checks":
+        return legs_text(e.get("legs"))
+    if col == "note":
+        return text(e.get("detail"))
+    if col == "item" and e.get("item") is None:
+        return "-"
+    return text(e.get(col))
+
+
+def rows_html(events):
     out = []
     for e in events:
         tds = []
         for col in COLUMNS:
-            v = html.escape(cell(e.get(col), col))
+            raw = field(e, col)
+            v = html.escape(raw)
+            t = html.escape(raw, quote=True)
+            if col == "note":
+                inner = (
+                    '<span class="note" role="img" tabindex="0" title="%s" aria-label="%s">\u270e</span>' % (t, t) if raw else ""
+                )
+                tds.append('<td class="c-note">%s</td>' % inner)
+                continue
             if col == "time":
-                v = '<time datetime="%s">%s</time>' % (v, v)
+                inner = '<time datetime="%s">%s</time>' % (t, v)
             elif col == "result":
-                v = '<span class="r-%s">%s</span>' % (html.escape(cell(e.get(col), col).lower(), quote=True), v)
-            tds.append("<td>%s</td>" % v)
-        if with_legs:
-            for col in EXTRA:
-                tds.append("<td>%s</td>" % html.escape(cell(e.get(col), col)))
+                cls = text(e.get("result")).lower()
+                cls = cls if cls in CUES else "skip"
+                inner = '<span class="r-%s">%s</span>' % (cls, v)
+            else:
+                inner = v
+            tds.append('<td class="c-%s" title="%s">%s</td>' % (col, t, inner))
         out.append('<tr onclick="location=\'/all\'">%s</tr>' % "".join(tds))
     return "\n".join(out)
 
@@ -107,32 +131,42 @@ PAGE = """<!doctype html>
 <title>po events</title>
 <style>
 body{{font:14px system-ui,sans-serif;margin:1.5rem;color:#222;background:#fff}}
-table{{border-collapse:collapse;width:100%}}
-th,td{{text-align:left;padding:.35rem .6rem;border-bottom:1px solid #ddd;white-space:nowrap}}
+table{{border-collapse:collapse;width:100%;table-layout:fixed;min-width:44rem}}
+th,td{{text-align:left;padding:.35rem .6rem;border-bottom:1px solid #ddd;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
 tbody tr{{cursor:pointer}} tbody tr:hover{{background:#f3f3f3}}
-.r-pass,.r-ok{{color:#0a7a2f}} .r-fail{{color:#b3261e;font-weight:600}}
+.r-pass,.r-ok{{color:#0a7a2f;font-weight:600}} .r-fail{{color:#b3261e;font-weight:600}} .r-skip{{color:#555;font-weight:600}}
+.c-kind,.c-checks,.c-agent,.c-time{{color:#555}} .note{{color:#555;cursor:help}}
+.note:focus-visible{{outline:2px solid currentColor;outline-offset:2px}}
+.sr{{position:absolute;left:-9999px}}
 #err{{color:#b3261e}} nav a{{margin-right:1rem}}
 @media(prefers-color-scheme:dark){{body{{color:#ddd;background:#181818}}
 th,td{{border-color:#444}} tbody tr:hover{{background:#262626}}
-.r-pass,.r-ok{{color:#5fd38a}} .r-fail,#err{{color:#ff8a80}}}}
+.r-pass,.r-ok{{color:#5fd38a}} .r-fail,#err{{color:#ff8a80}} .r-skip,.c-kind,.c-checks,.c-agent,.c-time,.note{{color:#aaa}}}}
 </style></head>
-<body data-limit="{limit}" data-legs="{legs}">
+<body data-limit="{limit}">
 <h1>{title}</h1>
 <nav><a href="/">last {last}</a><a href="/all">all</a><a href="/events.json">json</a></nav>
 <p id="err">{err}</p>
-<table><thead><tr>{head}</tr></thead>
+<table><colgroup>{colgroup}</colgroup><thead><tr>{head}</tr></thead>
 <tbody id="rows">
 {rows}
 </tbody></table>
 <script>
-const body = document.body, limit = +body.dataset.limit, legs = body.dataset.legs === "1";
-const cols = {cols}, extra = {extra};
-function fmt(c, v) {{
-  if (c === "legs" && Array.isArray(v))
-    return v.map(l => (l && typeof l === "object") ? (l.name ?? "?") + ":" + (l.result ?? "?") : String(l)).join(" ");
-  if (c === "item" && v == null) return "-";
+const limit = +document.body.dataset.limit;
+const cols = {cols}, cues = {cues};
+function legs(v) {{
+  return Array.isArray(v) ? v.map(l => (l && typeof l === "object") ? (l.name ?? "?") + ":" + (l.result ?? "?") : String(l)).join(" ") : "";
+}}
+function str(v) {{
   if (v !== null && typeof v === "object") return JSON.stringify(v);
   return v == null ? "" : String(v);
+}}
+function field(c, e) {{
+  if (c === "result") {{ const r = str(e.result); return cues[r.toLowerCase()] || "\u2013 " + (r || "?"); }}
+  if (c === "checks") return legs(e.legs);
+  if (c === "note") return str(e.detail);
+  if (c === "item" && e.item == null) return "-";
+  return str(e[c]);
 }}
 let last = null;
 function local() {{
@@ -147,20 +181,36 @@ function render(events) {{
   for (const e of (limit ? events.slice(0, limit) : events)) {{
     const tr = document.createElement("tr");
     tr.onclick = () => {{ location = "/all"; }};
-    for (const c of cols.concat(legs ? extra : [])) {{
+    for (const c of cols) {{
       const td = document.createElement("td");
-      const v = fmt(c, e[c]);
-      if (c === "time") {{
-        const t = document.createElement("time");
-        t.setAttribute("datetime", v);
-        t.textContent = v;
-        td.appendChild(t);
-      }} else if (c === "result") {{
-        const s = document.createElement("span");
-        s.className = "r-" + v.toLowerCase().replace(/[^a-z0-9_-]/g, "");
-        s.textContent = v;
-        td.appendChild(s);
-      }} else td.textContent = v;
+      const v = field(c, e);
+      td.className = "c-" + c;
+      if (c === "note") {{
+        if (v) {{
+          const n = document.createElement("span");
+          n.className = "note";
+          n.setAttribute("role", "img");
+          n.tabIndex = 0;
+          n.title = v;
+          n.setAttribute("aria-label", v);
+          n.textContent = "\u270e";
+          td.appendChild(n);
+        }}
+      }} else {{
+        td.title = v;
+        if (c === "time") {{
+          const t = document.createElement("time");
+          t.setAttribute("datetime", v);
+          t.textContent = v;
+          td.appendChild(t);
+        }} else if (c === "result") {{
+          const s = document.createElement("span");
+          const r = str(e.result).toLowerCase();
+          s.className = "r-" + (cues[r] ? r : "skip");
+          s.textContent = v;
+          td.appendChild(s);
+        }} else td.textContent = v;
+      }}
       tr.appendChild(td);
     }}
     tb.appendChild(tr);
@@ -184,17 +234,18 @@ setInterval(poll, 5000);
 
 
 def page(events, error, full):
-    cols = list(COLUMNS) + (list(EXTRA) if full else [])
     return PAGE.format(
         limit=0 if full else LAST,
-        legs=1 if full else 0,
         last=LAST,
         title="All events" if full else "Last %d events" % LAST,
         err=html.escape(error or ""),
-        head="".join("<th>%s</th>" % html.escape(c) for c in cols),
-        rows=rows_html(events if full else events[:LAST], full),
+        colgroup="".join('<col style="width:%dch">' % WIDTHS[c] if c in WIDTHS else "<col>" for c in COLUMNS),
+        head="".join(
+            '<th class="c-%s">%s</th>' % (c, '<span class="sr">note</span>' if c == "note" else html.escape(c)) for c in COLUMNS
+        ),
+        rows=rows_html(events if full else events[:LAST]),
         cols=json.dumps(list(COLUMNS)),
-        extra=json.dumps(list(EXTRA)),
+        cues=json.dumps(CUES),
     )
 
 

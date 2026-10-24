@@ -107,6 +107,22 @@ def result_class(result):
     return r if r in CUES else "skip"
 
 
+# The columns of a card, left to right: (row key, title, width in characters,
+# widest before ellipsizing, grows with the window). Every card uses the same
+# widths, so the fields line up; the note slot follows the last column.
+COLUMNS = (
+    ("result", "result", 7, 7, False),
+    ("item", "item", 6, 6, False),
+    ("project", "project", 6, 28, True),
+    ("kind", "kind", 5, 5, False),
+    ("legs", "checks", 10, 44, True),
+    ("agent", "agent", 7, 7, False),
+    ("time", "time", 17, 17, False),
+)
+NOTE_ICONS = ("document-edit-symbolic", "text-x-generic-symbolic", "dialog-information-symbolic")
+NOTE_FALLBACK = "\u270e"  # pencil, used when the icon theme has none of NOTE_ICONS
+
+
 def row(event, tz=None):
     """One event as the strings a card shows. The result always carries a symbol and a word."""
     result = str(event.get("result") or "")
@@ -164,10 +180,12 @@ window.po-dashboard { background-color: %(base)s; color: %(text)s; }
 .po-toggle:checked { box-shadow: inset 4px 4px 8px %(dark)s, inset -4px -4px 8px %(light)s; }
 .po-toggle:focus-visible { outline: 2px solid %(text)s; outline-offset: 2px; }
 .po-list { background-color: transparent; padding: 6px 18px 18px 18px; }
-.po-card { background-color: %(base)s; border-radius: 14px; padding: 10px 16px; margin: 8px 0;
+.po-card { background-color: %(base)s; border-radius: 14px; padding: 12px 16px; margin: 8px 0;
   box-shadow: 5px 5px 10px %(dark)s, -5px -5px 10px %(light)s; }
 .po-text { color: %(text)s; }
 .po-muted { color: %(muted)s; font-size: 12px; }
+.po-note { color: %(muted)s; }
+.po-note:focus-visible { outline: 2px solid %(text)s; outline-offset: 2px; }
 .po-pass { color: %(pass)s; font-weight: 700; }
 .po-fail { color: %(fail)s; font-weight: 700; }
 .po-skip { color: %(skip)s; font-weight: 700; }
@@ -177,6 +195,7 @@ window.po-dashboard { background-color: %(base)s; color: %(text)s; }
 CONTRAST_PAIRS = [
     (".po-text", ".po-card", "card text"),
     (".po-muted", ".po-card", "card detail text"),
+    (".po-note", ".po-card", "note icon"),
     (".po-pass", ".po-card", "pass status"),
     (".po-fail", ".po-card", "fail status"),
     (".po-skip", ".po-card", "skip status"),

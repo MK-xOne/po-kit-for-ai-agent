@@ -247,9 +247,11 @@ the same from any worktree.
   readiness — and change nothing. Exit 6: refused by the item law.
 
 - `po serve [--bind <addr>] [--port <n>]` — a small read-only web viewer of the
-  gate events, for a screen you leave open. `/` shows the last 10 events (item,
-  project, kind, result, agent, time), newest on top; each row links to `/all`,
-  the full list; `/events.json` is the same data as JSON. The pages poll it every
+  gate events, for a screen you leave open. `/` shows the last 10 events, newest on top,
+  one row each: result (symbol and word), item, project, kind, checks (each
+  gate leg and its result), agent, time, and a note icon when the event has a
+  detail (its tooltip and aria-label are the detail); each row links to `/all`,
+  the full list, in the same layout; `/events.json` is the same data as JSON. The pages poll it every
   few seconds and redraw in place; times are UTC in the data and shown in the
   browser's local time. Every field is HTML-escaped. It reads events only by
   running `po events --json` (so it needs a po that has `po events`) and needs
@@ -261,8 +263,12 @@ the same from any worktree.
   stopped; `--port 0` picks a free port.
 - `po-dashboard [--url <url>] [--theme auto|light|dark] [--all] [--size WxH] [--check] [--screenshot <png>]`
   (`bin/po-dashboard`, not a `po` subcommand) — a desktop window for the same
-  events: the last 10 as soft raised cards (item, project, kind, result, agent,
-  time in the local zone, legs, detail), a "Show all" toggle for every event, a
+  events: the last 10 as soft raised single-line cards (result, item, project,
+  kind, checks, agent, time in the local zone, note) in fixed columns that line
+  up from card to card, long values ellipsized with the full text as a tooltip,
+  the project and checks columns widening with the window, and a note icon for
+  an event with a detail (tooltip and accessible label are the detail; an
+  event without one leaves the slot empty), a "Show all" toggle for every event, a
   refresh every 5 seconds. The URL is the events JSON, for example the
   `/events.json` of a `po serve`; `--url` or `PO_DASHBOARD_URL`, with no
   default, and neither is an error (exit 1). It accepts a JSON array or one

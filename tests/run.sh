@@ -1763,6 +1763,7 @@ ev[5]["item"] = None
 ev[5]["detail"] = "<b>boom</b>"
 ev[6]["kind"] = "open"
 ev[6]["legs"] = []
+ev[7]["detail"] = ""
 # real po events --json: one object per line, keys in this order
 KEYS = ("time", "kind", "item", "project", "result", "agent", "legs", "detail")
 with open(sys.argv[1], "w") as f:  # oldest first: the viewer must sort newest first
@@ -1811,7 +1812,7 @@ if [[ -z $SV_URL ]]; then
 else
 	[[ $SV_URL == http://127.0.0.1:* ]] && ok "po serve binds 127.0.0.1 by default" || bad "default bind" "$SV_URL"
 	out=$(sv_req GET /)
-	[[ $(head -1 <<<"$out") == 200 && $(grep -c '<td><time' <<<"$out") == 10 && $(grep -c '^<tr ' <<<"$out") == 10 ]] &&
+	[[ $(head -1 <<<"$out") == 200 && $(grep -c '<td class="c-time"' <<<"$out") == 10 && $(grep -c '^<tr ' <<<"$out") == 10 ]] &&
 		ok "/ shows 10 rows after 12 events" || bad "/ rows" "$out"
 	first=$(grep -m1 '^<tr ' <<<"$out")
 	[[ $first == *1.11* && $first == *dev11* && $first == *demo* && $first == *stamp* && $first == *'class="r-pass"'* ]] &&
@@ -1821,7 +1822,7 @@ else
 	[[ $out == *'onclick="location=&apos;/all&apos;"'* || $out == *"onclick=\"location='/all'\""* ]] &&
 		ok "each / row links to /all" || bad "row link" "$first"
 	out=$(sv_req GET /all)
-	[[ $(head -1 <<<"$out") == 200 && $(grep -c '^<tr ' <<<"$out") == 12 && $(grep -m1 '^<tr ' <<<"$out") == *1.11* && $out == *'<td>lint:pass test:pass</td>'* && $out == *'<td>lint:pass test:fail</td>'* ]] &&
+	[[ $(head -1 <<<"$out") == 200 && $(grep -c '^<tr ' <<<"$out") == 12 && $(grep -m1 '^<tr ' <<<"$out") == *1.11* && $out == *'>lint:pass test:pass</td>'* && $out == *'>lint:pass test:fail</td>'* ]] &&
 		ok "/all lists all 12 events, newest on top, with legs" || bad "/all" "$out"
 	out=$(sv_req GET /events.json)
 	[[ $(head -1 <<<"$out") == 200 ]] &&
@@ -1831,8 +1832,20 @@ else
 	[[ $out == *'<script>alert'* ]] && bad "item name reached the page unescaped" "$out" ||
 		{ [[ $out == *'&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;&amp;'* && $out == *'&quot;&gt;&lt;img src=x&gt;'* ]] &&
 			ok "every field is HTML-escaped (names are data, not markup)" || bad "escaping" "$out"; }
-	[[ $out == *'<td>-</td>'* && $out == *'<td>open</td>'* && $out == *'&lt;b&gt;boom&lt;/b&gt;'* && $out != *'<b>boom'* ]] &&
+	[[ $out == *'<td class="c-item" title="-">-</td>'* && $out == *'<td class="c-kind" title="open">open</td>'* && $out == *'&lt;b&gt;boom&lt;/b&gt;'* && $out != *'<b>boom'* ]] &&
 		ok "item null shows -, kind shows, detail is escaped" || bad "null item, kind, detail" "$out"
+	rows=$(grep -c '^<tr ' <<<"$out")
+	[[ $rows == 12 && $(grep -c '<td class="c-result"' <<<"$out") == 12 && $(grep -c '<td class="c-checks"' <<<"$out") == 12 &&
+		$(grep -c '<td class="c-note"' <<<"$out") == 12 ]] &&
+		ok "every row has the same eight columns, one row per event" || bad "columns" "$out"
+	[[ $(grep -c 'class="note"' <<<"$out") == 11 && $out == *'<td class="c-note"></td>'* ]] &&
+		ok "the note icon is on events with a detail and the slot is empty without" || bad "note slot" "$out"
+	[[ $out == *'<span class="note" role="img" tabindex="0" title="d3" aria-label="d3">'* && $out == *'title="&lt;b&gt;boom&lt;/b&gt;" aria-label="&lt;b&gt;boom&lt;/b&gt;"'* ]] &&
+		ok "the note icon carries the detail as title and aria-label, escaped" || bad "note attrs" "$out"
+	[[ $out == *'<span class="r-fail">'$'\u2718'' fail</span>'* && $out == *'<span class="r-pass">'$'\u2714'' pass</span>'* ]] &&
+		ok "pass and fail carry a symbol and a word" || bad "result cues" "$out"
+	[[ $out == *'fetch("/events.json"'* && $out == *'aria-label'* && $out == *"for (const c of cols)"* ]] &&
+		ok "the live redraw builds the same columns and note icon" || bad "page script columns" "$out"
 	[[ $out == *'fetch("/events.json"'* && $out == *toLocaleString* && $out == *textContent* ]] &&
 		ok "pages poll /events.json and render times locally with textContent" || bad "page script"
 	for m in POST PUT DELETE PATCH OPTIONS; do
@@ -1959,6 +1972,13 @@ check("dashboard: kind is shown", c.row(ev[6], utc)["kind"] == "open")
 check("dashboard: pass has a symbol and a word", c.row(ev[1], utc)["result"] == "✔ pass")
 check("dashboard: fail has a symbol and a word", c.row(ev[0], utc)["result"] == "✘ fail" and c.row(ev[0], utc)["result_class"] == "fail")
 check("dashboard: an unknown result keeps its word", c.row({"result": "weird"}, utc)["result"] == "– weird")
+keys = [col[0] for col in c.COLUMNS]
+check("dashboard: the columns are result item project kind checks agent time", keys == ["result", "item", "project", "kind", "legs", "agent", "time"])
+check("dashboard: every column key is a row field", all(k in c.row(ev[0], utc) for k in keys))
+check("dashboard: only project and checks grow", [col[0] for col in c.COLUMNS if col[4]] == ["project", "legs"])
+check("dashboard: fixed columns are as wide as they may get", all(col[2] == col[3] for col in c.COLUMNS if not col[4]))
+check("dashboard: a note is the detail, empty when there is none", c.row(ev[5], utc)["detail"] == "d5" and c.row({"detail": None}, utc)["detail"] == "" and c.row({}, utc)["detail"] == "")
+check("dashboard: the note icon has a theme fallback", len(c.NOTE_ICONS) >= 2 and c.NOTE_FALLBACK)
 check("dashboard: markup in a field stays text", c.row({"item": "<b>x</b>"}, utc)["item"] == "<b>x</b>")
 
 check("dashboard: --url wins over the environment", c.resolve_url("http://a/x", {"PO_DASHBOARD_URL": "http://b"}) == "http://a/x")

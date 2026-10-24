@@ -99,7 +99,7 @@ def main():
             self.error.set_visible(False)
             self.list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
             self.list.add_css_class("po-list")
-            scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+            scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.AUTOMATIC)
             scroll.set_child(self.list)
 
             outer.append(header)
@@ -198,25 +198,43 @@ def main():
                 lab.add_css_class(c)
             return lab
 
+        def note_icon(self, detail):
+            """The note slot's content: an icon whose tooltip and accessible label are the detail."""
+            theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
+            name = next((n for n in core.NOTE_ICONS if theme.has_icon(n)), None)
+            if name:
+                note = Gtk.Image.new_from_icon_name(name)
+            else:
+                note = Gtk.Label(label=core.NOTE_FALLBACK)
+            note.add_css_class("po-note")
+            note.set_tooltip_text(detail)
+            note.set_focusable(True)
+            note.update_property([Gtk.AccessibleProperty.LABEL], [detail])
+            return note
+
         def redraw(self):
             child = self.list.get_first_child()
             while child is not None:
                 nxt = child.get_next_sibling()
                 self.list.remove(child)
                 child = nxt
+            groups = [Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL) for _ in core.COLUMNS]
+            note_group = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)
             for r in core.rows(self.events, self.show_all):
-                card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+                card = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
                 card.add_css_class("po-card")
-                top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
-                res = self.label(r["result"], "po-" + r["result_class"], width_chars=8)
-                top.append(res)
-                top.append(self.label(r["item"], "po-text", width_chars=8))
-                top.append(self.label(r["project"], "po-text", hexpand=True))
-                top.append(self.label(r["kind"], "po-muted"))
-                card.append(top)
-                card.append(self.label("%s · %s%s" % (r["agent"], r["time"], "  ·  " + r["legs"] if r["legs"] else ""), "po-muted"))
+                for (key, _title, width, widest, grow), group in zip(core.COLUMNS, groups):
+                    cls = "po-" + r["result_class"] if key == "result" else "po-muted" if key in ("kind", "legs", "agent", "time") else "po-text"
+                    lab = self.label(r[key], cls, width_chars=width, max_width_chars=widest, hexpand=grow, ellipsize=3)
+                    lab.set_tooltip_text(r[key])
+                    group.add_widget(lab)
+                    card.append(lab)
+                slot = Gtk.Box(halign=Gtk.Align.CENTER)
                 if r["detail"]:
-                    card.append(self.label(r["detail"], "po-muted", ellipsize=3, max_width_chars=80))
+                    slot.append(self.note_icon(r["detail"]))
+                note_group.add_widget(slot)
+                slot.set_size_request(24, -1)
+                card.append(slot)
                 self.list.append(card)
 
         def screenshot(self):

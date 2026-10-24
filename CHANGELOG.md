@@ -14,6 +14,25 @@ Unreleased becomes `## Release N (YYYY-MM-DD): <theme>`.
 
 Nothing yet.
 
+## Release 4 (2026-10-24): one line per event, note icon
+
+Item v0.15.
+
+**Agents, in short:** nothing to do.
+
+**Adopt, in short:** nothing.
+
+### Dashboard and viewer: one line per event (v0.15)
+
+- `po-dashboard` shows each event as one single-line card in fixed columns
+  (result, item, project, kind, checks, agent, time, note); long values
+  ellipsize with the full text as a tooltip, and the project and checks
+  columns widen with the window. An event with a detail shows a note icon
+  whose tooltip and accessible label are the detail; the separate detail line
+  is gone. `po serve`'s pages use the same one-row layout and note icon.
+- **Agents:** none.
+- **Adopt:** none.
+
 ## Release 3 (2026-10-24): the desktop event viewer
 
 Item v0.14.
