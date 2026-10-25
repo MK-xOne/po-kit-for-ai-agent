@@ -1,3 +1,5 @@
+<img src="assets/logo/po-kit-icon-512.png" width="96" alt="po-kit">
+
 # po-kit
 
 `po` is a small command-line tool for running a software backlog one item at a
@@ -132,8 +134,12 @@ the same from any worktree.
   HEAD <sha> (<branch>)  dirty <n>
   gate PASS: check/test/clippy/fmt   tests <n> passed
   diffstat vs merge-base(main): <summary>
+  prepare ran: <line>               # one per [stamp] prepare line
   bin sha256 <hash> (<path>)        # with --bin
   ```
+
+  Optional `[stamp] prepare` lines run first (see below), so a format-only
+  failure cannot happen.
 
   The count is the sum of every libtest `test result: ok. N passed` line
   `test_count_cmd` prints, and must equal the gate's own when the gate
@@ -143,6 +149,27 @@ the same from any worktree.
   disagreeing count, a non-ok summary, or a worktree that changed while
   the gate ran exits 4 and writes no file. `dirty` and that last check
   ignore the stamp files themselves; don't commit them.
+
+  A failed run keeps its evidence outside the worktree. Its event (see
+  `po events`) gives the failing leg a `tail`: the last 40 lines of that
+  leg's output, each cut at 400 characters. The whole run's output (the
+  reason, then every command that ran, under its command line and exit
+  code) goes to `po-logs/stamp-<UTC time>-<item>-<pid>.log` in the
+  repository's common git dir; the event's `log` key names it and stderr
+  says where it is. Both are redacted first, best effort: the value of every
+  environment variable whose name says it is a secret (`TOKEN`, `SECRET`,
+  `PASSWORD`, `PASSWD`, `API_KEY`, `PRIVATE_KEY`, `ACCESS_KEY`, `CREDENTIAL`,
+  `AUTH`, `NSEC`), is 8 characters or more and is not an absolute path, the value after a key of that
+  kind (`token=...`, `password: ...`), an `Authorization` header's value
+  (up to a quote or semicolon),
+  `Bearer` and `Basic` credentials, a URL's user and password, tokens of
+  well-known shapes (`ghp_`, `github_pat_`, `glpat-`, `sk-`, `xox?-`, `AKIA`,
+  `nsec1`) and every line of a PEM private key become `[REDACTED]`, and
+  terminal colour codes are dropped. A secret of no known shape under a name
+  that does not say so passes through, so a gate should not print one. The
+  event's `detail`, which names the failing leg's command, is redacted the
+  same way. `po-logs/` is never pruned: po never deletes a log; remove old
+  ones by hand.
 
   With `[gate] test_format = "pytest"` (default `"libtest"`) the count is
   instead the `N passed` of the last pytest summary line the output has
@@ -207,11 +234,16 @@ the same from any worktree.
   `close`), `item` (null off an item branch), `project` (the checkout's
   directory name), `result` (`pass`, `fail`), `agent` (`$BUZZ_AGENT`, else the
   user), `legs` (each leg's `name` and `result`: `pass`, `fail`, or `skip` when
-  an earlier leg failed) and `detail` (why a stamp failed). Logging never
+  an earlier leg failed) and `detail` (why a stamp failed). A failed stamp
+  also has the failing leg's `tail` (its last 40 lines, redacted, one string
+  with `\n` between lines) and `log` (the absolute path of the run's full
+  output, null when it could not be written); see `po stamp`. Logging never
   changes a command's exit status or output; a log that cannot be written
   warns on stderr. `po events` prints the last 10, newest first, as a table
-  in the viewer's local time; `--all` prints every event; `--json` prints the
-  stored lines (UTC) for machines; the two combine.
+  in the viewer's local time, then, under it, each listed failed stamp's
+  tail, indented, under a line naming the leg and the log; `--all` prints
+  every event; `--json` prints the stored lines (UTC) for machines; the two
+  combine.
 - `po open <version|next> [<title>]` — the founding boundary. A new number
   must be latest founded + 1 (`next`), an epoch step with `--epoch`
   (1.10.0, 2.0.0), or the next insert in the `insert_segment`-th segment
@@ -257,6 +289,22 @@ the same from any worktree.
   one). A value that is not an array of quoted strings, or any other key under
   `[close]`, is a manifest error (2); `po doctor` lists the key as
   `adopt [close] checklist` for a manifest without it.
+- `[stamp] prepare` — an optional manifest key, a one-line array of
+  strings (`prepare = ["cargo fmt", "ruff format"]`), the deterministic
+  fixes (formatters) a project wants applied before every gate. `po stamp`
+  runs each non-blank line in order (`sh -c` in the worktree, stdin
+  `/dev/null`) before anything else, then takes the worktree's state, so
+  `dirty` and the unchanged-tree check count what the lines changed, and
+  the gate tests the formatted tree. The block names each line that ran
+  (`prepare ran: <line>`, after the diffstat); the event records them as one
+  leg, `prepare`, ahead of the gate's legs. Test summaries a line prints
+  are not counted. A line that exits non-zero fails the stamp like a gate
+  leg: exit 4, nothing written, later lines and the gate not run, the
+  `prepare` leg failed with its tail (the output of every line so far) and
+  the full output in the stamp log. Absent or `[]`, `po stamp` is
+  unchanged. A value that is not an array of quoted strings, or any other
+  key under `[stamp]`, is a manifest error (2); `po doctor` lists the key as
+  `adopt [stamp] prepare` for a manifest without it.
 - The backlog edits both make are status words only — a spec heading's
   status word, a table row's Status cell, the one status word after the
   item's id in BACKLOG prose (`v1.9.11 parser TODO` → `DOING`; a close
@@ -271,7 +319,8 @@ the same from any worktree.
   gate events, for a screen you leave open. `/` shows the last 10 events, newest on top,
   one row each: result (symbol and word), item, project, kind, checks (each
   gate leg and its result), agent, time, and a note icon when the event has a
-  detail (its tooltip and aria-label are the detail); each row links to `/all`,
+  detail (its tooltip and aria-label are the detail, then, for a failed
+  stamp, the failing leg's tail and the log's path); each row links to `/all`,
   the full list, in the same layout; `/events.json` is the same data as JSON. The pages poll it every
   few seconds and redraw in place; times are UTC in the data and shown in the
   browser's local time. Every field is HTML-escaped. It reads events only by
@@ -288,7 +337,8 @@ the same from any worktree.
   kind, checks, agent, time in the local zone, note) in fixed columns that line
   up from card to card, long values ellipsized with the full text as a tooltip,
   the project and checks columns widening with the window, and a note icon for
-  an event with a detail (tooltip and accessible label are the detail; an
+  an event with a detail (tooltip and accessible label are the detail, with
+  a failed stamp's tail and log path as in `po serve`; an
   event without one leaves the slot empty), a "Show all" toggle for every event, a
   refresh every 5 seconds. The URL is the events JSON, for example the
   `/events.json` of a `po serve`; `--url` or `PO_DASHBOARD_URL`, with no
@@ -326,8 +376,11 @@ the same from any worktree.
   `--decisions-url` wins) adds a Decisions view to the same header toggle
   (Events | Team | Decisions, each shown only when its feed is set): items
   waiting on a decision, from a JSON array of `{project, item, title,
-  waiting_for, asked_at, thread_url?}`, one line per entry, oldest `asked_at`
-  first (entries without a readable one last). `asked_at` is shown relative
+  waiting_for, asked_at, thread_url?, asked_by?}`, collapsed to one line per
+  entry (project, item, short title, when; `asked_by`, when present, shown
+  muted), click expands the full `waiting_for` wrapped with line breaks, click
+  again collapses. Oldest `asked_at` first (entries without a readable one
+  last). `asked_at` is shown relative
   ("3h ago"), its local time in the tooltip; `thread_url`, when present, is
   muted text you can select and copy, never opened from the window. Refreshed
   with the events; a failed fetch keeps the last decisions data and says so.
@@ -349,6 +402,9 @@ the same from any worktree.
   `po serve` do the same (a CSS animation; `prefers-reduced-motion` keeps the
   highlight without animating). `examples/events-demo-server.py` is a sample
   feed that adds an event every 15 seconds to watch it on.
+  Run `bin/po-dashboard-install` to add a po-dashboard entry to the desktop
+  application menu and install its icon theme files; `--prefix <dir>` installs
+  under a directory for testing, `--uninstall` removes exactly what it wrote.
 - `po version` — the tag this po-kit checkout is at (`git describe --tags
   --exact-match`; else `git describe --tags --always --dirty`). Works from
   anywhere, reads no manifest.

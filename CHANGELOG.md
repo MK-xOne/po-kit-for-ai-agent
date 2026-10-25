@@ -12,7 +12,69 @@ Unreleased becomes `## Release N (YYYY-MM-DD): <theme>`.
 
 ## Unreleased
 
-Nothing yet.
+## Release 11 (2026-10-25): failed-gate evidence, stamp prepare, dashboard polish
+
+Items v0.24 to v0.30.
+
+**Agents, in short:** read the tail or the log of a failed gate before asking why it failed; run the formatter through `[stamp] prepare` or by hand before stamping.
+
+**Adopt, in short:** optional: `[stamp] prepare = ["cargo fmt"]` (or `ruff format .`); feed producers may add `asked_by`.
+
+### Dashboard menu entry (v0.30, 2026-10-25)
+
+`bin/po-dashboard-install` adds a po-dashboard entry and its icons to the user's desktop menu (`--prefix <dir>` for tests, `--uninstall` to remove).
+
+**Agents:** nothing to do.
+
+**Adopt:** nothing.
+
+### The po-kit logo (v0.28, 2026-10-25)
+
+The logo files live in `assets/logo/` (SVG and PNGs 16 to 1024); the dashboard window uses it as its icon and the README shows it at the top.
+
+**Agents:** nothing to do.
+
+**Adopt:** nothing.
+
+### Dashboard: Show all stays put across views (v0.29, 2026-10-25)
+
+The Show all toggle sits left of the view buttons and is hidden by opacity, so switching to Team or Decisions moves nothing.
+
+**Agents:** nothing to do.
+
+**Adopt:** nothing.
+
+### Dashboard: screenshot and check runs never activate a running dashboard (v0.24, 2026-10-24)
+
+`po-dashboard --screenshot` and `--check` now register the GTK application as NON_UNIQUE, so they no longer hand off to the user's open dashboard (no stray windows, the PNG is written).
+
+**Agents:** nothing to do.
+
+**Adopt:** nothing.
+
+### Dashboard: Decisions entries collapse and expand (v0.25, 2026-10-25)
+
+Each Decisions entry shows one line (project, item, short title, when, and the optional `asked_by` muted); clicking it expands the full `waiting_for`, wrapped, line breaks kept; clicking again collapses. The feed row gains an optional `asked_by` string.
+
+**Agents:** nothing to do.
+
+**Adopt:** feed producers may add `asked_by`.
+
+### Failed gates keep their evidence (v0.26, 2026-10-25)
+
+A failed `po stamp` event now carries `tail` on the failing leg (its last 40 lines, redacted) and `log`, the path of the full redacted output kept under `po-logs/` in the git dir. `po events`, `po serve` and po-dashboard show the tail. `po-logs/` is never pruned.
+
+**Agents:** read the tail or the log before asking why a gate failed.
+
+**Adopt:** nothing.
+
+### Stamp prepare step (v0.27, 2026-10-25)
+
+An optional `[stamp] prepare` array in `po.toml` lists commands (a formatter, for example) that `po stamp` runs in the worktree before the gate, so formatting cannot fail it. The evidence block names each line (`prepare ran: <line>`), the event gets a `prepare` leg, and a failing line fails the stamp with its tail kept. `po doctor` offers it.
+
+**Agents:** run the formatter through `prepare` (or by hand) before stamping; the stamp will not fail on formatting alone.
+
+**Adopt:** `[stamp] prepare = ["cargo fmt"]` (or `ruff format .`), by the project's PO.
 
 ## Release 10 (2026-10-24): usage limit in the Team view
 

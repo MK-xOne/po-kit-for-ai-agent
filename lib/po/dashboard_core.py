@@ -138,6 +138,18 @@ def legs_text(legs):
     )
 
 
+def note_text(event):
+    """The note: the detail, then each failing leg's output tail and the log that holds the run's full output."""
+    parts = [str(event.get("detail") or "")]
+    legs = event.get("legs")
+    for l in legs if isinstance(legs, list) else []:
+        if isinstance(l, dict) and l.get("tail"):
+            parts.append("leg %s, last lines:\n%s" % (l.get("name", "?"), l["tail"]))
+    if event.get("log"):
+        parts.append("full output: %s" % event["log"])
+    return "\n\n".join(p for p in parts if p)
+
+
 def result_class(result):
     r = str(result or "").lower()
     return r if r in CUES else "skip"
@@ -173,7 +185,7 @@ def row(event, tz=None):
         "agent": str(event.get("agent") or ""),
         "time": local_time(event.get("time"), tz),
         "legs": legs_text(event.get("legs")),
-        "detail": str(event.get("detail") or ""),
+        "detail": note_text(event),
     }
 
 
@@ -320,20 +332,28 @@ def ago(then, now):
             return "%d%s ago" % (secs // size, unit)
 
 
+def short_title(text, limit=80):
+    """A title shortened to at most `limit` characters (default 80)."""
+    s = str(text if text is not None else "")
+    return s[:limit]
+
+
 def decision_row(entry, now=None, tz=None):
     """One decision as the strings a line shows; asked is relative to now, asked_local the local time."""
     now = now or datetime.datetime.now(datetime.timezone.utc)
     asked = parse_time(entry.get("asked_at"))
     url = entry.get("thread_url")
     item = entry.get("item")
+    asked_by = entry.get("asked_by")
     return {
         "project": str(entry.get("project") or ""),
         "item": "-" if item in (None, "") else str(item),
-        "title": str(entry.get("title") or ""),
+        "title": short_title(entry.get("title"), 80),
         "waiting_for": str(entry.get("waiting_for") or "?"),
         "asked": ago(asked, now) if asked else str(entry.get("asked_at") or "?"),
         "asked_local": local_time(entry.get("asked_at"), tz) if asked else "",
         "thread_url": url.strip() if isinstance(url, str) else "",
+        "asked_by": asked_by.strip() if isinstance(asked_by, str) else "",
     }
 
 

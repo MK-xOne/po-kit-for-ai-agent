@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# po-dashboard-install [--prefix <dir>] [--uninstall]
+# Installs the po-dashboard .desktop entry and icons into the user's (or
+# --prefix's) data directory. Idempotent: re-running overwrites in place.
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+DASHBOARD="$ROOT/bin/po-dashboard"
+DESKTOP_SRC="$ROOT/share/po-dashboard.desktop"
+LOGO="$ROOT/assets/logo"
+
+prefix=""
+uninstall=0
+while (($#)); do
+	case "$1" in
+	--prefix)
+		prefix="${2:?--prefix needs a dir}"; shift 2 ;;
+	--uninstall)
+		uninstall=1; shift ;;
+	-h|--help)
+		printf 'usage: po-dashboard-install [--prefix <dir>] [--uninstall]\n'; exit 0 ;;
+	*)
+		printf 'po-dashboard-install: unknown arg %s\n' "$1" >&2; exit 1 ;;
+	esac
+done
+
+if [[ -n $prefix ]]; then
+	DATA="$prefix"
+else
+	DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
+fi
+
+APPS="$DATA/applications"
+ICONS="$DATA/icons/hicolor"
+
+if ((uninstall)); then
+	rm -f "$APPS/po-dashboard.desktop"
+	rm -f "$ICONS/scalable/apps/po-dashboard.svg"
+	for f in "$LOGO"/po-kit-icon-*.png; do
+		[[ -e $f ]] || continue
+		sz=$(basename "$f" | sed -E 's/po-kit-icon-([0-9]+)\.png/\1/')
+		rm -f "$ICONS/${sz}x${sz}/apps/po-dashboard.png"
+	done
+	exit 0
+fi
+
+mkdir -p "$APPS"
+# Rewrite Exec to absolute path of this po-dashboard.
+sed "s|^Exec=.*|Exec=$DASHBOARD|" "$DESKTOP_SRC" > "$APPS/po-dashboard.desktop"
+
+# Icons.
+mkdir -p "$ICONS/scalable/apps"
+cp "$LOGO/po-kit-icon.svg" "$ICONS/scalable/apps/po-dashboard.svg"
+for f in "$LOGO"/po-kit-icon-*.png; do
+	[[ -e $f ]] || continue
+	sz=$(basename "$f" | sed -E 's/po-kit-icon-([0-9]+)\.png/\1/')
+	mkdir -p "$ICONS/${sz}x${sz}/apps"
+	cp "$f" "$ICONS/${sz}x${sz}/apps/po-dashboard.png"
+done
+
+# Refresh caches when available.
+if command -v update-desktop-database >/dev/null 2>&1; then
+	update-desktop-database "$APPS" >/dev/null 2>&1 || true
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+	gtk-update-icon-cache -f -t "$DATA/icons/hicolor" >/dev/null 2>&1 || true
+fi

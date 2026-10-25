@@ -1,5 +1,5 @@
 [
-  {"project": "orchard", "item": "2.3", "title": "Pick the storage format for snapshots", "waiting_for": "a ruling", "asked_at": "2026-10-24T09:12:00Z", "thread_url": "https://chat.example.org/t/8f2c41"},
+  {"project": "orchard", "item": "2.3", "title": "Pick the storage format for snapshots", "waiting_for": "a ruling", "asked_at": "2026-10-24T09:12:00Z", "thread_url": "https://chat.example.org/t/8f2c41", "asked_by": "ana"},
   {"project": "harbor", "item": "0.7", "title": "Accept the new import screen", "waiting_for": "an acceptance", "asked_at": "2026-10-24T14:40:00Z"},
   {"project": "orchard", "item": "2.5", "title": "Unblock the release: a key is missing", "waiting_for": "a block to clear", "asked_at": "2026-10-23T18:05:00Z", "thread_url": "https://chat.example.org/t/1b9e07"}
 ]

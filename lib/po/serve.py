@@ -83,6 +83,18 @@ def legs_text(legs):
     return " ".join("%s:%s" % (l.get("name", "?"), l.get("result", "?")) if isinstance(l, dict) else str(l) for l in legs)
 
 
+def note_text(event):
+    """The note: the detail, then each failing leg's output tail and the log that holds the run's full output."""
+    parts = [text(event.get("detail"))]
+    legs = event.get("legs")
+    for l in legs if isinstance(legs, list) else []:
+        if isinstance(l, dict) and l.get("tail"):
+            parts.append("leg %s, last lines:\n%s" % (l.get("name", "?"), text(l["tail"])))
+    if event.get("log"):
+        parts.append("full output: %s" % text(event["log"]))
+    return "\n\n".join(p for p in parts if p)
+
+
 def text(value):
     if isinstance(value, (list, dict)):
         value = json.dumps(value, separators=(",", ":"))
@@ -97,7 +109,7 @@ def field(e, col):
     if col == "checks":
         return legs_text(e.get("legs"))
     if col == "note":
-        return text(e.get("detail"))
+        return note_text(e)
     if col == "item" and e.get("item") is None:
         return "-"
     return text(e.get(col))
@@ -179,7 +191,12 @@ function str(v) {{
 function field(c, e) {{
   if (c === "result") {{ const r = str(e.result); return cues[r.toLowerCase()] || "\u2013 " + (r || "?"); }}
   if (c === "checks") return legs(e.legs);
-  if (c === "note") return str(e.detail);
+  if (c === "note") {{
+    const parts = [str(e.detail)];
+    for (const l of Array.isArray(e.legs) ? e.legs : []) if (l && typeof l === "object" && l.tail) parts.push("leg " + (l.name ?? "?") + ", last lines:\\n" + str(l.tail));
+    if (e.log) parts.push("full output: " + str(e.log));
+    return parts.filter(p => p).join("\\n\\n");
+  }}
   if (c === "item" && e.item == null) return "-";
   return str(e[c]);
 }}

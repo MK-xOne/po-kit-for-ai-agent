@@ -37,12 +37,14 @@ declare -gA PO_SCHEMA=(
 	[hooks.on_close]=0
 	[kickoff.preamble]=0
 	[close.checklist]=0
+	[stamp.prepare]=0
 )
 
 # The keys whose value is an array of strings, not a string or an integer.
 declare -gA PO_ARRAYS=(
 	[kickoff.preamble]=1
 	[close.checklist]=1
+	[stamp.prepare]=1
 )
 
 # Defaults for optional keys the kit reads.

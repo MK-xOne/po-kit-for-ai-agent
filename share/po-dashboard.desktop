@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=po dashboard
+Exec=po-dashboard
+Icon=po-dashboard
+Categories=Development;Utility;
+StartupWMClass=dev.pokit.Dashboard

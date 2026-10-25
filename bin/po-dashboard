@@ -37,10 +37,10 @@ def load_gtk():
 
         gi.require_version("Gtk", "4.0")
         gi.require_version("Gdk", "4.0")
-        from gi.repository import GLib, Gdk, Gtk
+        from gi.repository import GLib, Gdk, Gtk, Gio
     except (ImportError, ValueError, AttributeError) as e:
         die("needs GTK 4 and PyGObject (pacman -S gtk4 python-gobject): %s" % e, 2)
-    return GLib, Gdk, Gtk
+    return GLib, Gdk, Gtk, Gio
 
 
 def main():
@@ -85,7 +85,7 @@ def main():
         except core.DashboardError as e:
             die(str(e), 2)
         return
-    GLib, Gdk, Gtk = load_gtk()
+    GLib, Gdk, Gtk, Gio = load_gtk()
 
     class Dashboard:
         def __init__(self, app):
@@ -109,6 +109,10 @@ def main():
             self.last_text = None
             self.provider = None
             self.shot_done = False
+            logo_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "assets", "logo"))
+            if os.path.exists(os.path.join(logo_dir, "po-kit-icon-512.png")):  # GTK4 has no icon-from-file: use the theme
+                Gtk.IconTheme.get_for_display(Gdk.Display.get_default()).add_search_path(logo_dir)
+                Gtk.Window.set_default_icon_name("po-kit-icon-512")
             self.win = Gtk.ApplicationWindow(application=app, title="po events")
             self.win.set_default_size(width, height)
             self.win.add_css_class("po-dashboard")
@@ -131,6 +135,7 @@ def main():
                 self.toggle.set_label("Show last %d" % core.LAST)
             self.toggle.connect("toggled", self.on_toggle)
             header.append(texts)
+            header.append(self.toggle)
             self.view_buttons = {}
             if team_url or decisions_url:
                 views = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, valign=Gtk.Align.CENTER)
@@ -144,7 +149,6 @@ def main():
                     views.append(b)
                     self.view_buttons[name] = b
                 header.append(views)
-            header.append(self.toggle)
 
             self.error = Gtk.Label(label="", xalign=0, wrap=True, margin_start=36, margin_end=36)
             self.error.add_css_class("po-error")
@@ -322,7 +326,8 @@ def main():
                 self.fade_tick()
             self.stack.set_visible_child_name(name)
             self.title_label.set_text({"team": "Team", "decisions": "Decisions"}.get(name, "Gate events"))
-            self.toggle.set_visible(name == "events")
+            self.toggle.set_opacity(1.0 if name == "events" else 0.0)
+            self.toggle.set_sensitive(name == "events")
             self.error.set_visible(name == "events" and self.events_failed)
             self.team_error.set_visible(name == "team" and self.team_failed)
             self.decisions_error.set_visible(name == "decisions" and self.decisions_failed)
@@ -478,12 +483,24 @@ def main():
                 waiting = self.label("waiting for " + r["waiting_for"], "po-muted", max_width_chars=24, ellipsize=3)
                 asked = self.label("asked " + r["asked"], "po-muted", width_chars=14, max_width_chars=20, ellipsize=3)
                 asked.set_tooltip_text(r["asked_local"] or None)
+                if r.get("asked_by"):
+                    asked_by = self.label(r["asked_by"], "po-muted", width_chars=8, max_width_chars=16, ellipsize=3)
+                else:
+                    asked_by = None
                 for w, g in zip((item, project, waiting, asked), groups):
                     g.add_widget(w)
-                for w in (item, project, title, waiting, asked):
+                for w in (item, project, title, asked, asked_by) if asked_by else (item, project, title, asked):
                     top.append(w)
-                card.append(top)
-                if r["thread_url"]:  # text to copy, never opened from here
+                expanded = Gtk.Label(label=r["waiting_for"], xalign=0, wrap=True, selectable=True)
+                expanded.set_visible(False)
+                expanded.add_css_class("po-muted")
+                # collapsed header: click toggles the full waiting_for
+                header = Gtk.Button()
+                header.set_child(top)
+                header.connect("clicked", lambda _b, ex=expanded: ex.set_visible(not ex.get_visible()))
+                card.append(header)
+                card.append(expanded)
+                if r["thread_url"]:
                     url = self.label(r["thread_url"], "po-muted", selectable=True, ellipsize=2)
                     url.set_tooltip_text(r["thread_url"])
                     card.append(url)
@@ -541,7 +558,8 @@ def main():
             self.win.get_application().quit()
             return False
 
-    app = Gtk.Application(application_id="dev.pokit.Dashboard")
+    flags = Gio.ApplicationFlags.NON_UNIQUE if (a.screenshot or a.check) else 0
+    app = Gtk.Application(application_id="dev.pokit.Dashboard", flags=flags)
     app.connect("activate", lambda application: Dashboard(application))
     sys.exit(app.run([sys.argv[0]]))
 

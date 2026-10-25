@@ -17,7 +17,8 @@ every backlog status; **devs** each work one item in its own worktree.
   worktrees, dirt; `--idle <minutes>` flags stalls), `po fresh <v>` (is the
   branch behind main), `po kickoff <v>` (the item's spec section and the rulings
   since the last boundary), `po events` (the gate event log: every `po stamp`
-  run, pass or fail, and every `po open` and `po close --commit`; last 10,
+  run, pass or fail, and every `po open` and `po close --commit`; a failed
+  stamp shows its failing leg's last 40 lines and names its full log; last 10,
   `--all`, `--json`), `po serve [--bind <addr>] [--port <n>]` (a read-only web
   viewer of those events, loopback by default; run it only when asked, it stays
   up until stopped; `po-dashboard --url <events url>` is the same as a desktop

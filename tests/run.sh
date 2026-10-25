@@ -345,11 +345,13 @@ git -C "$W" add new.txt && git -C "$W" commit -qm "v1.0.3: Third"
 git -C "$S" commit -q --allow-empty -m "main moves on"
 
 # stamp_manifest <leg>...: the good manifest plus a gate, each leg as
-# "name=command"; COUNT_CMD overrides the test count command.
+# "name=command"; COUNT_CMD overrides the test count command, PREPARE is
+# the raw value of [stamp] prepare.
 stamp_manifest() {
 	local leg
 	{
 		printf '%s' "$GOOD_MANIFEST"
+		[[ -z ${PREPARE:-} ]] || printf '[stamp]\nprepare = %s\n' "$PREPARE"
 		printf '[gate]\ntest_count_cmd = "%s"\n' "${COUNT_CMD:-sh ./fake-test.sh 2>&1}"
 		[[ -z ${TEST_FORMAT:-} ]] || printf 'test_format = "%s"\n' "$TEST_FORMAT"
 		printf '[gate.legs]\n'
@@ -1669,10 +1671,14 @@ n_before=$(grep -c . "$BLOG")
 sha=$(sha256sum "$SLOG")
 out=$(TZ=Pacific/Auckland "$PO" -C "$S" --manifest "$TMP/s.toml" events 2>&1)
 code=$?
+# The table ends at the first blank line; failed stamps' tails follow it.
+# It reads all its input, so the writer never sees a closed pipe.
+table() { awk 'done { next } /^$/ { done = 1; next } { print }'; }
+out=$(table <<<"$out")
 rows=$(($(wc -l <<<"$out") - 1))
 [[ $code == 0 && $rows == 10 ]] && head -1 <<<"$out" | grep -qE '^TIME +KIND +ITEM +PROJECT +RESULT +AGENT +LEGS$' &&
 	ok "events: by default the table shows the last 10 events under a header" || bad "events table (exit $code, rows $rows)" "$out"
-[[ $(wc -l <"$SLOG") -gt 10 ]] && out_all=$("$PO" -C "$S" --manifest "$TMP/s.toml" events --all 2>&1) &&
+[[ $(wc -l <"$SLOG") -gt 10 ]] && out_all=$("$PO" -C "$S" --manifest "$TMP/s.toml" events --all 2>&1 | table) &&
 	[[ $(($(wc -l <<<"$out_all") - 1)) == "$(wc -l <"$SLOG")" ]] &&
 	ok "events: --all lists every event" || bad "events --all" "$out_all"
 grep -qE ' (NZDT|NZST) ' <<<"$out" && ! grep -q 'T[0-9:]*Z' <<<"$out" &&
@@ -1719,6 +1725,172 @@ rmdir "$SLOG"
 mv "$SLOG.keep" "$SLOG"
 stamp_manifest "${STD_LEGS[@]}"
 rm -f "$W"/gate-*.txt
+
+# ---- failed gates keep their evidence (item Z) ------------------------------
+# A failed stamp's event carries the failing leg's last 40 lines, redacted, and
+# names a log file of the whole run under po-logs/ in the common git dir.
+FL=$S/.git/po-logs
+FT=$TMP/ztmp
+mkdir -p "$FT"
+cat >"$TMP/z-first.sh" <<'SH'
+echo "first leg says hello"
+SH
+cat >"$TMP/z-noisy.sh" <<'SH'
+i=1
+while [ "$i" -le 50 ]; do echo "noisy line $i"; i=$((i + 1)); done
+echo "token=hunter2hunter2 and password: swordfish"
+echo "Authorization: Bearer abcdefghijklmnop0123"
+echo "curl -H 'X-Note: bearer zyxwvutsrqponm9876'"
+echo "clone https://alice:s3cr3tpw@example.invalid/repo.git"
+echo "found ghp_abcdefghijklmnopqrstuvwxyz0123456789 in config"
+echo "env value $Z_API_TOKEN leaked"
+echo "-----BEGIN OPENSSH PRIVATE KEY-----"
+echo "b3BlbnNzaC1rZXktdjEAAAAABG5vbmU"
+echo "-----END OPENSSH PRIVATE KEY-----"
+printf '\033[31mred text\033[0m plain\n'
+exit 3
+SH
+stamp_manifest "first=sh $TMP/z-first.sh" "noisy=sh $TMP/z-noisy.sh" last=true
+rm -f "$W"/gate-*.txt
+dirt_before=$(git -C "$W" status --porcelain --untracked-files=all)
+n_logs=$(find "$FL" -name '*.log' 2>/dev/null | grep -c . || true)
+TMPDIR=$FT Z_API_TOKEN=zz-env-secret-value-42 "$PO" -C "$W" --manifest "$TMP/s.toml" stamp >"$TMP/z.out" 2>"$TMP/z.err"
+code=$?
+zev=$(tail -1 "$SLOG")
+ztail=$(python3 -I -c 'import json,sys; e=json.loads(sys.argv[1]); print(e["legs"][1].get("tail", "<none>"))' "$zev")
+zlog=$(python3 -I -c 'import json,sys; print(json.loads(sys.argv[1]).get("log") or "")' "$zev")
+[[ $code == 4 && ! -s $TMP/z.out ]] && json_ok <(printf '%s\n' "$zev") &&
+	python3 -I -c 'import json,sys; e=json.loads(sys.argv[1]); assert [l["result"] for l in e["legs"]]==["pass","fail","skip"]; assert "tail" in e["legs"][1] and "tail" not in e["legs"][0] and "tail" not in e["legs"][2]; assert list(e)[-2:]==["detail","log"]' "$zev" &&
+	ok "evidence: a failed stamp's event gives the failing leg, and only it, a tail, and names a log" || bad "evidence event (exit $code)" "$zev"
+[[ $(wc -l <<<"$ztail") == 40 && $(head -1 <<<"$ztail") == 'noisy line 21' && $ztail != *'noisy line 20'$'\n'* ]] &&
+	ok "evidence: the tail is the failing leg's last 40 lines, one per line" || bad "tail lines" "$ztail"
+[[ $ztail == *'red text plain'* && $ztail != *$'\033'* ]] &&
+	ok "evidence: the tail drops terminal colour codes" || bad "tail colours" "$ztail"
+redacted() {
+	[[ $1 != *hunter2hunter2* && $1 != *swordfish* && $1 != *abcdefghijklmnop0123* && $1 != *zyxwvutsrqponm9876* && $1 != *s3cr3tpw* &&
+		$1 != *ghp_abcdef* && $1 != *zz-env-secret-value-42* && $1 != *b3BlbnNzaC1rZXktdjEAAAAABG5vbmU* ]] &&
+		[[ $1 == *'token=[REDACTED]'* && $1 == *'password: [REDACTED]'* && $1 == *'Authorization: [REDACTED]'* && $1 == *'bearer [REDACTED]'* &&
+			$1 == *'https://[REDACTED]@example.invalid/repo.git'* && $1 == *'found [REDACTED] in config'* &&
+			$1 == *'env value [REDACTED] leaked'* && $1 == *'noisy line 50'* ]]
+}
+redacted "$ztail" && ok "evidence: the tail is redacted: key=value secrets, bearer tokens, URL passwords, known token shapes, secret env values, private keys" || bad "tail redaction" "$ztail"
+[[ $zlog == "$FL"/stamp-*-1.0.3-*.log && -f $zlog ]] &&
+	ok "evidence: the log is a file under po-logs/ in the common git dir, named for the item" || bad "log path" "$zlog"
+zfull=$(cat "$zlog" 2>/dev/null)
+[[ $zfull == *'first leg says hello'* && $zfull == *'noisy line 1'$'\n'* && $zfull == *"gate leg 'noisy'"* &&
+	$zfull == *"== leg noisy: sh $TMP/z-noisy.sh (exit 3)"* ]] &&
+	ok "evidence: the log holds the whole run: the reason and every leg's full output under its command and exit" || bad "log content" "$zfull"
+redacted "$zfull" && ok "evidence: the log is redacted like the tail" || bad "log redaction" "$zfull"
+grep -qF "the full output is in $zlog" "$TMP/z.err" &&
+	ok "evidence: a failed stamp says on stderr where the full output is" || bad "stderr log" "$(cat "$TMP/z.err")"
+[[ $(git -C "$W" status --porcelain --untracked-files=all) == "$dirt_before" && -z $(ls -A "$FT") ]] &&
+	ok "evidence: the capture leaves the worktree untouched and no temporary files" || bad "capture dirt" "$(ls -A "$FT")"
+[[ $(find "$FL" -name '*.log' | grep -c .) == $((n_logs + 1)) ]] && rm -f "$W"/gate-*.txt &&
+	stamp_manifest "first=sh $TMP/z-first.sh" last=true && TMPDIR=$FT "$PO" -C "$W" --manifest "$TMP/s.toml" stamp >/dev/null 2>&1 &&
+	[[ $(find "$FL" -name '*.log' | grep -c .) == $((n_logs + 1)) && -z $(ls -A "$FT") ]] &&
+	! tail -1 "$SLOG" | grep -qE '"tail"|"log"' &&
+	ok "evidence: a passing stamp writes no log and its event has no tail or log" || bad "pass log"
+rm -f "$W"/gate-*.txt
+# A long line is cut; a failure that is not a leg's (the count) has a log but no tail.
+printf 'printf "%%0600d\\n" 0\nexit 1\n' >"$TMP/z-wide.sh"
+stamp_manifest "wide=sh $TMP/z-wide.sh"
+"$PO" -C "$W" --manifest "$TMP/s.toml" stamp >/dev/null 2>&1
+python3 -I -c 'import json,sys; t=json.loads(sys.argv[1])["legs"][0]["tail"]; assert len(t)==403 and t.endswith("..."), len(t)' "$(tail -1 "$SLOG")" &&
+	ok "evidence: a tail line longer than 400 characters is cut and ends in ..." || bad "wide line" "$(tail -1 "$SLOG" | cut -c1-300)"
+COUNT_CMD="echo counting; exit 2" stamp_manifest check=true
+"$PO" -C "$W" --manifest "$TMP/s.toml" stamp >/dev/null 2>&1
+zc=$(tail -1 "$SLOG")
+zclog=$(python3 -I -c 'import json,sys; e=json.loads(sys.argv[1]); assert all("tail" not in l for l in e["legs"]); print(e["log"])' "$zc")
+[[ -f $zclog ]] && grep -q '^== test count: echo counting; exit 2 (exit 2)$' "$zclog" && grep -q '^counting$' "$zclog" &&
+	ok "evidence: a failing test_count_cmd is in the log; no leg gets a tail" || bad "count failure" "$zc"
+# po events shows the tail under the table; --json keeps it as one line.
+stamp_manifest "first=sh $TMP/z-first.sh" "noisy=sh $TMP/z-noisy.sh" last=true
+"$PO" -C "$W" --manifest "$TMP/s.toml" stamp >/dev/null 2>&1
+zlog=$(python3 -I -c 'import json,sys; print(json.loads(sys.argv[1])["log"])' "$(tail -1 "$SLOG")")
+out=$("$PO" -C "$S" --manifest "$TMP/s.toml" events 2>&1)
+grep -qF "1.0.3: leg noisy failed; its last lines (full output: $zlog):" <<<"$out" &&
+	grep -qx '    noisy line 21' <<<"$out" && grep -qx '    token=\[REDACTED\] and password: \[REDACTED\]' <<<"$out" &&
+	! grep -qx '    noisy line 20' <<<"$out" && [[ $(table <<<"$out" | head -2 | tail -1) == *'first:pass noisy:fail last:skip'* ]] &&
+	ok "events: the table is followed by each failed stamp's tail, indented, naming the leg and the log" || bad "events tail" "$out"
+out=$("$PO" -C "$S" --manifest "$TMP/s.toml" events --json 2>&1)
+[[ $(wc -l <<<"$out") == 10 ]] && python3 -I -c 'import json,sys; e=json.loads(sys.stdin.readline()); assert e["legs"][1]["tail"].count("\n")==39' <<<"$out" &&
+	ok "events: --json keeps a tail's lines inside one event line" || bad "events json tail" "$(head -1 <<<"$out" | cut -c1-300)"
+# The reason names the leg's command; a secret in it is redacted in the event.
+stamp_manifest 'leak=echo password=hunter2secret; echo \"Authorization: Bearer abcdefgh12345678\"; exit 1'
+"$PO" -C "$W" --manifest "$TMP/s.toml" stamp >/dev/null 2>&1
+zd=$(tail -1 "$SLOG")
+zdd=$(jfield "$zd" detail)
+out=$("$PO" -C "$S" --manifest "$TMP/s.toml" events --json 2>&1)
+[[ $zd != *hunter2secret* && $zd != *abcdefgh12345678* && $(head -1 <<<"$out") != *hunter2secret* &&
+	$(head -1 <<<"$out") != *abcdefgh12345678* && $zdd == *"gate leg 'leak' (echo password=[REDACTED]"* && $zdd == *'exited 1'* ]] &&
+	ok "evidence: a secret in the failing leg's command is redacted in the event's detail" || bad "detail redaction" "$zd"
+stamp_manifest "${STD_LEGS[@]}"
+rm -f "$W"/gate-*.txt
+
+# ---- stamp: prepare lines (item AA) -----------------------------------------
+# A formatter fixes the tree before the gate looks at it.
+rm -f "$W"/gate-*.txt "$TMP/order"
+printf '  messy\n' >"$W/messy.txt"
+FMT_LEGS=(check=true "test=sh ./fake-test.sh" "fmt=! grep -q '^ ' messy.txt")
+stamp_manifest "${FMT_LEGS[@]}"
+expect "prepare: without it, a format-only failure fails the stamp" 4 "gate leg 'fmt'" -- -C "$W" --manifest "$TMP/s.toml" stamp
+PREPARE="[\"sed -i 's/^ *//' messy.txt\", \"echo p2 >>$TMP/order; echo 'test result: ok. 9 passed; 0 failed;'\"]" \
+	stamp_manifest "${FMT_LEGS[@]}" "order=echo leg >>$TMP/order"
+out=$("$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>"$TMP/p.err")
+code=$?
+want=$(
+	printf 'HEAD %s (item-v1.0.3)  dirty 1\n' "$(git -C "$W" rev-parse HEAD)"
+	printf 'gate PASS: check/test/fmt/order   tests 5 passed\n'
+	printf 'diffstat vs merge-base(main): %s\n' "$(git -C "$W" diff --shortstat "$(git -C "$W" merge-base main HEAD)" HEAD | sed 's/^ //')"
+	printf "prepare ran: sed -i 's/^ *//' messy.txt\n"
+	printf "prepare ran: echo p2 >>%s/order; echo 'test result: ok. 9 passed; 0 failed;'\n" "$TMP"
+)
+[[ $code == 0 && $out == "$want" && $(<"$W/messy.txt") == messy ]] &&
+	ok "prepare: its lines fix the tree before the gate, and the block names each line that ran, after the diffstat" || bad "prepare block (exit $code)" "$out"$'\n'"$(cat "$TMP/p.err")"
+[[ $(<"$TMP/order") == $'p2\nleg' ]] &&
+	ok "prepare: the lines run in order, before every gate leg" || bad "prepare order" "$(cat "$TMP/order")"
+[[ $out == *'tests 5 passed'* ]] &&
+	ok "prepare: test summaries a prepare line prints are not counted" || bad "prepare count" "$out"
+pev=$(tail -1 "$SLOG")
+python3 -I -c 'import json,sys; e=json.loads(sys.argv[1]); assert e["result"]=="pass"; assert e["legs"]==[{"name":n,"result":"pass"} for n in ("prepare","check","test","fmt","order")], e["legs"]' "$pev" &&
+	ok "prepare: the stamp event records it as a leg named prepare, ahead of the gate's" || bad "prepare event" "$pev"
+# The state is taken after prepare: what it writes is counted dirty and is not a change during the gate.
+rm -f "$W"/gate-*.txt
+PREPARE='["echo made >prepared.txt"]' stamp_manifest check=true
+out=$("$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>&1)
+[[ $? == 0 && $out == *'dirty 2'* && $out == *'prepare ran: echo made >prepared.txt'* ]] &&
+	ok "prepare: the dirty count and the unchanged-tree check are taken after it" || bad "prepare state" "$out"
+rm -f "$W"/gate-*.txt "$W/prepared.txt"
+PREPARE='["echo one", "", "   "]' stamp_manifest check=true
+out=$("$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>/dev/null)
+[[ $(grep -c '^prepare ran: ' <<<"$out") == 1 && $out == *'prepare ran: echo one'* ]] &&
+	ok "prepare: blank lines are skipped" || bad "prepare blanks" "$out"
+rm -f "$W"/gate-*.txt
+PREPARE='[]' stamp_manifest check=true
+out=$("$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>/dev/null)
+[[ $? == 0 && $out != *prepare* ]] && ! tail -1 "$SLOG" | grep -q '"prepare"' &&
+	ok "prepare: an empty array is no prepare: no line in the block, no leg in the event" || bad "prepare empty" "$out"
+# A failing line fails the stamp, keeping its tail as a failed leg does.
+rm -f "$W"/gate-*.txt "$TMP/order"
+PREPARE="[\"echo first-prep\", \"echo prep says why; exit 7\", \"echo never >>$TMP/order\"]" \
+	stamp_manifest "order=echo leg >>$TMP/order" check=true
+"$PO" -C "$W" --manifest "$TMP/s.toml" stamp >"$TMP/p.out" 2>"$TMP/p.err"
+code=$?
+pev=$(tail -1 "$SLOG")
+[[ $code == 4 && ! -s $TMP/p.out && ! -e $TMP/order && -z $(find "$W" -maxdepth 1 -name 'gate-*.txt') ]] &&
+	grep -qF "prepare line 'echo prep says why; exit 7' exited 7" "$TMP/p.err" &&
+	ok "prepare: a failing line fails the stamp with exit 4, names the line, runs nothing after it and writes no evidence" || bad "prepare fail (exit $code)" "$(cat "$TMP/p.err")"
+python3 -I -c 'import json,sys; e=json.loads(sys.argv[1]); assert e["result"]=="fail"; assert [(l["name"],l["result"]) for l in e["legs"]]==[("prepare","fail"),("order","skip"),("check","skip")]; t=e["legs"][0]["tail"]; assert t.splitlines()==["first-prep","prep says why"], t; assert "tail" not in e["legs"][1]; assert "prepare line" in e["detail"]' "$pev" &&
+	ok "prepare: a failing line's event fails the prepare leg with its tail and skips the gate's legs" || bad "prepare fail event" "$pev"
+plog=$(jfield "$pev" log)
+[[ -f $plog ]] && grep -qx '== prepare: echo prep says why; exit 7 (exit 7)' "$plog" && grep -qx 'prep says why' "$plog" &&
+	ok "prepare: a failing line's full output is in the stamp log" || bad "prepare fail log" "$(cat "$plog" 2>/dev/null)"
+PREPARE='"cargo fmt"' stamp_manifest check=true
+expect "prepare: a value that is not an array is a manifest error" 2 'not an array|must be an array' -- -C "$W" --manifest "$TMP/s.toml" stamp
+mf '[stamp]\nprepares = ["x"]\n[gate]\ncommand = "true"\n'
+expect "prepare: another key under [stamp] is a manifest error" 2 "unknown key 'prepares' in \[stamp\]" -- -C "$W" --manifest "$TMP/s.toml" stamp
+rm -f "$W"/gate-*.txt "$W/messy.txt" "$TMP/order"
+stamp_manifest "${STD_LEGS[@]}"
 
 # ---- releases and adopters (item K) ---------------------------------------
 # Every install below runs with a throwaway HOME; the real symlink must not move.
@@ -1773,6 +1945,8 @@ block "$KH/ad1" | grep -q '^  adopt  *\[kickoff\] preamble$' &&
 	ok "doctor offers [kickoff] preamble to a manifest without it" || bad "doctor kickoff adopt" "$out"
 block "$KH/ad1" | grep -q '^  adopt  *\[close\] checklist$' &&
 	ok "doctor offers [close] checklist to a manifest without it" || bad "doctor close adopt" "$out"
+block "$KH/ad1" | grep -q '^  adopt  *\[stamp\] prepare$' &&
+	ok "doctor offers [stamp] prepare to a manifest without it" || bad "doctor stamp adopt" "$out"
 ! block "$TMP/ad2" | grep -q 'owner_column' && block "$TMP/ad2" | grep -q '^  adopt  *\[hooks\] on_close$' &&
 	ok "a key the manifest sets is not offered" || bad "doctor offered a set key" "$out"
 [[ $(dsnap) == "$before" ]] && ok "doctor is read-only" || bad "doctor wrote something"
@@ -1881,11 +2055,13 @@ ev[5]["detail"] = "<b>boom</b>"
 ev[6]["kind"] = "open"
 ev[6]["legs"] = []
 ev[7]["detail"] = ""
+ev[8]["legs"][1]["tail"] = "tail one\ntail <two>"
+ev[8]["log"] = "/repo/.git/po-logs/stamp-x.log"
 # real po events --json: one object per line, keys in this order
-KEYS = ("time", "kind", "item", "project", "result", "agent", "legs", "detail")
+KEYS = ("time", "kind", "item", "project", "result", "agent", "legs", "detail", "log")
 with open(sys.argv[1], "w") as f:  # oldest first: the viewer must sort newest first
     for e in ev:
-        f.write(json.dumps({k: e[k] for k in KEYS}, separators=(",", ":")) + "\n")
+        f.write(json.dumps({k: e[k] for k in KEYS if k in e}, separators=(",", ":")) + "\n")
 PY
 cat >"$SV/bin/po" <<'EOF'
 #!/usr/bin/env bash
@@ -1959,6 +2135,10 @@ else
 		ok "the note icon is on events with a detail and the slot is empty without" || bad "note slot" "$out"
 	[[ $out == *'<span class="note" role="img" tabindex="0" title="d3" aria-label="d3">'* && $out == *'title="&lt;b&gt;boom&lt;/b&gt;" aria-label="&lt;b&gt;boom&lt;/b&gt;"'* ]] &&
 		ok "the note icon carries the detail as title and aria-label, escaped" || bad "note attrs" "$out"
+	[[ $out == *'title="d8'$'\n\n''leg test, last lines:'$'\n''tail one'$'\n''tail &lt;two&gt;'$'\n\n''full output: /repo/.git/po-logs/stamp-x.log"'* ]] &&
+		ok "a failed stamp's note adds the failing leg's tail and the log, escaped" || bad "note tail" "$out"
+	[[ $out == *'if (e.log) parts.push("full output: "'* && $out == *'", last lines:\n"'* ]] &&
+		ok "the live redraw builds the same note with the tail and the log" || bad "page script note"
 	[[ $out == *'<span class="r-fail">'$'\u2718'' fail</span>'* && $out == *'<span class="r-pass">'$'\u2714'' pass</span>'* ]] &&
 		ok "pass and fail carry a symbol and a word" || bad "result cues" "$out"
 	[[ $out == *'fetch("/events.json"'* && $out == *'aria-label'* && $out == *"for (const c of cols)"* ]] &&
@@ -2096,6 +2276,9 @@ check("dashboard: the columns are result item project kind checks agent time", k
 check("dashboard: every column key is a row field", all(k in c.row(ev[0], utc) for k in keys))
 check("dashboard: only project and checks grow", [col[0] for col in c.COLUMNS if col[4]] == ["project", "legs"])
 check("dashboard: fixed columns are as wide as they may get", all(col[2] == col[3] for col in c.COLUMNS if not col[4]))
+tl = {"detail": "why", "legs": [{"name": "a", "result": "pass"}, {"name": "b", "result": "fail", "tail": "x\ny"}], "log": "/g/po-logs/s.log"}
+check("dashboard: a failed stamp's note adds the failing leg's tail and the log",
+      c.row(tl, utc)["detail"] == "why\n\nleg b, last lines:\nx\ny\n\nfull output: /g/po-logs/s.log")
 check("dashboard: a note is the detail, empty when there is none", c.row(ev[5], utc)["detail"] == "d5" and c.row({"detail": None}, utc)["detail"] == "" and c.row({}, utc)["detail"] == "")
 check("dashboard: the note icon has a theme fallback", len(c.NOTE_ICONS) >= 2 and c.NOTE_FALLBACK)
 check("dashboard: markup in a field stays text", c.row({"item": "<b>x</b>"}, utc)["item"] == "<b>x</b>")
@@ -2239,11 +2422,15 @@ check("dashboard decisions: under a minute, or ahead of the clock, is just now",
       c.ago(now, now) == "just now" and c.ago(now - datetime.timedelta(seconds=59), now) == "just now" and c.ago(now + datetime.timedelta(hours=1), now) == "just now")
 check("dashboard decisions: the local time is kept for the tooltip", dr[1]["asked_local"] == "2026-10-24 09:00:00" and c.decision_row(dec[0], now, est)["asked_local"] == "2026-10-24 05:00:00")
 check("dashboard decisions: an unreadable asked_at is kept as text", c.decision_row({"asked_at": "soon"}, now)["asked"] == "soon" and c.decision_row({"asked_at": "soon"}, now)["asked_local"] == "")
-check("dashboard decisions: a sparse entry still has a row", c.decision_row({}, now) == {"project": "", "item": "-", "title": "", "waiting_for": "?", "asked": "?", "asked_local": "", "thread_url": ""})
+check("dashboard decisions: a sparse entry still has a row", c.decision_row({}, now) == {"project": "", "item": "-", "title": "", "waiting_for": "?", "asked": "?", "asked_local": "", "thread_url": "", "asked_by": ""})
 check("dashboard decisions: thread_url is kept as text, trimmed; absent or not a string is empty",
-      dr[1]["thread_url"] == "https://chat.example.org/t/1" and dr[0]["thread_url"] == "" and c.decision_row({"thread_url": 4}, now)["thread_url"] == ""
-      and c.decision_row({"thread_url": " https://x/t "}, now)["thread_url"] == "https://x/t")
+       dr[1]["thread_url"] == "https://chat.example.org/t/1" and dr[0]["thread_url"] == "" and c.decision_row({"thread_url": 4}, now)["thread_url"] == ""
+       and c.decision_row({"thread_url": " https://x/t "}, now)["thread_url"] == "https://x/t")
+check("dashboard decisions: asked_by is trimmed when a string, empty otherwise",
+       c.decision_row({"asked_by": " ana "}, now)["asked_by"] == "ana" and c.decision_row({"asked_by": 4}, now)["asked_by"] == "")
 check("dashboard decisions: markup in a field stays text", c.decision_row({"title": "<b>x</b>"}, now)["title"] == "<b>x</b>")
+check("dashboard decisions: short_title cuts at 80 and keeps short text", c.short_title("x" * 100) == "x" * 80 and c.short_title("abc") == "abc" and c.short_title(None) == "")
+check("dashboard decisions: a long title is cut in the row", len(c.decision_row({"title": "y" * 120}, now)["title"]) == 80)
 check("dashboard decisions: check lines show item project title waiting asked and the URL when there is one",
       c.decision_check_lines(dec[:2], now, utc) == ["2.3 | orchard | Pick a format | waiting for: a ruling | asked 3h ago (2026-10-24 09:00:00) | https://chat.example.org/t/1",
                                                    "0.7 | harbor | Accept the screen | waiting for: an acceptance | asked 30m ago (2026-10-24 11:30:00)"])
@@ -2432,6 +2619,32 @@ PY
 	fi
 else
 	ok "po-dashboard UI smoke skipped: GTK 4 or PyGObject missing"
+fi
+
+# po-dashboard-install.
+INST2=""$(cd "$(dirname "$PO")/.." && pwd)/bin/po-dashboard-install""
+tmp=$(mktemp -d)
+"$INST2" --prefix "$tmp" >/dev/null 2>&1
+[[ -f "$tmp/applications/po-dashboard.desktop" ]] && ok "dashboard-install: .desktop created" || bad "dashboard-install desktop"
+grep -q "^Exec=$(cd "$(dirname "$PO")/.." && pwd)/bin/po-dashboard$" "$tmp/applications/po-dashboard.desktop" && ok "dashboard-install: Exec is absolute path" || bad "dashboard-install exec"
+[[ -f "$tmp/icons/hicolor/512x512/apps/po-dashboard.png" ]] && ok "dashboard-install: 512 icon" || bad "dashboard-install 512"
+[[ -f "$tmp/icons/hicolor/scalable/apps/po-dashboard.svg" ]] && ok "dashboard-install: svg icon" || bad "dashboard-install svg"
+# idempotence: same file list after re-run
+before=$(find "$tmp" -type f | sort)
+"$INST2" --prefix "$tmp" >/dev/null 2>&1
+after=$(find "$tmp" -type f | sort)
+[[ "$before" == "$after" ]] && ok "dashboard-install: idempotent file list" || bad "dashboard-install idempotent"
+# uninstall removes all
+"$INST2" --prefix "$tmp" --uninstall >/dev/null 2>&1
+[[ -z "$(find "$tmp" -name '*po-dashboard*' -print -quit)" ]] && ok "dashboard-install: uninstall removes all" || bad "dashboard-install uninstall"
+rm -rf "$tmp"
+if command -v desktop-file-validate >/dev/null 2>&1; then
+	tmp=$(mktemp -d)
+	"$INST2" --prefix "$tmp" >/dev/null 2>&1
+	desktop-file-validate "$tmp/applications/po-dashboard.desktop" >/dev/null 2>&1 && ok "dashboard-install: desktop-file-validate clean" || bad "dashboard-install validate"
+	rm -rf "$tmp"
+else
+	ok "dashboard-install: desktop-file-validate not installed (skipped)"
 fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
