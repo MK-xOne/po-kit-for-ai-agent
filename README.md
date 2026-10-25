@@ -331,7 +331,7 @@ the same from any worktree.
   interface's. There is no login, so bind only to an address whose reachers you
   trust. It prints `po serve: listening on http://<addr>:<port>/` and runs until
   stopped; `--port 0` picks a free port.
-- `po-dashboard [--url <url>] [--team-url <url>] [--decisions-url <url>] [--view events|team|decisions] [--theme auto|light|dark] [--all] [--size WxH] [--check] [--screenshot <png>] [--screenshot-delay <s>]`
+- `po-dashboard [--url <url>] [--team-url <url>] [--decisions-url <url>] [--view events|team|decisions|reports] [--theme auto|light|dark] [--all] [--size WxH] [--check] [--screenshot <png>] [--screenshot-delay <s>]`
   (`bin/po-dashboard`, not a `po` subcommand) — a desktop window for the same
   events: the last 10 as soft raised single-line cards (result, item, project,
   kind, checks, agent, time in the local zone, note) in fixed columns that line
@@ -339,7 +339,8 @@ the same from any worktree.
   the project and checks columns widening with the window, and a note icon for
   an event with a detail (tooltip and accessible label are the detail, with
   a failed stamp's tail and log path as in `po serve`; an
-  event without one leaves the slot empty), a "Show all" toggle for every event, a
+  event without one leaves the slot empty), a "Show all" toggle for every event (in the
+  second button row, below), a
   refresh every 5 seconds. The URL is the events JSON, for example the
   `/events.json` of a `po serve`; `--url` or `PO_DASHBOARD_URL`, with no
   default, and neither is an error (exit 1). It accepts a JSON array or one
@@ -384,6 +385,7 @@ the same from any worktree.
   ("3h ago"), its local time in the tooltip; `thread_url`, when present, is
   muted text you can select and copy, never opened from the window. Refreshed
   with the events; a failed fetch keeps the last decisions data and says so.
+  An entry you expand stays open across refreshes (until it leaves the feed).
   The view is read-only. The feed is an http(s) URL or a file
   (`examples/decisions-feed.json` is a sample); `--view decisions` starts in it.
   Esc closes it. `--check` prints the rows the window would show, without a
@@ -393,6 +395,38 @@ the same from any worktree.
   `--all` also starts the window with Show all on, `--size WxH` sets its size,
   and `--screenshot` saves the window to a PNG once it has data (after
   `--screenshot-delay` seconds, 0.6 by default), then quits.
+  In the Events view a second, thinner row of buttons sits under the header: "Show all"
+  and "Reports". The row is hidden in Team and Decisions; the view buttons never move.
+  "Reports" swaps the list for a report pane (a title, a time-range choice 24 h / 7 d / 30 d,
+  7 d by default, and five charts; "no events in this range" when the range holds none);
+  "Reports" again returns to the list. The charts (the numbers come from `lib/po/dashboard_reports.py`,
+  no GTK; drawn with GTK's own snapshot API, no drawing library to install): gate runs per agent, one
+  row per agent with stacked pass (solid) and fail (hatched) bars per bucket, hourly for 24 h and daily
+  for 7 d and 30 d, busiest agent first; first-try pass rate per agent, the share of items whose first
+  stamp (per project, item and agent) passed, a horizontal bar with the percentage and n; items closed
+  per day, stacked by project with a legend (a project past the palette's six colours reuses one,
+  hatched); item cycle time per agent, a box plot of the time from an item's open event to its
+  passing close event (whisker min to max, box first to third quartile, a bar at the median, then the
+  median and n; items not yet closed, or with no open event in the feed, are left out, and an item
+  counts for the agent that stamped it most, else the agent of its close event); failed legs by kind
+  over time, the failed legs of the events counted per leg name per bucket (hourly for 24 h, daily
+  otherwise), stacked, the six leg names with most failures in the range each with a colour and the
+  rest grouped as "other" (hatched grey, last). Colours come from the dashboard theme, light and dark; each chart is an image for assistive
+  technology whose label, also its tooltip, is the numbers as a sentence. Days and hours are in the
+  viewer's time zone. The charts read these fields of each event in the feed: `kind`, `item`,
+  `project`, `result`, `agent`, `time` and `legs` (a list of `{name, result}`); `examples/events-demo-server.py`
+  serves enough open, stamp and close events to show all five. `--screenshot` with `--view reports` saves the pane. The range and the pane
+  survive the 5-second refresh. `--view reports` starts in the pane.
+  The Events and Team lists have a header line of column titles in muted text
+  (same widths as the rows, so each sits over its data). Each is a button
+  (accessible label "sort by <column>"): a click sorts the rows by that column
+  ascending, a second click descending, a third returns to the default order
+  (newest first for Events, the saved drag order for Team); an arrow marks the
+  active column and direction. Time sorts by instant, numbers inside text
+  ("1.9" before "1.11") by value, other text without regard to case. The sort
+  holds across refreshes, is never written to the saved Team order, and a Team
+  line cannot be dragged while a column sort is on. The Decisions view has no
+  headers. `--screenshot` shows the headers.
   An event that appears while the Events view is open starts with its card 25%
   darker (25% lighter in the dark theme) and eases back to the normal card
   colour over 60 seconds, text colours adjusting to stay AA at every step;

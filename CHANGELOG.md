@@ -12,6 +12,20 @@ Unreleased becomes `## Release N (YYYY-MM-DD): <theme>`.
 
 ## Unreleased
 
+## Release 12 (2026-10-25): dashboard sortable columns, Reports, Decisions fix
+
+Items v0.31 to v0.35.
+
+**Agents, in short:** nothing to do.
+
+**Adopt, in short:** nothing. The dashboard gains sortable column headers (Events, Team), a Reports view with five charts (button under the header), and Decisions entries that stay open across refreshes.
+
+- v0.31: po-dashboard column headers and sortable columns. A muted header line over the Events and Team lists labels each column (same widths as the rows); a click sorts by that column, again reverses, a third returns to the default order; an arrow marks the column. Time sorts by instant. Sorting never rewrites the saved Team order (dragging waits for the default order). Decisions unchanged.
+- v0.32: po-dashboard second button row and Reports shell. In the Events view a thinner row under the header holds "Show all" (moved there) and a new "Reports" button; the row is hidden in Team and Decisions. Reports swaps the list for a pane with a 24 h / 7 d / 30 d range choice (7 d default), chart-area placeholders and the empty text "no events in this range"; range and pane survive refreshes. `--view reports` opens it.
+- v0.33: po-dashboard Reports, first three charts. A pure aggregation module (`lib/po/dashboard_reports.py`, unit-tested, no GTK) turns the events feed into chart data for the chosen range, and the pane draws it with GTK's snapshot API (no new dependency): gate runs per agent (stacked pass solid / fail hatched per hour for 24 h, per day for 7 d and 30 d), first-try pass rate per agent (first stamp per project, item and agent, with n), and items closed per day stacked by project. Theme colours in light and dark, legend, a text alternative (accessible label and tooltip) per chart. Also fixes the window opening on the Team page (blank without a team feed) instead of Events.
+- v0.34: po-dashboard Reports, last two charts. Item cycle time per agent (a box plot: min, quartiles, median, max and n, from an item's open event to its passing close event; unclosed items are left out) and failed legs by kind over time (stacked per hour or day; the six leg names with most failures keep a colour, the rest group as "other"). Both come from `lib/po/dashboard_reports.py` with tests; the README lists the five charts and the feed fields they read; `examples/events-demo-server.py` now emits open and close events too.
+- v0.35: po-dashboard Decisions entries stay open across refreshes. An entry expanded in the Decisions view used to collapse again at the next refresh; the window now keeps the expanded entries (by project and item) and re-applies them on every rebuild, and an entry that leaves the feed drops out. Nothing for agents to do.
+
 ## Release 11 (2026-10-25): failed-gate evidence, stamp prepare, dashboard polish
 
 Items v0.24 to v0.30.

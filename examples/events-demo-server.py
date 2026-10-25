@@ -3,7 +3,8 @@
 
     python3 examples/events-demo-server.py [--port 8798] [--every 15]
 
-Serves /events.json with a few made-up events and adds a new one every --every
+Serves /events.json with some made-up events (open, stamp and close events over
+the past days, enough for every Reports chart) and adds a new one every --every
 seconds, so a po-dashboard (or the page of a po serve pointed at the same data)
 open on it shows a card appear and fade. Stop it with Ctrl-C.
 """
@@ -29,11 +30,30 @@ def event(i, when):
             "detail": "" if ok else "a sample failure"}
 
 
+def history():
+    """Open, stamp and close events over the past days, so every report chart has something to show."""
+    out = []
+    for n, (agent, project, hours) in enumerate([("ada", "demo", 3), ("ada", "demo", 7), ("ada", "demo", 26), ("bob", "demo", 5),
+                                                  ("bob", "other", 40), ("bob", "other", 9), ("cy", "other", 14)]):
+        closed_at = start - datetime.timedelta(hours=2 + 11 * n)
+        item = "0.%d" % n
+        out.append({"time": stamp(closed_at - datetime.timedelta(hours=hours)), "kind": "open", "item": item, "project": project,
+                    "result": "pass", "agent": "pat", "legs": [], "detail": ""})
+        for k, leg in enumerate(["lint", "test", "docs", "build", "types", "audit", "smoke"][: 1 + n % 4]):
+            out.append({"time": stamp(closed_at - datetime.timedelta(minutes=30 + 20 * k)), "kind": "stamp", "item": item, "project": project,
+                        "result": "fail", "agent": agent, "legs": [{"name": leg, "result": "fail"}], "detail": "a sample failure"})
+        out.append({"time": stamp(closed_at - datetime.timedelta(minutes=10)), "kind": "stamp", "item": item, "project": project,
+                    "result": "pass", "agent": agent, "legs": [{"name": "lint", "result": "pass"}, {"name": "test", "result": "pass"}], "detail": ""})
+        out.append({"time": stamp(closed_at), "kind": "close", "item": item, "project": project,
+                    "result": "pass", "agent": "pat", "legs": [], "detail": ""})
+    return out
+
+
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         now = datetime.datetime.now(datetime.timezone.utc)
         n = 5 + int((now - start).total_seconds() // a.every)
-        body = json.dumps([event(i, start - datetime.timedelta(minutes=5 - i)) if i < 5 else
+        body = json.dumps(history() + [event(i, start - datetime.timedelta(minutes=5 - i)) if i < 5 else
                            event(i, start + datetime.timedelta(seconds=(i - 5 + 1) * a.every)) for i in range(n)]).encode()
         self.send_response(200 if self.path.startswith("/events.json") else 404)
         self.send_header("Content-Length", str(len(body)))

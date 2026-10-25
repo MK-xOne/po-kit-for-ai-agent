@@ -2221,6 +2221,7 @@ done < <(python3 -B -I - "$DBLIB" <<'PY'
 import datetime, http.server, json, sys, threading
 sys.path.insert(0, sys.argv[1])
 import dashboard_core as c
+import dashboard_reports as r
 
 def check(name, cond, detail=""):
     print("%s\t%s\t%s" % ("ok" if cond else "FAIL", name, detail.replace("\n", " | ")))
@@ -2256,6 +2257,84 @@ same = [{"time": "t", "item": "a"}, {"time": "t", "item": "b"}]
 check("dashboard: equal times keep the source order", [e["item"] for e in c.sort_events(same)] == ["a", "b"])
 check("dashboard: the default view is the last 10", len(c.visible(ev, False)) == 10 and c.visible(ev, False)[0]["item"] == "1.11")
 check("dashboard: Show all lists every event", len(c.visible(ev, True)) == 12)
+_now = c.parse_time("2026-10-25T12:00:00Z")
+_re = [{"time": "2026-10-25T11:00:00Z"}, {"time": "2026-10-22T12:00:00Z"}, {"time": "2026-09-30T12:00:00Z"}, {"time": "junk"}, {}]
+check("dashboard reports: ranges are 24 h, 7 d, 30 d with 7 d the default", [r[0] for r in c.REPORT_RANGES] == ["24 h", "7 d", "30 d"] and c.REPORT_RANGES[c.REPORT_DEFAULT][0] == "7 d")
+check("dashboard reports: 24 h keeps only the last day", len(c.in_range(_re, 86400, _now)) == 1)
+check("dashboard reports: 7 d keeps the last week", len(c.in_range(_re, 7 * 86400, _now)) == 2)
+check("dashboard reports: 30 d keeps the last month, unreadable times left out", len(c.in_range(_re, 30 * 86400, _now)) == 3)
+check("dashboard reports: empty-state text and five charts", c.REPORT_EMPTY == "no events in this range" and len(c.REPORT_CHARTS) == 5)
+
+# The report charts' data (dashboard_reports.py): buckets, empty, one agent, ranges.
+def _st(t, agent="a", result="pass", item="1", project="p", kind="stamp"):
+    return {"time": t, "kind": kind, "agent": agent, "result": result, "item": item, "project": project}
+_n = c.parse_time("2026-10-25T12:30:00Z")
+check("dashboard reports: 24 h is 24 hourly buckets ending in the current hour", len(r.bucket_starts(86400, _n)) == 24 and r.bucket_starts(86400, _n)[-1] == c.parse_time("2026-10-25T12:00:00Z") and r.bucket_starts(86400, _n)[0] == c.parse_time("2026-10-24T13:00:00Z"))
+check("dashboard reports: 7 d and 30 d are 7 and 30 daily buckets from midnight", [len(r.bucket_starts(s, _n)) for s in (7 * 86400, 30 * 86400)] == [7, 30] and r.bucket_starts(7 * 86400, _n)[-1] == c.parse_time("2026-10-25T00:00:00Z"))
+_g = r.gate_runs([_st("2026-10-25T12:10:00Z"), _st("2026-10-25T12:20:00Z", result="fail"), _st("2026-10-25T11:59:59Z", agent="b"),
+                  _st("2026-10-25T12:05:00Z", kind="open"), _st("2026-10-23T12:00:00Z"), _st("junk"), _st("2026-10-26T00:00:00Z")], 86400, _n)
+check("dashboard reports: gate runs split pass and fail in the right hour", _g["series"]["a"][-1] == (1, 1) and _g["series"]["b"][-2] == (1, 0) and _g["total"] == 3)
+check("dashboard reports: gate runs ignore non-stamps, old, future and unreadable times", _g["total"] == 3 and _g["agents"] == ["a", "b"] and _g["hourly"] and _g["labels"][-1] == "12:00")
+check("dashboard reports: 7 d gate runs bucket by day, labelled by date", r.gate_runs([_st("2026-10-23T12:00:00Z")], 7 * 86400, _n)["series"]["a"][-3] == (1, 0) and r.gate_runs([], 7 * 86400, _n)["labels"][-1] == "10-25")
+check("dashboard reports: 30 d reaches back where 7 d does not", r.gate_runs([_st("2026-10-10T12:00:00Z")], 7 * 86400, _n)["total"] == 0 and r.gate_runs([_st("2026-10-10T12:00:00Z")], 30 * 86400, _n)["total"] == 1)
+check("dashboard reports: empty feed gives empty data and text", r.gate_runs([], 86400, _n)["agents"] == [] and r.first_try([], 86400, _n)["rows"] == [] and r.closed([], 86400, _n)["total"] == 0
+      and "none in this range" in r.gate_runs_text(r.gate_runs([], 86400, _n)) and "none in this range" in r.first_try_text(r.first_try([], 86400, _n)) and "none in this range" in r.closed_text(r.closed([], 86400, _n)))
+_o = r.gate_runs([_st("2026-10-25T12:10:00Z", agent="solo")], 86400, _n)
+check("dashboard reports: one agent gives one row", _o["agents"] == ["solo"] and len(_o["series"]["solo"]) == 24 and r.layout_gate_runs(_o, 600)[0] > 0)
+check("dashboard reports: busiest agent first, ties by name", r.gate_runs([_st("2026-10-25T12:10:00Z", agent="z"), _st("2026-10-25T12:11:00Z", agent="z"), _st("2026-10-25T12:12:00Z", agent="b"), _st("2026-10-25T12:13:00Z", agent="a")], 86400, _n)["agents"] == ["z", "a", "b"])
+_f = r.first_try([_st("2026-10-25T10:00:00Z", result="fail"), _st("2026-10-25T11:00:00Z"),
+                  _st("2026-10-25T10:00:00Z", item="2"), _st("2026-10-25T10:00:00Z", item="3", project="q"),
+                  _st("2026-10-25T10:00:00Z", agent="b", result="fail"), _st("2026-10-25T10:00:00Z", kind="close")], 86400, _n)
+check("dashboard reports: first-try counts only the first stamp per project, item and agent", {x["agent"]: (x["n"], x["passed"]) for x in _f["rows"]} == {"a": (3, 2), "b": (1, 0)})
+check("dashboard reports: first-try rate, best first", [x["agent"] for x in _f["rows"]] == ["a", "b"] and abs(_f["rows"][0]["rate"] - 2 / 3) < 1e-9)
+check("dashboard reports: a first stamp before the range is not a first try inside it", r.first_try([_st("2026-10-01T10:00:00Z", result="fail"), _st("2026-10-25T10:00:00Z")], 86400, _n)["rows"] == [])
+_c = r.closed([_st("2026-10-25T01:00:00Z", kind="close", project="x"), _st("2026-10-25T02:00:00Z", kind="close", project="x", item="2"), _st("2026-10-24T23:00:00Z", kind="close", project="y"),
+               _st("2026-10-25T03:00:00Z", kind="close", project="y", result="fail"), _st("2026-10-25T03:00:00Z", project="y"), _st("2026-10-20T03:00:00Z", kind="close", project="y")], 86400, _n)
+check("dashboard reports: closes per day by project, passing closes only, two days for 24 h", _c["labels"] == ["10-24", "10-25"] and _c["series"] == {"x": [0, 2], "y": [1, 0]} and _c["projects"] == ["x", "y"] and _c["total"] == 3)
+check("dashboard reports: 7 d closes reach the older day", r.closed([_st("2026-10-20T03:00:00Z", kind="close", project="y")], 7 * 86400, _n)["total"] == 1 and len(r.closed([], 30 * 86400, _n)["labels"]) == 30)
+check("dashboard reports: a time zone moves the day boundary", r.closed([_st("2026-10-25T02:00:00Z", kind="close")], 86400, _n, datetime.timezone(datetime.timedelta(hours=-4)))["series"]["p"] == [1, 0])
+check("dashboard reports: events with no agent or project are 'unknown'", r.gate_runs([{"time": "2026-10-25T12:10:00Z", "kind": "stamp", "result": "pass"}], 86400, _n)["agents"] == ["unknown"])
+check("dashboard reports: the text alternative carries the numbers", "a 2 runs, 1 passed, 1 failed" in r.gate_runs_text(_g) and "a 67% of 3 items" in r.first_try_text(_f) and "3 in all; x 2; y 1" in r.closed_text(_c))
+check("dashboard reports: reports() gives the five charts in order with text", [t for t, _d, _x in r.reports([], 86400, _n)] == list(c.REPORT_CHARTS) and all(x for _t, _d, x in r.reports([], 86400, _n)))
+def _lg(t, legs, **k):
+    e = _st(t, **k)
+    e["legs"] = [{"name": n, "result": x} for n, x in legs]
+    return e
+_ct = [_st("2026-10-25T08:00:00Z", kind="open", agent="po"), _st("2026-10-25T09:00:00Z", agent="a"), _st("2026-10-25T10:00:00Z", kind="close", agent="po"),
+       _st("2026-10-25T08:00:00Z", kind="open", item="2", agent="po"), _st("2026-10-25T09:00:00Z", item="2", agent="a"), _st("2026-10-25T12:00:00Z", kind="close", item="2", agent="po"),
+       _st("2026-10-25T07:00:00Z", kind="open", item="3", agent="po"), _st("2026-10-25T09:00:00Z", item="3", agent="b"), _st("2026-10-25T09:30:00Z", kind="close", item="3", agent="po"),
+       _st("2026-10-25T08:00:00Z", kind="open", item="4", agent="po"), _st("2026-10-25T09:00:00Z", item="4", agent="a"),
+       _st("2026-10-25T09:00:00Z", kind="close", item="5", agent="po"),
+       _st("2026-10-25T08:00:00Z", kind="open", item="6", agent="po"), _st("2026-10-25T09:00:00Z", kind="close", item="6", agent="po", result="fail")]
+_t = r.cycle_time(_ct, 86400, _n)
+_ar = {x["agent"]: x for x in _t["rows"]}
+check("dashboard reports: cycle time is open to close per agent, five numbers and n", _ar["a"]["n"] == 2 and _ar["a"]["min"] == 7200 and _ar["a"]["max"] == 14400 and _ar["a"]["median"] == 10800 and _ar["a"]["q1"] == 9000 and _ar["a"]["q3"] == 12600 and _ar["b"]["n"] == 1 and _ar["b"]["min"] == _ar["b"]["max"] == 9000)
+check("dashboard reports: cycle time leaves out unclosed, failed-close and open-less items", sum(x["n"] for x in _t["rows"]) == 3)
+check("dashboard reports: cycle time rows run longest median first and the unit fits", [x["agent"] for x in _t["rows"]] == ["a", "b"] and _t["unit"] == "hour" and r.cycle_time([], 86400, _n) == {"rows": [], "unit": "minute"})
+check("dashboard reports: cycle time counts a close only inside the range", r.cycle_time(_ct, 600, _n)["rows"] == [] and len(r.cycle_time(_ct, 3600, _n)["rows"]) == 1 and r.cycle_time([_st("2026-10-01T08:00:00Z", kind="open"), _st("2026-10-25T12:00:00Z", kind="close")], 86400, _n)["rows"][0]["n"] == 1)
+check("dashboard reports: cycle time falls back to the close event's agent without a stamp", r.cycle_time([_st("2026-10-25T08:00:00Z", kind="open"), _st("2026-10-25T08:10:00Z", kind="close", agent="po")], 86400, _n)["rows"][0]["agent"] == "po")
+_fl = r.failed_legs([_lg("2026-10-25T12:10:00Z", [("lint", "pass"), ("test", "fail")]), _lg("2026-10-25T12:20:00Z", [("test", "fail"), ("fmt", "fail")], result="fail"),
+                     _lg("2026-10-25T11:10:00Z", [("test", "fail")]), _lg("2026-10-20T11:10:00Z", [("test", "fail")]), _st("2026-10-25T12:00:00Z"),
+                     {"time": "2026-10-25T12:00:00Z", "legs": "junk"}], 86400, _n)
+check("dashboard reports: failed legs count only failing legs, per name and hour", _fl["legs"] == ["test", "fmt"] and _fl["series"]["test"][-1] == 2 and _fl["series"]["test"][-2] == 1 and _fl["series"]["fmt"][-1] == 1 and _fl["total"] == 4 and _fl["hourly"])
+_seven = r.failed_legs([_lg("2026-10-25T12:10:00Z", [("l%d" % i, "fail")] * (9 - i)) for i in range(8)], 86400, _n)
+check("dashboard reports: past six leg names the rest group as other, last", len(_seven["legs"]) == 7 and _seven["legs"][-1] == "other" and _seven["legs"][:6] == ["l0", "l1", "l2", "l3", "l4", "l5"] and sum(_seven["series"]["other"]) == 3 + 2 and _seven["total"] == sum(9 - i for i in range(8)))
+check("dashboard reports: failed legs bucket daily for 7 d and are empty without failures", r.failed_legs([_lg("2026-10-23T12:00:00Z", [("t", "fail")])], 7 * 86400, _n)["series"]["t"][-3] == 1 and r.failed_legs([_st("2026-10-25T12:00:00Z")], 86400, _n)["total"] == 0)
+check("dashboard reports: the new charts' text alternatives carry the numbers", "a 2 items, median 3.0 h" in r.cycle_time_text(_t) and "4 in all; test 3; fmt 1" in r.failed_legs_text(_fl) and "none in this range" in r.cycle_time_text(r.cycle_time([], 86400, _n)) and "none in this range" in r.failed_legs_text(r.failed_legs([], 86400, _n)))
+_cs = r.layout_cycle_time(_t, 640)[1] + r.layout_failed_legs(_fl, 640)[1] + r.layout_failed_legs(_seven, 640)[1]
+check("dashboard reports: cycle time shows the median and n as text and boxes for each agent", any(s[0] == "text" and s[3] == "3.0 h  n=2" for s in _cs) and sum(1 for s in r.layout_cycle_time(_t, 640)[1] if s[0] == "rect" and s[5] == ("series", 0)) == 2)
+check("dashboard reports: other is hatched muted, never one of the six colours", any(s[0] == "rect" and s[5] == "muted" and s[6] for s in r.layout_failed_legs(_seven, 640)[1]) and not any(s[0] == "rect" and s[5] == ("series", 6 % 6) and s[6] for s in r.layout_failed_legs(_seven, 640)[1]))
+check("dashboard reports: new charts stay inside the width", all(s[1] >= 0 and s[1] + (s[3] if s[0] == "rect" else 0) <= 640 + 1e-6 for s in _cs if s[0] in ("rect", "line")))
+check("dashboard reports: nice axis tops", [r.nice_max(v) for v in (0, 1, 3, 7, 20, 21, 101)] == [1, 1, 5, 10, 20, 50, 200])
+_shapes = r.layout_gate_runs(_g, 640)[1] + r.layout_first_try(_f, 640)[1] + r.layout_closed(_c, 640)[1]
+check("dashboard reports: fail is hatched, pass solid, so colour is not the only cue", any(s[0] == "rect" and s[5] == "fail" and s[6] for s in _shapes) and any(s[0] == "rect" and s[5] == "pass" and not s[6] for s in _shapes))
+check("dashboard reports: first-try rows carry the share and n as text", any(s[0] == "text" and s[3] == "67%  n=3" for s in r.layout_first_try(_f, 640)[1]))
+check("dashboard reports: shapes stay inside the width", all(s[1] >= 0 and s[1] + (s[3] if s[0] == "rect" else 0) <= 640 + 1e-6 for s in r.layout_gate_runs(_g, 640)[1] + r.layout_closed(_c, 640)[1] if s[0] in ("rect", "line")))
+_many = r.closed([_st("2026-10-25T01:00:00Z", kind="close", project="p%d" % i) for i in range(8)], 86400, _n)
+check("dashboard reports: a project past the palette reuses a colour hatched", r.series_colour(0) == (("series", 0), False) and r.series_colour(6) == (("series", 0), True) and len(r.layout_closed(_many, 400)[1]) > 8)
+for _v, _p in sorted(c.PALETTES.items()):
+    _lo = min(c.contrast(x, _p["base"]) for x in _p["series"] + [_p["pass"], _p["fail"]])
+    check("dashboard reports %s: chart colours reach 3:1 against the base (%.2f)" % (_v, _lo), _lo >= 3 and len(_p["series"]) == r.SERIES_COLOURS)
 check("dashboard: fewer than 10 events show them all", len(c.visible(ev[:3], False)) == 3)
 
 utc = datetime.timezone.utc
@@ -2417,6 +2496,12 @@ check("dashboard decisions: oldest asked first", [r["item"] for r in dr] == ["2.
 check("dashboard decisions: zones are compared as instants", [e["item"] for e in c.sort_decisions([{"item": "a", "asked_at": "2026-10-24T10:00:00+02:00"}, {"item": "b", "asked_at": "2026-10-24T09:00:00Z"}])] == ["a", "b"])
 check("dashboard decisions: a missing or unreadable asked_at goes last, in the feed's order",
       [e["item"] for e in c.sort_decisions([{"item": "x"}, {"item": "y", "asked_at": "soon"}, {"item": "z", "asked_at": "2026-10-24T09:00:00Z"}])] == ["z", "x", "y"])
+ka, kb = c.decision_key({"project": "p", "item": "1"}), c.decision_key({"project": "q", "item": "1"})
+check("dashboard decisions: the key is project and item", ka != kb and ka == ("p", "1"))
+ex = c.toggle_expanded(set(), ka)
+check("dashboard decisions: toggling opens then closes an entry", ex == {ka} and c.toggle_expanded(ex, ka) == set())
+check("dashboard decisions: an expanded entry stays across a refresh", c.prune_expanded({ka, kb}, [{"project": "p", "item": "1"}, {"project": "q", "item": "1"}]) == {ka, kb})
+check("dashboard decisions: an entry that left the feed drops out", c.prune_expanded({ka, kb}, [{"project": "q", "item": "1"}]) == {kb})
 check("dashboard decisions: asked_at is shown relative to now", [r["asked"] for r in dr] == ["1d ago", "3h ago", "30m ago"])
 check("dashboard decisions: under a minute, or ahead of the clock, is just now",
       c.ago(now, now) == "just now" and c.ago(now - datetime.timedelta(seconds=59), now) == "just now" and c.ago(now + datetime.timedelta(hours=1), now) == "just now")
@@ -2519,11 +2604,33 @@ for variant, base, target, normal in (("light", "#ffffff", "#000000", {"text": "
         ratio = c.contrast(col, start)
         check("serve page %s: %s text keeps contrast >= 4.5 on the strongest highlight (%.2f)" % (variant, role, ratio), ratio >= 4.5)
         check("serve page %s: %s text is in the page's CSS" % (variant, role), col in pg)
+# sortable columns (item v0.31)
+sv_ev = [{"time": t, "item": i, "project": pr, "result": r, "kind": "stamp", "agent": ag, "legs": []} for t, i, pr, r, ag in (
+    ("2026-10-23T09:00:00-04:00", "1.9", "beta", "pass", "x"), ("2026-10-23T12:00:00Z", "1.11", "Alpha", "fail", "y"),
+    ("2026-10-23T08:00:00Z", "1.2", "gamma", "pass", "z"))]
+check("dashboard sort: no sort keeps the given order", [e["item"] for e in c.sorted_events(sv_ev, None)] == ["1.9", "1.11", "1.2"])
+check("dashboard sort: time sorts by instant, not text (09:00-04:00 is 13:00Z)", [e["item"] for e in c.sorted_events(sv_ev, ("time", False))] == ["1.2", "1.11", "1.9"])
+check("dashboard sort: descending reverses", [e["item"] for e in c.sorted_events(sv_ev, ("time", True))] == ["1.9", "1.11", "1.2"])
+check("dashboard sort: item compares numbers inside the text (1.9 < 1.11)", [e["item"] for e in c.sorted_events(sv_ev, ("item", False))] == ["1.2", "1.9", "1.11"])
+check("dashboard sort: project ignores case", [e["project"] for e in c.sorted_events(sv_ev, ("project", False))] == ["Alpha", "beta", "gamma"])
+check("dashboard sort: an unreadable time sorts first ascending", c.sorted_events(sv_ev + [{"time": "soon", "item": "q"}], ("time", False))[0]["item"] == "q")
+check("dashboard sort: rows() sorts the last 10 it shows, not the whole feed", [r["item"] for r in c.rows(ev, False, None, ("item", False))] == sorted((r["item"] for r in c.rows(ev, False)), key=c.natural_key))
+check("dashboard sort: every events column can be sorted", all(c.sorted_events(ev, (k[0], False)) is not None for k in c.COLUMNS))
+check("dashboard sort: click cycles ascending, descending, default", c.next_sort(None, "item") == ("item", False) and c.next_sort(("item", False), "item") == ("item", True) and c.next_sort(("item", True), "item") is None)
+check("dashboard sort: a click on another column starts it ascending", c.next_sort(("item", True), "time") == ("time", False))
+check("dashboard sort: the mark is an arrow on the sorted column only", c.sort_mark(("time", False), "time") == "\u25b2" and c.sort_mark(("time", True), "time") == "\u25bc" and c.sort_mark(("time", True), "item") == "" and c.sort_mark(None, "time") == "")
+tm = [{"agent": "b", "state": "idle 5m", "now": "1.10", "owns": []}, {"agent": "A", "state": "WORKING", "now": "1.9", "owns": ["x"], "model": "m"}]
+check("dashboard sort: team None keeps the saved order", [e["agent"] for e in c.sorted_team(tm, None)] == ["b", "A"])
+check("dashboard sort: team agent ignores case, now compares numbers", [e["agent"] for e in c.sorted_team(tm, ("agent", False))] == ["A", "b"] and [e["agent"] for e in c.sorted_team(tm, ("now", False))] == ["A", "b"])
+check("dashboard sort: team columns are the line's fields", c.TEAM_COLUMNS == ("agent", "model", "status", "now", "owns") and all(k in c.team_row(tm[0]) for k in c.TEAM_COLUMNS))
+check("dashboard sort: sorting does not change the list it is given", [e["agent"] for e in tm] == ["b", "A"])
+check("dashboard css: the column header style exists with a focus ring", ".po-colhead" in c.css("light") and ".po-colhead:focus-visible" in c.css("dark"))
 check("dashboard css: the two variants differ", c.css("light") != c.css("dark"))
 check("dashboard: contrast of black on white is 21", round(c.contrast("#000000", "#ffffff")) == 21)
 PY
 )
 
+grep -q 'sort by %s' "$DB" && grep -q 'Gtk.Button' "$DB" && ok "po-dashboard headers are buttons labelled sort by <column>" || bad "dashboard header buttons"
 # bin/po-dashboard: argument handling needs no display.
 out=$(env -u PO_DASHBOARD_URL python3 -B "$DB" 2>&1)
 [[ $? == 1 && $out == *'no URL'* && $out == *PO_DASHBOARD_URL* ]] &&
@@ -2577,6 +2684,8 @@ out=$(env -u PO_DASHBOARD_TEAM_URL python3 -B "$DB" --url "$CHK_URL" --check 2>&
 printf '[{"project":"harbor","item":"0.7","title":"Accept","waiting_for":"an acceptance","asked_at":"2026-10-24T11:30:00Z"},{"project":"orchard","item":"2.3","title":"Pick","waiting_for":"a ruling","asked_at":"2026-10-24T09:00:00Z","thread_url":"https://chat.example.org/t/1"}]\n' >"$TMP/decisions.json"
 out=$(python3 -B "$DB" --url http://h/x --decisions-url ftp://h/x 2>&1)
 [[ $? == 1 && $out == *'not an http'* ]] && ok "po-dashboard refuses a non-http decisions URL" || bad "dashboard decisions url" "$out"
+out=$(python3 -B "$DB" --url http://h/x --view bogus 2>&1)
+[[ $? -ne 0 && $out == *"invalid choice"* ]] && ok "po-dashboard --view accepts reports and rejects an unknown view" || bad "dashboard view bogus" "$out"
 out=$(env -u PO_DASHBOARD_DECISIONS_URL python3 -B "$DB" --url http://h/x --view decisions 2>&1)
 [[ $? == 1 && $out == *'--decisions-url'* && $out == *PO_DASHBOARD_DECISIONS_URL* ]] &&
 	ok "po-dashboard --view decisions without a decisions feed is a usage error" || bad "dashboard view decisions" "$out"
@@ -2597,7 +2706,7 @@ out=$(python3 -B "$DB" --url "http://127.0.0.1:1/" --check 2>&1)
 if python3 -c 'import gi; gi.require_version("Gtk", "4.0"); from gi.repository import Gtk' >/dev/null 2>&1; then
 	if [[ -n ${DISPLAY:-}${WAYLAND_DISPLAY:-} ]]; then
 		# UI smoke: the window comes up with data and saves a screenshot.
-		python3 -I - "$SV/events.json" "$TMP/shot.png" "$DB" "$TMP/decisions.json" "$TMP/shot-decisions.png" "$TMP/team-limit.json" "$TMP/shot-team.png" <<'PY' &&
+		python3 -I - "$SV/events.json" "$TMP/shot.png" "$DB" "$TMP/decisions.json" "$TMP/shot-decisions.png" "$TMP/team-limit.json" "$TMP/shot-team.png" "$TMP/shot-reports.png" <<'PY' &&
 import http.server, subprocess, sys, threading
 body = open(sys.argv[1], "rb").read()
 class H(http.server.BaseHTTPRequestHandler):
@@ -2611,9 +2720,11 @@ if r.returncode == 0 and len(sys.argv) > 4:
     r = subprocess.run([sys.executable, sys.argv[3], "--url", "http://127.0.0.1:%d/" % srv.server_address[1], "--decisions-url", sys.argv[4], "--view", "decisions", "--screenshot", sys.argv[5]], timeout=60)
 if r.returncode == 0 and len(sys.argv) > 6:
     r = subprocess.run([sys.executable, sys.argv[3], "--url", "http://127.0.0.1:%d/" % srv.server_address[1], "--team-url", sys.argv[6], "--view", "team", "--screenshot", sys.argv[7]], timeout=60)
+if r.returncode == 0 and len(sys.argv) > 8:
+    r = subprocess.run([sys.executable, sys.argv[3], "--url", "http://127.0.0.1:%d/" % srv.server_address[1], "--view", "reports", "--screenshot", sys.argv[8]], timeout=60)
 sys.exit(r.returncode)
 PY
-			[[ -s $TMP/shot.png && -s $TMP/shot-decisions.png && -s $TMP/shot-team.png ]] && ok "po-dashboard opens, loads events and saves a screenshot, also in the Decisions and Team views (LIMIT and usage rows)" || bad "dashboard ui smoke"
+			[[ -s $TMP/shot.png && -s $TMP/shot-decisions.png && -s $TMP/shot-team.png && -s $TMP/shot-reports.png ]] && ok "po-dashboard opens, loads events and saves a screenshot, also in the Decisions, Team (LIMIT and usage rows) and Reports views" || bad "dashboard ui smoke"
 	else
 		ok "po-dashboard UI smoke skipped: no display"
 	fi

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """po-dashboard: a desktop window showing the gate events of a po serve.
 
-    po-dashboard [--url <url>] [--team-url <url>] [--decisions-url <url>] [--view events|team|decisions] [--theme auto|light|dark] [--all] [--size WxH] [--check] [--screenshot <png>] [--screenshot-delay <s>]
+    po-dashboard [--url <url>] [--team-url <url>] [--decisions-url <url>] [--view events|team|decisions|reports] [--theme auto|light|dark] [--all] [--size WxH] [--check] [--screenshot <png>] [--screenshot-delay <s>]
 
 The URL is the events JSON (a JSON array or one object per line, e.g. the
 /events.json of `po serve`); --url or PO_DASHBOARD_URL, no default. GTK 4 and
@@ -16,6 +16,8 @@ first, asked_at as "3h ago" (local time in the tooltip), thread_url as copyable 
 (or, with --check, the feed unreachable).
 """
 import argparse
+import datetime
+import math
 import os
 import sys
 import threading
@@ -24,11 +26,21 @@ import time
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib", "po"))
 import dashboard_core as core  # noqa: E402
+import dashboard_reports as reports  # noqa: E402
 
 
 def die(msg, code=1):
     sys.stderr.write("po-dashboard: %s\n" % msg)
     sys.exit(code)
+
+
+def local_tz():
+    """The viewer's own zone, for the day and hour buckets of the report charts."""
+    return datetime.datetime.now().astimezone().tzinfo
+
+
+def reports_empty(data):
+    return not (data.get("total") or data.get("rows"))
 
 
 def load_gtk():
@@ -37,10 +49,10 @@ def load_gtk():
 
         gi.require_version("Gtk", "4.0")
         gi.require_version("Gdk", "4.0")
-        from gi.repository import GLib, Gdk, Gtk, Gio
+        from gi.repository import GLib, Gdk, Gtk, Gio, Graphene, Pango
     except (ImportError, ValueError, AttributeError) as e:
         die("needs GTK 4 and PyGObject (pacman -S gtk4 python-gobject): %s" % e, 2)
-    return GLib, Gdk, Gtk, Gio
+    return GLib, Gdk, Gtk, Gio, Graphene, Pango
 
 
 def main():
@@ -48,7 +60,7 @@ def main():
     ap.add_argument("--url", help="events JSON URL (default: $%s)" % core.URL_ENV)
     ap.add_argument("--team-url", help="team feed JSON URL or file (default: $%s; none = no Team view)" % core.TEAM_URL_ENV)
     ap.add_argument("--decisions-url", help="decisions feed JSON URL or file (default: $%s; none = no Decisions view)" % core.DECISIONS_URL_ENV)
-    ap.add_argument("--view", choices=("events", "team", "decisions"), default="events", help="the view to start in (team and decisions need their feed)")
+    ap.add_argument("--view", choices=("events", "team", "decisions", "reports"), default="events", help="the view to start in (team and decisions need their feed)")
     ap.add_argument("--theme", choices=("auto", "light", "dark"), default="auto")
     ap.add_argument("--all", action="store_true", help="start with every event shown (Show all on)")
     ap.add_argument("--size", metavar="WxH", default="760x640", help="initial window size (default 760x640)")
@@ -85,7 +97,75 @@ def main():
         except core.DashboardError as e:
             die(str(e), 2)
         return
-    GLib, Gdk, Gtk, Gio = load_gtk()
+    GLib, Gdk, Gtk, Gio, Graphene, Pango = load_gtk()
+
+    class Chart(Gtk.Widget):
+        """One report chart: the shapes of dashboard_reports, painted with GTK's snapshot (no drawing library
+        beyond GTK itself). Its accessible label and tooltip are the chart's numbers as a sentence."""
+
+        def __init__(self, layout, data, text, dark):
+            super().__init__(hexpand=True, focusable=True, accessible_role=Gtk.AccessibleRole.IMG)
+            self.layout, self.data, self.dark = layout, data, dark
+            self.add_css_class("po-chart-draw")
+            self.set_tooltip_text(text)
+            self.update_property([Gtk.AccessibleProperty.LABEL], [text])
+
+        def do_get_request_mode(self):
+            return Gtk.SizeRequestMode.HEIGHT_FOR_WIDTH
+
+        def do_measure(self, orientation, for_size):
+            if orientation == Gtk.Orientation.HORIZONTAL:
+                return 320, 640, -1, -1
+            h = int(math.ceil(self.layout(self.data, max(for_size, 320))[0]))
+            return h, h, -1, -1
+
+        def colour(self, key):
+            pal = core.PALETTES["dark" if self.dark else "light"]
+            hexcolor = pal["series"][key[1]] if isinstance(key, tuple) else pal[key]
+            rgba = Gdk.RGBA()
+            rgba.parse(hexcolor)
+            return rgba
+
+        def box(self, snap, rgba, x, y, w, h):
+            snap.append_color(rgba, Graphene.Rect().init(x, y, w, h))
+
+        def do_snapshot(self, snap):
+            width = self.get_width()
+            if width <= 0:
+                return
+            for shape in self.layout(self.data, width)[1]:
+                kind = shape[0]
+                if kind == "rect":
+                    _k, x, y, w, h, key, hatched = shape
+                    rgba = self.colour(key)
+                    if not hatched:
+                        self.box(snap, rgba, x, y, w, h)
+                        continue
+                    for bx, by, bw, bh in ((x, y, w, 1), (x, y + h - 1, w, 1), (x, y, 1, h), (x + w - 1, y, 1, h)):
+                        self.box(snap, rgba, bx, by, bw, bh)
+                    snap.push_clip(Graphene.Rect().init(x, y, w, h))
+                    for k in range(-int(h), int(w), 5):  # diagonal lines, bottom left to top right
+                        snap.save()
+                        snap.translate(Graphene.Point().init(x + k, y + h))
+                        snap.rotate(-45)
+                        self.box(snap, rgba, 0, 0, h * 1.4143, 1.5)
+                        snap.restore()
+                    snap.pop()
+                elif kind == "line":
+                    _k, x1, y1, x2, _y2, key = shape
+                    self.box(snap, self.colour(key), x1, y1, x2 - x1, 1)
+                else:
+                    _k, x, y, text, key, align = shape
+                    lay = self.create_pango_layout(text)
+                    desc = Pango.FontDescription()
+                    desc.set_absolute_size(12 * Pango.SCALE)
+                    lay.set_font_description(desc)
+                    tw = lay.get_pixel_size()[0]
+                    x -= tw if align == "end" else tw / 2 if align == "middle" else 0
+                    snap.save()
+                    snap.translate(Graphene.Point().init(x, y))
+                    snap.append_layout(lay, self.colour(key))
+                    snap.restore()
 
     class Dashboard:
         def __init__(self, app):
@@ -100,7 +180,12 @@ def main():
             self.team_order = core.load_team_order(self.order_path)  # saved agent names, the viewer's own order
             self.team_shown = []  # agent names as the Team view shows them now
             self.team_cards = {}  # agent name -> its card, to keep focus on a moved line
+            self.sorts = {"events": None, "team": None}  # per view: None (the default order) or (column key, descending)
+            self.heads = {"events": {}, "team": {}}  # view -> column key -> (header button, arrow label)
+            self.event_groups = [Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL) for _ in core.COLUMNS]
+            self.team_groups = [Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL) for _ in range(4)]
             self.decisions = []
+            self.decisions_expanded = set()  # (project, item) of the cards the user opened
             self.decisions_text = None
             self.view = "events"
             self.events_failed = False
@@ -128,14 +213,12 @@ def main():
             texts.append(title)
             texts.append(self.status)
             self.toggle = Gtk.ToggleButton(label="Show all")
-            self.toggle.add_css_class("po-toggle")
-            self.toggle.set_valign(Gtk.Align.CENTER)
+            self.toggle.add_css_class("po-small")
             if a.all:
                 self.toggle.set_active(True)
                 self.toggle.set_label("Show last %d" % core.LAST)
             self.toggle.connect("toggled", self.on_toggle)
             header.append(texts)
-            header.append(self.toggle)
             self.view_buttons = {}
             if team_url or decisions_url:
                 views = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, valign=Gtk.Align.CENTER)
@@ -150,6 +233,16 @@ def main():
                     self.view_buttons[name] = b
                 header.append(views)
 
+            self.reports_on = a.view == "reports"  # the Reports pane replaces the Events list; kept across refreshes
+            self.report_range = core.REPORT_DEFAULT
+            self.reports_button = Gtk.ToggleButton(label="Reports", active=self.reports_on)
+            self.reports_button.add_css_class("po-small")
+            self.reports_button.connect("toggled", self.on_reports)
+            self.subrow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, margin_top=4, margin_bottom=2)
+            self.subrow.add_css_class("po-subrow")
+            self.subrow.append(self.toggle)
+            self.subrow.append(self.reports_button)
+
             self.error = Gtk.Label(label="", xalign=0, wrap=True, margin_start=36, margin_end=36)
             self.error.add_css_class("po-error")
             self.error.set_visible(False)
@@ -162,8 +255,23 @@ def main():
             team_scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.AUTOMATIC)
             team_scroll.set_child(self.team_list)
             self.stack = Gtk.Stack(vexpand=True)
-            self.stack.add_named(scroll, "events")
-            self.stack.add_named(team_scroll, "team")
+            event_head = self.column_header("events", [(k, t, g, grow) for (k, t, _w, _m, grow), g in zip(core.COLUMNS, self.event_groups)], note_slot=True)
+            team_cols = list(zip(core.TEAM_COLUMNS, self.team_groups + [None]))
+            team_head = self.column_header("team", [(k, k, g, k == "owns") for k, g in team_cols])
+            for view, head, body in (("events", event_head, scroll), ("team", team_head, team_scroll)):
+                page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+                page.append(head)
+                page.append(body)
+                if view == "events":
+                    self.events_page = page
+                    continue
+                self.stack.add_named(page, view)
+            self.events_stack = Gtk.Stack(vexpand=True)  # the Events view: the list, or the Reports pane
+            self.events_stack.add_named(self.events_page, "list")
+            self.events_stack.add_named(self.build_reports(), "reports")
+            self.events_stack.set_visible_child_name("reports" if self.reports_on else "list")
+            self.stack.add_named(self.events_stack, "events")
+            self.stack.set_visible_child_name("events")  # not the first page added (Team): v0.32 showed it at start
             self.decisions_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
             self.decisions_list.add_css_class("po-list")
             decisions_scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.AUTOMATIC)
@@ -177,6 +285,7 @@ def main():
             self.decisions_error.set_visible(False)
 
             outer.append(header)
+            outer.append(self.subrow)
             outer.append(self.error)
             outer.append(self.team_error)
             outer.append(self.decisions_error)
@@ -224,6 +333,8 @@ def main():
             else:
                 self.provider.load_from_data(text.encode("utf-8"))
             Gtk.StyleContext.add_provider_for_display(display, self.provider, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+            if hasattr(self, "chart_box"):
+                self.redraw_reports()  # the charts take their colours from the variant
 
         # -- the new-event highlight --
         def step_of(self, key):
@@ -326,8 +437,7 @@ def main():
                 self.fade_tick()
             self.stack.set_visible_child_name(name)
             self.title_label.set_text({"team": "Team", "decisions": "Decisions"}.get(name, "Gate events"))
-            self.toggle.set_opacity(1.0 if name == "events" else 0.0)
-            self.toggle.set_sensitive(name == "events")
+            self.subrow.set_visible(name == "events")
             self.error.set_visible(name == "events" and self.events_failed)
             self.team_error.set_visible(name == "team" and self.team_failed)
             self.decisions_error.set_visible(name == "decisions" and self.decisions_failed)
@@ -358,6 +468,7 @@ def main():
                 self.seen = {core.event_key(e) for e in events} | (self.seen or set())
                 self.last_text, self.events = text, events
                 self.redraw()
+            self.redraw_reports()  # the range holds more or fewer events as the clock moves
             self.show_status()
             if a.screenshot and not self.shot_done:
                 self.shot_done = True
@@ -370,11 +481,101 @@ def main():
                 return True
             return False
 
+        # -- reports --
+        def build_reports(self):
+            """The Reports pane: a title, the time-range choice, one area per chart (placeholders) or the empty text."""
+            pane = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_start=36, margin_end=36, margin_top=10)
+            title = self.label("Reports", "po-title")
+            pane.append(title)
+            choice = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            self.range_buttons = []
+            first = None
+            for i, (text, _secs) in enumerate(core.REPORT_RANGES):
+                b = Gtk.ToggleButton(label=text, active=i == self.report_range, group=first)
+                first = first or b
+                b.add_css_class("po-small")
+                b.connect("toggled", self.on_range, i)
+                choice.append(b)
+                self.range_buttons.append(b)
+            pane.append(choice)
+            self.chart_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            pane.append(self.chart_box)
+            self.redraw_reports()
+            scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+            scroll.set_child(pane)
+            return scroll
+
+        def redraw_reports(self):
+            child = self.chart_box.get_first_child()
+            while child is not None:
+                nxt = child.get_next_sibling()
+                self.chart_box.remove(child)
+                child = nxt
+            secs = core.REPORT_RANGES[self.report_range][1]
+            if not core.in_range(self.events, secs):
+                self.chart_box.append(self.label(core.REPORT_EMPTY, "po-muted", margin_top=8))
+                return
+            layouts = (reports.layout_gate_runs, reports.layout_first_try, reports.layout_closed,
+                       reports.layout_cycle_time, reports.layout_failed_legs)
+            for (name, data, text), layout in zip(reports.reports(self.events, secs, tz=local_tz()), layouts):
+                area = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+                area.add_css_class("po-chart")
+                area.append(self.label(name, "po-text"))
+                if reports_empty(data):
+                    area.append(self.label("none in this range", "po-muted"))
+                else:
+                    area.append(Chart(layout, data, text, self.dark()))
+                self.chart_box.append(area)
+
+        def on_range(self, button, i):
+            if button.get_active():
+                self.report_range = i
+                self.redraw_reports()
+
+        def on_reports(self, button):
+            self.reports_on = button.get_active()
+            self.events_stack.set_visible_child_name("reports" if self.reports_on else "list")
+
         def on_toggle(self, button):
             self.show_all = button.get_active()
             button.set_label("Show last %d" % core.LAST if self.show_all else "Show all")
             self.redraw()
             self.show_status()
+
+        # -- column headers --
+        def column_header(self, view, columns, note_slot=False):
+            """A muted line of real buttons over a list's columns, in the columns' size groups; a click sorts by one."""
+            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10, margin_start=34, margin_end=34, margin_top=4)
+            for key, title, group, grow in columns:
+                inner = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4, halign=Gtk.Align.START)
+                inner.append(self.label(title, "po-muted", ellipsize=3))
+                arrow = self.label("", "po-muted", width_chars=1)
+                inner.append(arrow)
+                b = Gtk.Button(hexpand=grow)
+                b.set_child(inner)
+                b.add_css_class("po-colhead")
+                b.set_tooltip_text("sort by %s" % title)
+                b.update_property([Gtk.AccessibleProperty.LABEL], ["sort by %s" % title])
+                b.connect("clicked", self.on_sort, view, key)
+                if group is not None:
+                    group.add_widget(b)
+                box.append(b)
+                self.heads[view][key] = (b, arrow)
+            if note_slot:
+                box.append(Gtk.Box(width_request=24))
+            return box
+
+        def on_sort(self, _button, view, key):
+            self.sorts[view] = core.next_sort(self.sorts[view], key)
+            self.show_marks(view)
+            if view == "events":
+                self.redraw()
+            else:
+                self.redraw_team()
+
+        def show_marks(self, view):
+            for key, (_b, arrow) in self.heads[view].items():
+                arrow.set_text(core.sort_mark(self.sorts[view], key))
 
         # -- drawing --
         def label(self, text, *classes, **kw):
@@ -403,10 +604,10 @@ def main():
                 nxt = child.get_next_sibling()
                 self.list.remove(child)
                 child = nxt
-            groups = [Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL) for _ in core.COLUMNS]
+            groups = self.event_groups
             note_group = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)
             self.cards = []
-            for ev in core.visible(self.events, self.show_all):
+            for ev in core.sorted_events(core.visible(self.events, self.show_all), self.sorts["events"]):
                 r = core.row(ev)
                 card = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
                 card.add_css_class("po-card")
@@ -435,9 +636,11 @@ def main():
                 nxt = child.get_next_sibling()
                 self.team_list.remove(child)
                 child = nxt
-            groups = [Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL) for _ in range(4)]
-            rows = core.team_rows(core.apply_team_order(self.team, self.team_order))
+            groups = self.team_groups
+            sort = self.sorts["team"]
+            rows = core.team_rows(core.sorted_team(core.apply_team_order(self.team, self.team_order), sort))
             any_model = any(r["model"] for r in rows)
+            self.heads["team"]["model"][0].set_visible(any_model)
             self.team_shown = [r["agent"] for r in rows]
             self.team_cards = {}
             for r in rows:
@@ -462,17 +665,22 @@ def main():
                     g.add_widget(w)
                 for w in (name, model, state, now, owns) if any_model else (name, state, now, owns):
                     card.append(w)
+                if sort is not None:
+                    card.set_tooltip_text("%s: clear the column sort to reorder" % r["agent"])
                 self.team_list.append(card)
                 self.team_cards[r["agent"]] = card
 
         def redraw_decisions(self):
+            self.decisions_expanded = core.prune_expanded(self.decisions_expanded, self.decisions)
             child = self.decisions_list.get_first_child()
             while child is not None:
                 nxt = child.get_next_sibling()
                 self.decisions_list.remove(child)
                 child = nxt
             groups = [Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL) for _ in range(4)]
-            for r in core.decision_rows(self.decisions):
+            for entry in core.sort_decisions(self.decisions):
+                r = core.decision_row(entry)
+                key = core.decision_key(entry)
                 card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
                 card.add_css_class("po-card")
                 top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
@@ -492,12 +700,12 @@ def main():
                 for w in (item, project, title, asked, asked_by) if asked_by else (item, project, title, asked):
                     top.append(w)
                 expanded = Gtk.Label(label=r["waiting_for"], xalign=0, wrap=True, selectable=True)
-                expanded.set_visible(False)
+                expanded.set_visible(key in self.decisions_expanded)
                 expanded.add_css_class("po-muted")
                 # collapsed header: click toggles the full waiting_for
                 header = Gtk.Button()
                 header.set_child(top)
-                header.connect("clicked", lambda _b, ex=expanded: ex.set_visible(not ex.get_visible()))
+                header.connect("clicked", self.on_decision_toggle, expanded, key)
                 card.append(header)
                 card.append(expanded)
                 if r["thread_url"]:
@@ -505,6 +713,10 @@ def main():
                     url.set_tooltip_text(r["thread_url"])
                     card.append(url)
                 self.decisions_list.append(card)
+
+        def on_decision_toggle(self, _button, label, key):
+            self.decisions_expanded = core.toggle_expanded(self.decisions_expanded, key)
+            label.set_visible(key in self.decisions_expanded)
 
         def make_movable(self, card, agent):
             """Drag the line onto another to take its place; Alt+Up/Down moves the focused line."""
@@ -533,6 +745,8 @@ def main():
 
         def move_team(self, agent, index):
             """Move agent to index, save the order on this machine, redraw and keep the focus on its line."""
+            if self.sorts["team"] is not None:  # the shown order is the sort's, never the saved one
+                return True
             shown = core.move_agent(self.team_shown, agent, index)
             if shown == self.team_shown:
                 return True

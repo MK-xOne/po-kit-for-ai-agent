@@ -15,6 +15,13 @@ import urllib.request
 
 LAST = 10
 INTERVAL_MS = 5000
+# The Reports pane: time ranges (label, seconds), the default one, and the chart areas
+# (placeholders until the charts exist) shown when the range holds events.
+REPORT_RANGES = (("24 h", 86400), ("7 d", 7 * 86400), ("30 d", 30 * 86400))
+REPORT_DEFAULT = 1
+REPORT_CHARTS = ("Gate runs per agent", "First-try pass rate per agent", "Items closed per day, by project",
+                 "Item cycle time per agent", "Failed legs by kind over time")
+REPORT_EMPTY = "no events in this range"
 URL_ENV = "PO_DASHBOARD_URL"
 TEAM_URL_ENV = "PO_DASHBOARD_TEAM_URL"
 DECISIONS_URL_ENV = "PO_DASHBOARD_DECISIONS_URL"
@@ -116,6 +123,18 @@ def visible(events, show_all):
     return events if show_all else events[:LAST]
 
 
+def in_range(events, seconds, now=None):
+    """The events whose time falls within the last `seconds` before now (default: the present); unreadable times are left out."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    lo = now - datetime.timedelta(seconds=seconds)
+    out = []
+    for e in events:
+        t = parse_time(e.get("time"))
+        if t is not None and lo <= t <= now:
+            out.append(e)
+    return out
+
+
 # ---- formatting ------------------------------------------------------------
 
 
@@ -189,8 +208,48 @@ def row(event, tz=None):
     }
 
 
-def rows(events, show_all, tz=None):
-    return [row(e, tz) for e in visible(events, show_all)]
+def rows(events, show_all, tz=None, sort=None):
+    return [row(e, tz) for e in sorted_events(visible(events, show_all), sort, tz)]
+
+
+# ---- sortable columns ----------------------------------------------------------
+# A sort is None (the default order) or (column key, descending). Clicking a header
+# cycles that column ascending, descending, then back to None.
+
+
+def natural_key(text):
+    """Case-insensitive, with digit runs compared as numbers ('1.9' before '1.11')."""
+    parts = re.split(r"(\d+)", str(text).lower())
+    return tuple((0, int(p), "") if p.isdigit() else (1, 0, p) for p in parts if p != "")
+
+
+def next_sort(current, key):
+    """The sort after a click on column key: ascending, then descending, then none."""
+    if current is None or current[0] != key:
+        return (key, False)
+    return (key, True) if not current[1] else None
+
+
+def sort_mark(sort, key):
+    """The arrow the header of column key shows: up ascending, down descending, '' when not the sorted column."""
+    if sort is None or sort[0] != key:
+        return ""
+    return "\u25bc" if sort[1] else "\u25b2"
+
+
+def sorted_events(events, sort, tz=None):
+    """events ordered by the sort (stable); time by instant, not text; None keeps the order given."""
+    if sort is None:
+        return list(events)
+    key, desc = sort
+    if key == "time":
+        def value(e):
+            t = parse_time(e.get("time"))
+            return (1, t.timestamp(), ()) if t else (0, 0.0, natural_key(e.get("time") or ""))
+    else:
+        def value(e):
+            return natural_key(row(e, tz)[key])
+    return sorted(events, key=value, reverse=desc)
 
 
 def check_lines(events, show_all=False, tz=None):
@@ -278,6 +337,17 @@ def team_rows(entries, now=None, tz=None):
     return [team_row(e, now, tz) for e in entries]
 
 
+TEAM_COLUMNS = ("agent", "model", "status", "now", "owns")
+
+
+def sorted_team(entries, sort, now=None, tz=None):
+    """Team entries ordered by the sort (stable); None keeps the order given (the viewer's saved order)."""
+    if sort is None:
+        return list(entries)
+    key, desc = sort
+    return sorted(entries, key=lambda e: natural_key(team_row(e, now, tz)[key]), reverse=desc)
+
+
 def team_check_lines(entries, now=None, tz=None):
     """What the Team view would show, one ' | ' line per agent; a model follows the name after ' · '."""
     return [
@@ -359,6 +429,21 @@ def decision_row(entry, now=None, tz=None):
 
 def decision_rows(entries, now=None, tz=None):
     return [decision_row(e, now, tz) for e in sort_decisions(entries)]
+
+
+def decision_key(entry):
+    """What identifies a decision across refreshes: its project and item."""
+    return (str(entry.get("project") or ""), str(entry.get("item") or ""))
+
+
+def toggle_expanded(expanded, key):
+    """The set of expanded decisions with key flipped (a new set; expanded is not changed)."""
+    return expanded - {key} if key in expanded else expanded | {key}
+
+
+def prune_expanded(expanded, entries):
+    """The expanded decisions still in the feed; one that left the feed drops out."""
+    return expanded & {decision_key(e) for e in entries}
 
 
 def decision_check_lines(entries, now=None, tz=None):
@@ -514,11 +599,13 @@ PALETTES = {
         "base": "#e0e5ec", "light": "#ffffff", "dark": "#a3b1c6",
         "text": "#2b3440", "muted": "#4f5b6a",
         "pass": "#13693a", "fail": "#a8201a", "skip": "#5a5f66",
+        "series": ["#1f5fa8", "#a14a00", "#7a3d9e", "#00796b", "#8c3b2e", "#5a5f66"],
     },
     "dark": {
         "base": "#2b2f36", "light": "#383d46", "dark": "#1e2126",
         "text": "#e8ebf0", "muted": "#aab2bf",
         "pass": "#6fdc9a", "fail": "#ff9a94", "skip": "#aab2bf",
+        "series": ["#7fb2ff", "#ffb86b", "#c9a0ff", "#5fd6c4", "#e6a08f", "#aab2bf"],
     },
 }
 
@@ -550,6 +637,17 @@ window.po-dashboard { background-color: %(base)s; color: %(text)s; }
   padding: 8px 16px; box-shadow: 4px 4px 8px %(dark)s, -4px -4px 8px %(light)s; }
 .po-view:checked { box-shadow: inset 4px 4px 8px %(dark)s, inset -4px -4px 8px %(light)s; }
 .po-view:focus-visible { outline: 2px solid %(text)s; outline-offset: 2px; }
+.po-subrow { margin: 0 18px 0 18px; }
+.po-small { background-color: %(base)s; background-image: none; color: %(text)s; border: none; border-radius: 10px;
+  padding: 2px 12px; min-height: 0; font-size: 12px; box-shadow: 3px 3px 6px %(dark)s, -3px -3px 6px %(light)s; }
+.po-small:checked { box-shadow: inset 3px 3px 6px %(dark)s, inset -3px -3px 6px %(light)s; }
+.po-small:focus-visible { outline: 2px solid %(text)s; outline-offset: 2px; }
+.po-chart { background-color: %(base)s; border-radius: 14px; padding: 24px 16px; margin: 8px 0;
+  box-shadow: inset 4px 4px 8px %(dark)s, inset -4px -4px 8px %(light)s; }
+.po-chart-draw:focus-visible { outline: 2px solid %(text)s; outline-offset: 2px; }
+.po-colhead { background-color: transparent; background-image: none; border: none; box-shadow: none; padding: 2px 0; min-height: 0; }
+.po-colhead:hover { background-color: transparent; }
+.po-colhead:focus-visible { outline: 2px solid %(text)s; outline-offset: 2px; }
 .po-team:focus-visible { outline: 2px solid %(text)s; outline-offset: 2px; }
 .po-team.po-drop { box-shadow: inset 4px 4px 8px %(dark)s, inset -4px -4px 8px %(light)s; }
 """
