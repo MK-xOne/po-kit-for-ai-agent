@@ -1,5 +1,17 @@
 [
   {"project": "orchard", "item": "2.3", "title": "Pick the storage format for snapshots", "waiting_for": "a ruling", "asked_at": "2026-10-24T09:12:00Z", "thread_url": "https://chat.example.org/t/8f2c41", "asked_by": "ana"},
-  {"project": "harbor", "item": "0.7", "title": "Accept the new import screen", "waiting_for": "an acceptance", "asked_at": "2026-10-24T14:40:00Z"},
-  {"project": "orchard", "item": "2.5", "title": "Unblock the release: a key is missing", "waiting_for": "a block to clear", "asked_at": "2026-10-23T18:05:00Z", "thread_url": "https://chat.example.org/t/1b9e07"}
+  {"project": "harbor", "item": "0.7", "title": "Accept the new import screen", "waiting_for": "an acceptance", "asked_at": "2026-10-24T14:40:00Z", "kind": "choice", "id": "ask-0707", "asked_by": "ana",
+   "question": "Approve the import screen?",
+   "options": [
+     {"label": "Approve", "description": "ships as specified", "recommended": true},
+     {"label": "Deny", "description": "back to spec"}
+   ]},
+  {"project": "orchard", "item": "2.5", "title": "Unblock the release: a key is missing", "waiting_for": "a block to clear", "asked_at": "2026-10-23T18:05:00Z", "thread_url": "https://chat.example.org/t/1b9e07", "kind": "action", "id": "ask-0205", "asked_by": "bo",
+   "machine": "the build host",
+   "steps": [
+     {"text": "Put the signing key in place", "command": "install -m 600 release.key /etc/orchard/release.key"},
+     {"text": "Restart the viewer"}
+   ],
+   "done_when": "the page shows the new tag"},
+  {"project": "harbor", "item": "0.8", "title": "Choose the retry limit", "waiting_for": "a ruling", "asked_at": "2026-10-24T16:00:00Z", "kind": "choice", "id": "ask-0808", "asked_by": "bo"}
 ]

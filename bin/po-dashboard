@@ -11,8 +11,9 @@ JSON array of {agent, model?, state, now, owns[], free, limit_until?, usage?}; w
 (or Alt+Up/Down on a focused one) to reorder; the order is saved in $XDG_CONFIG_HOME/po-dashboard/team-order.json
 (default ~/.config; PO_DASHBOARD_TEAM_ORDER names another file).
 --decisions-url or PO_DASHBOARD_DECISIONS_URL (no default) adds a Decisions view to the toggle, read-only:
-a JSON array of {project, item, title, waiting_for, asked_at, thread_url?}, one line per entry, oldest asked
-first, asked_at as "3h ago" (local time in the tooltip), thread_url as copyable muted text. Esc closes the window. Exit codes: 1 usage, 2 GTK or PyGObject missing
+a JSON array of {project, item, title, waiting_for, asked_at, thread_url?, asked_by?, kind?, id?, ...}: Choices first, then
+Actions, then unformatted and legacy entries, oldest asked first in each group; an Actions toggle (saved in $XDG_CONFIG_HOME/po-dashboard/decisions.json)
+hides the Action entries. One line per entry, asked_at as "3h ago" (local time in the tooltip), thread_url as copyable muted text. Esc closes the window. Exit codes: 1 usage, 2 GTK or PyGObject missing
 (or, with --check, the feed unreachable).
 """
 import argparse
@@ -60,7 +61,9 @@ def main():
     ap.add_argument("--url", help="events JSON URL (default: $%s)" % core.URL_ENV)
     ap.add_argument("--team-url", help="team feed JSON URL or file (default: $%s; none = no Team view)" % core.TEAM_URL_ENV)
     ap.add_argument("--decisions-url", help="decisions feed JSON URL or file (default: $%s; none = no Decisions view)" % core.DECISIONS_URL_ENV)
-    ap.add_argument("--view", choices=("events", "team", "decisions", "reports"), default="events", help="the view to start in (team and decisions need their feed)")
+    ap.add_argument("--projects-url", help="projects feed JSON URL or file (default: $%s; none = no Projects view)" % core.PROJECTS_URL_ENV)
+    ap.add_argument("--view", choices=("events", "team", "decisions", "projects", "reports"), default="events", help="the view to start in (team, decisions and projects need their feed)")
+    ap.add_argument("--project", metavar="NAME", help="with --view projects: open straight on this project's screen")
     ap.add_argument("--theme", choices=("auto", "light", "dark"), default="auto")
     ap.add_argument("--all", action="store_true", help="start with every event shown (Show all on)")
     ap.add_argument("--size", metavar="WxH", default="760x640", help="initial window size (default 760x640)")
@@ -78,12 +81,17 @@ def main():
         url = core.resolve_url(a.url)
         team_url = core.resolve_team_url(a.team_url)
         decisions_url = core.resolve_decisions_url(a.decisions_url)
+        projects_url = core.resolve_projects_url(a.projects_url)
     except core.DashboardError as e:
         die(str(e))
     if a.view == "team" and not team_url:
         die("--view team needs a team feed: pass --team-url or set %s" % core.TEAM_URL_ENV)
     if a.view == "decisions" and not decisions_url:
         die("--view decisions needs a decisions feed: pass --decisions-url or set %s" % core.DECISIONS_URL_ENV)
+    if a.project and a.view != "projects":
+        die("--project needs --view projects")
+    if a.view == "projects" and not projects_url:
+        die("--view projects needs a projects feed: pass --projects-url or set %s" % core.PROJECTS_URL_ENV)
     if a.check:
         try:
             print("\n".join(core.check_lines(core.parse_events(core.fetch(url)), a.all)))
@@ -94,6 +102,9 @@ def main():
             if decisions_url:
                 print("decisions:")
                 print("\n".join(core.decision_check_lines(core.parse_decisions(core.fetch(decisions_url)))))
+            if projects_url:
+                print("projects:")
+                print("\n".join(core.project_check_lines(core.parse_projects(core.fetch(projects_url)))))
         except core.DashboardError as e:
             die(str(e), 2)
         return
@@ -186,11 +197,17 @@ def main():
             self.team_groups = [Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL) for _ in range(4)]
             self.decisions = []
             self.decisions_expanded = set()  # (project, item) of the cards the user opened
+            self.filter_path = core.decisions_filter_path()
+            self.actions_shown = core.load_actions_shown(self.filter_path)  # the viewer's own Actions filter
             self.decisions_text = None
             self.view = "events"
             self.events_failed = False
             self.team_failed = False
             self.decisions_failed = False
+            self.projects = None  # the last good projects feed 
+            self.projects_note = ""
+            self.projects_failed = False
+            self.cards_by_child = []
             self.last_text = None
             self.provider = None
             self.shot_done = False
@@ -220,9 +237,9 @@ def main():
             self.toggle.connect("toggled", self.on_toggle)
             header.append(texts)
             self.view_buttons = {}
-            if team_url or decisions_url:
+            if team_url or decisions_url or projects_url:
                 views = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, valign=Gtk.Align.CENTER)
-                shown = [("events", "Events")] + ([("team", "Team")] if team_url else []) + ([("decisions", "Decisions")] if decisions_url else [])
+                shown = [("events", "Events")] + ([("team", "Team")] if team_url else []) + ([("decisions", "Decisions")] if decisions_url else []) + ([("projects", "Projects")] if projects_url else [])
                 first = None
                 for name, text in shown:
                     b = Gtk.ToggleButton(label=text, active=first is None, group=first)
@@ -240,8 +257,13 @@ def main():
             self.reports_button.connect("toggled", self.on_reports)
             self.subrow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, margin_top=4, margin_bottom=2)
             self.subrow.add_css_class("po-subrow")
+            self.actions_toggle = Gtk.ToggleButton(label="Actions", active=self.actions_shown)
+            self.actions_toggle.add_css_class("po-small")
+            self.actions_toggle.connect("toggled", self.on_actions)
             self.subrow.append(self.toggle)
             self.subrow.append(self.reports_button)
+            self.subrow.append(self.actions_toggle)
+            self.subrow_show(a.view)
 
             self.error = Gtk.Label(label="", xalign=0, wrap=True, margin_start=36, margin_end=36)
             self.error.add_css_class("po-error")
@@ -277,6 +299,21 @@ def main():
             decisions_scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.AUTOMATIC)
             decisions_scroll.set_child(self.decisions_list)
             self.stack.add_named(decisions_scroll, "decisions")
+            self.projects_sig = None  # what the cards show now; a refresh that changes nothing touches nothing
+            self.pstate = core.project_view_state(a.project)  # open project (None = overview) and per-project filter
+            self.pscreen_sig = None
+            self.projects_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            self.projects_list.add_css_class("po-list")
+            self.projects_scroll = projects_scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+            projects_scroll.set_child(self.projects_list)
+            self.projects_stack = Gtk.Stack()
+            self.projects_stack.add_named(projects_scroll, "overview")
+            self.pscreen = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_start=36, margin_end=36, margin_top=6)
+            self.projects_stack.add_named(self.pscreen, "screen")
+            self.stack.add_named(self.projects_stack, "projects")
+            self.projects_error = Gtk.Label(label="", xalign=0, wrap=True, margin_start=36, margin_end=36)
+            self.projects_error.add_css_class("po-error")
+            self.projects_error.set_visible(False)
             self.team_error = Gtk.Label(label="", xalign=0, wrap=True, margin_start=36, margin_end=36)
             self.team_error.add_css_class("po-error")
             self.team_error.set_visible(False)
@@ -289,6 +326,7 @@ def main():
             outer.append(self.error)
             outer.append(self.team_error)
             outer.append(self.decisions_error)
+            outer.append(self.projects_error)
             outer.append(self.stack)
             self.win.set_child(outer)
             if a.view in self.view_buttons:
@@ -366,6 +404,147 @@ def main():
                 threading.Thread(target=self.team_worker, daemon=True).start()
             if decisions_url:
                 threading.Thread(target=self.decisions_worker, daemon=True).start()
+            if projects_url:
+                threading.Thread(target=self.projects_worker, daemon=True).start()
+
+        def projects_worker(self):
+            projects, note = core.load_projects(projects_url, self.projects)
+            GLib.idle_add(self.on_projects, projects, note)
+
+        def on_projects(self, projects, note):
+            self.projects, self.projects_note = projects, note
+            self.projects_failed = bool(note)
+            self.projects_error.set_text(note)
+            self.projects_error.set_visible(self.view == "projects" and self.projects_failed)
+            self.redraw_projects()
+            self.show_status()
+            if a.screenshot and not self.shot_done and self.view == "projects":
+                self.shot_done = True
+                GLib.timeout_add(int(a.screenshot_delay * 1000), self.screenshot)
+            return False
+
+        def open_project(self, name):
+            self.pstate = core.project_state_open(self.pstate, name)
+            self.redraw_project_screen()
+
+        def back_to_overview(self):
+            name = self.pstate["open"]
+            self.pstate = core.project_state_back(self.pstate)
+            self.redraw_project_screen()
+            for child, n in self.cards_by_child:  # the project stays highlighted: its card takes the focus back
+                if n == name:
+                    child.grab_focus()
+
+        def set_project_filter(self, key):
+            self.pstate = core.project_state_set_filter(self.pstate, self.pstate["open"], key)
+            self.redraw_project_screen()
+
+        def redraw_project_screen(self):
+            """Show the open project's screen, or the overview; a refresh that changes nothing touches nothing."""
+            self.pstate = core.project_state_reconcile(self.pstate, self.projects)
+            name = self.pstate["open"]
+            pr = next((p for p in self.projects or [] if p["project"] == name), None)
+            if pr is None:
+                self.pscreen_sig = None
+                self.projects_stack.set_visible_child_name("overview")
+                return
+            screen = core.project_screen(pr, core.project_state_filter(self.pstate, name))
+            sig = (screen["text"], [(f["key"], f["count"]) for f in screen["filters"]], core.project_state_filter(self.pstate, name),
+                   [(r["item"], r["title"], r["status"], tuple(r["agents"])) for r in screen["rows"]])
+            self.projects_stack.set_visible_child_name("screen")
+            if sig == self.pscreen_sig:
+                return
+            self.pscreen_sig = sig
+            for c in list(self.pscreen):
+                self.pscreen.remove(c)
+            head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            back = Gtk.Button(label="\u2190 Back")
+            back.connect("clicked", lambda _b: self.back_to_overview())
+            head.append(back)
+            head.append(self.label("\u25cf", "po-light-%s" % screen["light"]))
+            head.append(self.label(screen["name"], "po-title", hexpand=True, ellipsize=3))
+            head.append(self.label(screen["light"], "po-muted"))
+            head.set_tooltip_text(screen["text"])
+            self.pscreen.append(head)
+            bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            first = None
+            current = core.project_state_filter(self.pstate, name)
+            for f in screen["filters"]:
+                b = Gtk.ToggleButton(label="%s %d" % (f["label"], f["count"]), active=f["key"] == current, group=first)
+                first = first or b
+                b.connect("toggled", lambda btn, k=f["key"]: btn.get_active() and self.set_project_filter(k))
+                bar.append(b)
+            self.pscreen.append(bar)
+            rows = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            for r in screen["rows"]:
+                line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+                line.add_css_class("po-card")
+                line.append(self.label(r["item"], "po-text", width_chars=6))
+                line.append(self.label(r["title"], "po-text", hexpand=True, ellipsize=3))
+                line.append(self.label(r["status"], "po-muted", width_chars=7))
+                agents = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                if r["dash"]:
+                    agents.append(self.label("\u2013", "po-muted"))
+                for ag in r["agents"]:
+                    if r["live"]:
+                        agents.append(self.label("\u25cf", "po-live"))
+                    agents.append(self.label(ag, "po-text"))
+                line.append(agents)
+                rows.append(line)
+            if not screen["rows"]:
+                rows.append(self.label("no items", "po-muted"))
+            scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+            scroll.set_child(rows)
+            self.pscreen.append(scroll)
+
+        def redraw_projects(self):
+            cards = [core.project_card(pr) for pr in self.projects or []]
+            sig = [(c["name"], c["text"]) for c in cards]
+            self.redraw_project_screen()
+            if sig == self.projects_sig:
+                return
+            self.projects_sig = sig
+            vadj = self.projects_scroll.get_vadjustment()
+            scroll = vadj.get_value()
+            focused = None
+            for c in self.cards_by_child:
+                if c[0].has_focus():
+                    focused = c[1]
+            self.cards_by_child = []
+            for c in list(self.projects_list):
+                self.projects_list.remove(c)
+            if not cards:
+                self.projects_list.append(self.label("no projects", "po-muted"))
+                return
+            flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True, min_children_per_line=1,
+                               max_children_per_line=6, column_spacing=12, row_spacing=4, valign=Gtk.Align.START)
+            flow.connect("child-activated", lambda _f, child: self.open_project(child.project_name))
+            restore = None
+            for c in cards:
+                child = Gtk.FlowBoxChild(focusable=True)
+                child.project_name = c["name"]
+                child.set_tooltip_text(c["text"])
+                child.update_property([Gtk.AccessibleProperty.LABEL], [c["text"]])
+                card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+                card.add_css_class("po-card")
+                top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+                top.append(self.label("●", "po-light-%s" % c["light"]))
+                top.append(self.label(c["name"], "po-text", hexpand=True, ellipsize=3))
+                card.append(top)
+                row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+                for lab, key in (("TODO", "todo"), ("DOING", "doing"), ("DONE", "done")):
+                    row.append(self.label("%s %d" % (lab, c["counts"][key]), "po-muted"))
+                card.append(row)
+                child.set_child(card)
+                child.add_css_class("po-pcard")
+                flow.append(child)
+                self.cards_by_child.append((child, c["name"]))
+                if c["name"] == focused:
+                    restore = child
+            self.projects_list.append(flow)
+            if restore is not None:
+                restore.grab_focus()
+            GLib.idle_add(lambda: vadj.set_value(scroll) and False)
 
         def decisions_worker(self):
             try:
@@ -413,11 +592,17 @@ def main():
             return False
 
         def show_status(self):
+            if self.view == "projects":
+                if self.projects_failed:
+                    self.status.set_text("projects not updated")
+                else:
+                    self.status.set_text("%d projects" % len(self.projects) if self.projects is not None else "loading…")
+                return
             if self.view == "decisions":
                 if self.decisions_failed:
                     self.status.set_text("decisions not updated")
                 else:
-                    self.status.set_text("%d waiting" % len(self.decisions) if self.decisions_text is not None else "loading…")
+                    self.status.set_text(core.decisions_status(*self.decisions_counts()) if self.decisions_text is not None else "loading…")
             elif self.view == "team":
                 if self.team_failed:
                     self.status.set_text("team not updated")
@@ -428,6 +613,28 @@ def main():
             else:
                 self.status.set_text("%d events · %s" % (len(self.events), "all" if self.show_all else "last %d" % core.LAST))
 
+        def subrow_show(self, name):
+            """The second button row: Show all and Reports in Events, only Actions in Decisions, hidden elsewhere."""
+            self.subrow.set_visible(name in ("events", "decisions"))
+            self.toggle.set_visible(name == "events")
+            self.reports_button.set_visible(name == "events")
+            self.actions_toggle.set_visible(name == "decisions")
+
+        def decisions_counts(self):
+            """(entries shown, Action entries hidden by the filter)."""
+            kept, hidden = core.filter_decisions(self.decisions, self.actions_shown)
+            return len(kept), hidden
+
+        def on_actions(self, button):
+            self.actions_shown = button.get_active()
+            try:
+                core.save_actions_shown(self.filter_path, self.actions_shown)
+            except core.DashboardError as e:
+                self.decisions_error.set_text(str(e))
+                self.decisions_error.set_visible(self.view == "decisions")
+            self.redraw_decisions()
+            self.show_status()
+
         def on_view(self, button, name):
             if not button.get_active():
                 return
@@ -436,11 +643,12 @@ def main():
                 self.born.clear()
                 self.fade_tick()
             self.stack.set_visible_child_name(name)
-            self.title_label.set_text({"team": "Team", "decisions": "Decisions"}.get(name, "Gate events"))
-            self.subrow.set_visible(name == "events")
+            self.title_label.set_text({"team": "Team", "decisions": "Decisions", "projects": "Projects"}.get(name, "Gate events"))
+            self.subrow_show(name)
             self.error.set_visible(name == "events" and self.events_failed)
             self.team_error.set_visible(name == "team" and self.team_failed)
             self.decisions_error.set_visible(name == "decisions" and self.decisions_failed)
+            self.projects_error.set_visible(name == "projects" and self.projects_failed)
             self.show_status()
 
         def fetch_worker(self):
@@ -470,13 +678,16 @@ def main():
                 self.redraw()
             self.redraw_reports()  # the range holds more or fewer events as the clock moves
             self.show_status()
-            if a.screenshot and not self.shot_done:
+            if a.screenshot and not self.shot_done and a.view != "projects":  # the projects feed triggers its own shot
                 self.shot_done = True
                 GLib.timeout_add(int(a.screenshot_delay * 1000), self.screenshot)
             return False
 
         def on_key(self, _ctrl, keyval, _code, _state):
             if keyval == Gdk.KEY_Escape:
+                if self.view == "projects" and self.pstate["open"]:
+                    self.back_to_overview()
+                    return True
                 self.win.close()
                 return True
             return False
@@ -678,7 +889,8 @@ def main():
                 self.decisions_list.remove(child)
                 child = nxt
             groups = [Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL) for _ in range(4)]
-            for entry in core.sort_decisions(self.decisions):
+            shown, _hidden = core.filter_decisions(self.decisions, self.actions_shown)
+            for entry in core.sort_decisions(shown):
                 r = core.decision_row(entry)
                 key = core.decision_key(entry)
                 card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
@@ -697,11 +909,15 @@ def main():
                     asked_by = None
                 for w, g in zip((item, project, waiting, asked), groups):
                     g.add_widget(w)
-                for w in (item, project, title, asked, asked_by) if asked_by else (item, project, title, asked):
-                    top.append(w)
-                expanded = Gtk.Label(label=r["waiting_for"], xalign=0, wrap=True, selectable=True)
+                badge = self.label(core.DECISION_BADGE[r["kind"]], "po-kind", "po-kind-" + r["kind"], width_chars=11)  # empty for legacy: keeps the columns aligned
+                if r["kind"] != "legacy":
+                    badge.set_tooltip_text(r["kind"])
+                for w in (badge, item, project, title, asked, asked_by):
+                    if w is not None:
+                        top.append(w)
+                expanded = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
                 expanded.set_visible(key in self.decisions_expanded)
-                expanded.add_css_class("po-muted")
+                self.fill_decision(expanded, r)
                 # collapsed header: click toggles the full waiting_for
                 header = Gtk.Button()
                 header.set_child(top)
@@ -714,9 +930,46 @@ def main():
                     card.append(url)
                 self.decisions_list.append(card)
 
-        def on_decision_toggle(self, _button, label, key):
+        def fill_decision(self, box, r):
+            """The expanded part of a card: the full waiting_for, then the question and options or the steps."""
+            def text(s, *classes, **kw):
+                lab = Gtk.Label(label=s, xalign=0, wrap=True, selectable=True, **kw)
+                for c in classes:
+                    lab.add_css_class(c)
+                return lab
+            box.append(text(r["waiting_for"], "po-muted"))
+            if r["kind"] == "choice":
+                box.append(text(r["question"], "po-text"))
+                for n, o in enumerate(r["options"], 1):
+                    line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, margin_start=12)
+                    line.append(self.label("%d." % n, "po-muted"))
+                    line.append(text(o["label"], "po-text"))
+                    if o["recommended"]:
+                        line.append(self.label("recommended", "po-kind", "po-kind-choice"))
+                    box.append(line)
+                    if o["description"]:
+                        box.append(text(o["description"], "po-muted", margin_start=36))
+            elif r["kind"] == "action":
+                box.append(text("on " + r["machine"], "po-text"))
+                for st in r["steps"]:
+                    box.append(text("%d. %s" % (st["n"], st["text"]), "po-text", margin_start=12))
+                    if st["command"]:
+                        cmd = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, margin_start=36)
+                        cmd.append(text(st["command"], "po-muted", hexpand=True, css_classes=["monospace"]))
+                        copy = Gtk.Button(label="Copy")
+                        copy.add_css_class("po-small")
+                        copy.connect("clicked", self.on_copy, st["command"])
+                        cmd.append(copy)
+                        box.append(cmd)
+                box.append(text("done when: " + r["done_when"], "po-muted"))
+
+        def on_copy(self, button, command):
+            """Puts the command on the clipboard and nothing else; the dashboard never runs it."""
+            button.get_clipboard().set(command)
+
+        def on_decision_toggle(self, _button, box, key):
             self.decisions_expanded = core.toggle_expanded(self.decisions_expanded, key)
-            label.set_visible(key in self.decisions_expanded)
+            box.set_visible(key in self.decisions_expanded)
 
         def make_movable(self, card, agent):
             """Drag the line onto another to take its place; Alt+Up/Down moves the focused line."""

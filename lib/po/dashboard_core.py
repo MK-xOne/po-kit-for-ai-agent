@@ -25,11 +25,16 @@ REPORT_EMPTY = "no events in this range"
 URL_ENV = "PO_DASHBOARD_URL"
 TEAM_URL_ENV = "PO_DASHBOARD_TEAM_URL"
 DECISIONS_URL_ENV = "PO_DASHBOARD_DECISIONS_URL"
+PROJECTS_URL_ENV = "PO_DASHBOARD_PROJECTS_URL"
+DECISIONS_FILTER_ENV = "PO_DASHBOARD_DECISIONS_FILTER"  # the saved Actions filter's file, instead of the default under the config dir
 TEAM_ORDER_ENV = "PO_DASHBOARD_TEAM_ORDER"  # the saved order's file, instead of the default under the config dir
 FADE_SECONDS = 60
 FADE_STEPS = 60  # one CSS class per step, po-fade-<n>: n steps of highlight left
 FADE_AMOUNT = 0.25  # a new card starts 25% darker (lighter in the dark theme)
 CUES = {"pass": "✔ pass", "fail": "✘ fail", "skip": "– skip"}  # check, cross, en dash
+PROJECT_ACTIVE_MINUTES = 30  # the Projects light: active up to this age of the last event
+PROJECT_IDLE_HOURS = 24  # idle up to this age, inactive beyond (and for no, unreadable or future time)
+PROJECT_SKEW_MINUTES = 1  # a last_event this far ahead of the clock is still taken as now
 
 
 class DashboardError(Exception):
@@ -62,6 +67,11 @@ def resolve_team_url(arg, env=None):
 def resolve_decisions_url(arg, env=None):
     """--decisions-url wins over the environment; neither is None (no Decisions view, no default address)."""
     return resolve_feed_url(arg, DECISIONS_URL_ENV, env)
+
+
+def resolve_projects_url(arg, env=None):
+    """--projects-url wins over the environment; neither is None (no Projects feed, no default address)."""
+    return resolve_feed_url(arg, PROJECTS_URL_ENV, env)
 
 
 def resolve_feed_url(arg, env_name, env=None):
@@ -362,7 +372,7 @@ def team_check_lines(entries, now=None, tz=None):
 
 
 def parse_decisions(text):
-    """The decisions feed: a JSON array of {project, item, title, waiting_for, asked_at, thread_url?}. Raises DashboardError."""
+    """The decisions feed: a JSON array of {project, item, title, waiting_for, asked_at, thread_url?, kind?, id?, ...}. Raises DashboardError."""
     text = text.strip()
     if not text:
         return []
@@ -373,6 +383,127 @@ def parse_decisions(text):
     if not isinstance(data, list):
         raise DashboardError("expected a list of decisions")
     return [e for e in data if isinstance(e, dict)]
+
+
+_PROJECT_STATUSES_DOING = {"DOING", "PAUSED", "BLOCKED"}
+
+
+def parse_projects(text):
+    """The projects feed: a JSON array of {project, last_event?, items: [{item, title?, status, agents: []}]}. Tolerant."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    try:
+        data = json.loads(text)
+    except ValueError as e:
+        raise DashboardError("not JSON: %s" % e)
+    if not isinstance(data, list):
+        raise DashboardError("expected a list of projects")
+    out = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        items = entry.get("items")
+        if not isinstance(items, list):
+            items = []
+        norm_items = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            agents = it.get("agents")
+            if not isinstance(agents, list):
+                agents = []
+            agents = [str(a) for a in agents]
+            title = it.get("title")
+            if title is None:
+                title = ""
+            norm_items.append({
+                "item": str(it.get("item") if it.get("item") is not None else ""),
+                "title": str(title),
+                "status": str(it.get("status") if it.get("status") is not None else ""),
+                "agents": agents,
+            })
+        le = entry.get("last_event")
+        if le is not None and not isinstance(le, str):
+            le = str(le)
+        out.append({
+            "project": str(entry.get("project") if entry.get("project") is not None else ""),
+            "last_event": le,
+            "items": norm_items,
+        })
+    return out
+
+
+def project_counts(items):
+    """todo, doing, done counts from a list of project items."""
+    todo = doing = done = 0
+    for it in items or []:
+        status = str((it or {}).get("status") or "").strip().upper()
+        if status == "TODO":
+            todo += 1
+        elif status in _PROJECT_STATUSES_DOING:
+            doing += 1
+        elif status == "DONE":
+            done += 1
+    return {"todo": todo, "doing": doing, "done": done}
+
+
+def project_light(last_event, now=None):
+    """active/idle/inactive based on last_event age."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    dt = parse_time(last_event)
+    if dt is None:
+        return "inactive"
+    if dt > now + datetime.timedelta(minutes=PROJECT_SKEW_MINUTES):
+        return "inactive"
+    age = max(0, (now - dt).total_seconds())
+    if age <= PROJECT_ACTIVE_MINUTES * 60:
+        return "active"
+    if age <= PROJECT_IDLE_HOURS * 3600:
+        return "idle"
+    return "inactive"
+
+
+def filter_items(items, f):
+    """All/TODO/DOING/DONE filter keeping feed order."""
+    items = list(items or [])
+    key = str(f).strip().lower() if f is not None else "all"
+    if key in ("", "all"):
+        return items
+    if key == "todo":
+        return [it for it in items if str(it.get("status") or "").strip().upper() == "TODO"]
+    if key == "doing":
+        return [it for it in items if str(it.get("status") or "").strip().upper() in _PROJECT_STATUSES_DOING]
+    if key == "done":
+        return [it for it in items if str(it.get("status") or "").strip().upper() == "DONE"]
+    return items
+
+
+def project_check_lines(projects, now=None):
+    """One line per project for --check: name | light | todo/doing/done."""
+    out = []
+    for pr in projects:
+        c = project_counts(pr["items"])
+        out.append("%s | %s | %d/%d/%d" % (pr["project"], project_light(pr["last_event"], now), c["todo"], c["doing"], c["done"]))
+    return out
+
+
+def project_card(pr, now=None):
+    """What a Projects card shows: {name, light, counts, text}; text is the tooltip and accessible label, so the
+    light is named in words as well as coloured."""
+    light = project_light(pr.get("last_event"), now)
+    counts = project_counts(pr.get("items"))
+    name = str(pr.get("project", ""))
+    text = "%s, %s, TODO %d, DOING %d, DONE %d" % (name, light, counts["todo"], counts["doing"], counts["done"])
+    return {"name": name, "light": light, "counts": counts, "text": text}
+
+
+def load_projects(url, last=None):
+    """(projects, note) from the feed; a failed fetch keeps `last` and the note says so (note is "" when fine)."""
+    try:
+        return parse_projects(fetch(url)), ""
+    except DashboardError as e:
+        return last, "%s (showing the last projects data)" % e if last is not None else str(e)
 
 
 def parse_time(iso):
@@ -386,10 +517,51 @@ def parse_time(iso):
     return d if d.tzinfo else d.replace(tzinfo=datetime.timezone.utc)
 
 
+DECISION_KINDS = ("choice", "action")
+DECISION_GROUP = {"choice": 0, "action": 1, "unformatted": 2, "legacy": 2}  # the order of the groups in the view
+DECISION_BADGE = {"choice": "Choice", "action": "Action", "unformatted": "unformatted", "legacy": ""}
+
+
+def _text(value):
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _optional_text(value):
+    return value is None or isinstance(value, str)
+
+
+def decision_shape(entry):
+    """'choice', 'action', 'unformatted' (a kind that is unknown or an entry missing its id or a field) or 'legacy' (no kind)."""
+    if "kind" not in entry:
+        return "legacy"
+    kind = entry.get("kind")
+    if kind not in DECISION_KINDS or not _text(entry.get("id")):
+        return "unformatted"
+    if kind == "choice":
+        options = entry.get("options")
+        if not _text(entry.get("question")) or not isinstance(options, list) or len(options) < 2:
+            return "unformatted"
+        for o in options:
+            if not isinstance(o, dict) or not _text(o.get("label")) or not _optional_text(o.get("description")) \
+                    or not isinstance(o.get("recommended", False), bool):
+                return "unformatted"
+        if sum(1 for o in options if o.get("recommended")) > 1:
+            return "unformatted"
+        return "choice"
+    steps = entry.get("steps")
+    if not _text(entry.get("machine")) or not _text(entry.get("done_when")) or not isinstance(steps, list) or not steps:
+        return "unformatted"
+    for st in steps:
+        if not isinstance(st, dict) or not _text(st.get("text")) or not _optional_text(st.get("command")):
+            return "unformatted"
+    return "action"
+
+
 def sort_decisions(entries):
-    """Oldest asked first; an entry without a readable asked_at goes last; the sort is stable."""
+    """Choices, then Actions, then unformatted and legacy; inside a group oldest asked first (an entry without a
+    readable asked_at last); the sort is stable."""
     far = datetime.datetime.max.replace(tzinfo=datetime.timezone.utc)
-    return sorted(entries, key=lambda e: parse_time(e.get("asked_at")) or far)
+    return sorted(entries, key=lambda e: (DECISION_GROUP[decision_shape(e)], parse_time(e.get("asked_at")) or far))
 
 
 def ago(then, now):
@@ -415,7 +587,10 @@ def decision_row(entry, now=None, tz=None):
     url = entry.get("thread_url")
     item = entry.get("item")
     asked_by = entry.get("asked_by")
-    return {
+    kind = decision_shape(entry)
+    row = {
+        "kind": kind,
+        "id": str(entry.get("id") or "") if kind != "legacy" else "",
         "project": str(entry.get("project") or ""),
         "item": "-" if item in (None, "") else str(item),
         "title": short_title(entry.get("title"), 80),
@@ -425,6 +600,16 @@ def decision_row(entry, now=None, tz=None):
         "thread_url": url.strip() if isinstance(url, str) else "",
         "asked_by": asked_by.strip() if isinstance(asked_by, str) else "",
     }
+    if kind == "choice":
+        row["question"] = entry["question"].strip()
+        row["options"] = [{"label": o["label"].strip(), "description": (o.get("description") or "").strip(),
+                           "recommended": bool(o.get("recommended"))} for o in entry["options"]]
+    elif kind == "action":
+        row["machine"] = entry["machine"].strip()
+        row["steps"] = [{"n": i + 1, "text": st["text"].strip(), "command": (st.get("command") or "").strip()}
+                        for i, st in enumerate(entry["steps"])]
+        row["done_when"] = entry["done_when"].strip()
+    return row
 
 
 def decision_rows(entries, now=None, tz=None):
@@ -447,13 +632,64 @@ def prune_expanded(expanded, entries):
 
 
 def decision_check_lines(entries, now=None, tz=None):
-    """What the Decisions view would show, one ' | ' line per entry, oldest asked first."""
+    """What the Decisions view would show, one ' | ' line per entry, the kind first, in the view's order; the Actions filter is ignored."""
     return [
-        " | ".join((r["item"], r["project"], r["title"], "waiting for: " + r["waiting_for"],
+        " | ".join((r["kind"], r["item"], r["project"], r["title"], "waiting for: " + r["waiting_for"],
                     "asked " + r["asked"] + (" (%s)" % r["asked_local"] if r["asked_local"] else ""))
                    + ((r["thread_url"],) if r["thread_url"] else ()))
         for r in decision_rows(entries, now, tz)
     ]
+
+
+# ---- the Decisions view's Actions filter, saved on the viewer's machine -----
+
+
+def decisions_filter_path(env=None):
+    """$PO_DASHBOARD_DECISIONS_FILTER, else $XDG_CONFIG_HOME (default ~/.config)/po-dashboard/decisions.json."""
+    env = os.environ if env is None else env
+    path = (env.get(DECISIONS_FILTER_ENV) or "").strip()
+    if path:
+        return path
+    base = (env.get("XDG_CONFIG_HOME") or "").strip()
+    if not os.path.isabs(base):  # the XDG spec: a relative value is ignored
+        base = os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "po-dashboard", "decisions.json")
+
+
+def load_actions_shown(path):
+    """Whether Action entries show; on unless the file says {"actions": false} (missing or broken is on)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return True
+    return not (isinstance(data, dict) and data.get("actions") is False)
+
+
+def save_actions_shown(path, shown):
+    """Write the filter atomically, creating the directory. Raises DashboardError."""
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"actions": bool(shown)}, f, indent=1)
+            f.write("\n")
+        os.replace(tmp, path)
+    except OSError as e:
+        raise DashboardError("cannot save the decisions filter: %s" % e)
+
+
+def filter_decisions(entries, actions_shown):
+    """(entries to show, number of Action entries hidden); the feed's list is not changed."""
+    if actions_shown:
+        return list(entries), 0
+    kept = [e for e in entries if decision_shape(e) != "action"]
+    return kept, len(entries) - len(kept)
+
+
+def decisions_status(shown, hidden):
+    """The status line: '3 waiting', or '3 waiting · 1 action hidden'."""
+    return "%d waiting" % shown + (" \u00b7 %d action hidden" % hidden if hidden else "")
 
 
 # ---- the Team view's order, saved on the viewer's machine -------------------
@@ -598,14 +834,14 @@ PALETTES = {
     "light": {
         "base": "#e0e5ec", "light": "#ffffff", "dark": "#a3b1c6",
         "text": "#2b3440", "muted": "#4f5b6a",
-        "pass": "#13693a", "fail": "#a8201a", "skip": "#5a5f66",
-        "series": ["#1f5fa8", "#a14a00", "#7a3d9e", "#00796b", "#8c3b2e", "#5a5f66"],
+        "pass": "#13693a", "fail": "#a8201a", "skip": "#5a5f66", "warn": "#7a4f00",
+        "accent": "#1f5fa8", "series": ["#1f5fa8", "#a14a00", "#7a3d9e", "#00796b", "#8c3b2e", "#5a5f66"],
     },
     "dark": {
         "base": "#2b2f36", "light": "#383d46", "dark": "#1e2126",
         "text": "#e8ebf0", "muted": "#aab2bf",
-        "pass": "#6fdc9a", "fail": "#ff9a94", "skip": "#aab2bf",
-        "series": ["#7fb2ff", "#ffb86b", "#c9a0ff", "#5fd6c4", "#e6a08f", "#aab2bf"],
+        "pass": "#6fdc9a", "fail": "#ff9a94", "skip": "#aab2bf", "warn": "#f0c75e",
+        "accent": "#7fb2ff", "series": ["#7fb2ff", "#ffb86b", "#c9a0ff", "#5fd6c4", "#e6a08f", "#aab2bf"],
     },
 }
 
@@ -633,6 +869,14 @@ window.po-dashboard { background-color: %(base)s; color: %(text)s; }
 .po-live { color: %(pass)s; font-weight: 700; }
 .po-free { color: %(pass)s; font-weight: 700; border-radius: 10px; padding: 2px 10px;
   box-shadow: inset 3px 3px 6px %(dark)s, inset -3px -3px 6px %(light)s; }
+.po-kind { font-size: 12px; font-weight: 700; }
+.po-kind-choice { color: %(accent)s; }
+.po-kind-action { color: %(warn)s; }
+.po-kind-unformatted { color: %(fail)s; }
+.po-light-active { color: %(pass)s; }
+.po-light-idle { color: %(warn)s; }
+.po-light-inactive { color: %(fail)s; }
+.po-pcard:focus-visible { outline: 2px solid %(text)s; outline-offset: 2px; }
 .po-view { background-color: %(base)s; background-image: none; color: %(text)s; border: none; border-radius: 14px;
   padding: 8px 16px; box-shadow: 4px 4px 8px %(dark)s, -4px -4px 8px %(light)s; }
 .po-view:checked { box-shadow: inset 4px 4px 8px %(dark)s, inset -4px -4px 8px %(light)s; }
@@ -662,6 +906,12 @@ CONTRAST_PAIRS = [
     (".po-skip", ".po-card", "skip status"),
     (".po-live", ".po-card", "working dot"),
     (".po-free", ".po-card", "free badge"),
+    (".po-light-active", ".po-card", "active light"),
+    (".po-light-idle", ".po-card", "idle light"),
+    (".po-light-inactive", ".po-card", "inactive light"),
+    (".po-kind-choice", ".po-card", "choice badge"),
+    (".po-kind-action", ".po-card", "action badge"),
+    (".po-kind-unformatted", ".po-card", "unformatted badge"),
     (".po-view", ".po-view", "view toggle label"),
     (".po-title", ".po-header", "header title"),
     (".po-status", ".po-header", "header status line"),
@@ -697,3 +947,54 @@ def luminance(hexcolor):
 def contrast(a, b):
     hi, lo = sorted((luminance(a), luminance(b)), reverse=True)
     return (hi + 0.05) / (lo + 0.05)
+
+
+PROJECT_FILTERS = (("All", "all"), ("TODO", "todo"), ("DOING", "doing"), ("DONE", "done"))
+
+
+def project_view_state(open_project=None, filters=None):
+    """The Projects view state: which project is open (None = the overview) and each project's filter."""
+    return {"open": open_project, "filters": dict(filters or {})}
+
+
+def project_state_open(state, name):
+    """Open a project's screen; its filter is kept per project while the window is open."""
+    return dict(state, open=name)
+
+
+def project_state_back(state):
+    return dict(state, open=None)
+
+
+def project_state_filter(state, name):
+    key = str(state["filters"].get(name, "all")).strip().lower()
+    return key if key in dict((k, k) for _l, k in PROJECT_FILTERS) else "all"
+
+
+def project_state_set_filter(state, name, key):
+    return dict(state, filters=dict(state["filters"], **{name: str(key).strip().lower()}))
+
+
+def project_state_reconcile(state, projects):
+    """A refresh: the open project that left the feed returns to the overview; filters of departed projects drop."""
+    names = {pr["project"] for pr in projects or []}
+    return {"open": state["open"] if state["open"] in names else None,
+            "filters": {k: v for k, v in state["filters"].items() if k in names}}
+
+
+def project_screen(pr, key="all", now=None):
+    """What a project screen shows: header (name, light), the filter buttons with their counts, and one row per
+    item in the feed's order. Agents are as the feed gives them; none = a muted dash (agents empty, dash true)."""
+    items = pr.get("items") or []
+    counts = project_counts(items)
+    light = project_light(pr.get("last_event"), now)
+    filters = [{"label": lab, "key": k, "count": len(items) if k == "all" else counts[k]} for lab, k in PROJECT_FILTERS]
+    rows = []
+    for it in filter_items(items, key):
+        status = str(it.get("status") or "").strip().upper()
+        agents = list(it.get("agents") or [])
+        rows.append({"item": it.get("item", ""), "title": it.get("title", ""), "status": status, "agents": agents,
+                     "live": status == "DOING" and bool(agents),
+                     "dash": not agents})
+    name = str(pr.get("project", ""))
+    return {"name": name, "light": light, "text": "%s, %s" % (name, light), "filters": filters, "rows": rows}

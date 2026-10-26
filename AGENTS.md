@@ -53,6 +53,22 @@ every backlog status; **devs** each work one item in its own worktree.
 `po fresh` must pass; when main moved, rebase the item branch and re-stamp.
 po never pushes: pushing is the PO's own step after a close.
 
+## Asking the owner
+
+An agent that asks the owner for a decision gives the ask a kind, so the Decisions view
+can show it as a card. The ask carries an `id` (the ask's own message id) and its
+`waiting_for` line.
+
+- **Choice:** one clear question and two or more options, each with a label and a one-line
+  description; the recommended option first and marked `recommended`. The two-way
+  approve or deny becomes a two-option choice, e.g. `Approve the import screen?` with
+  `Approve (recommended): ships as specified` and `Deny: back to spec`.
+- **Action:** the machine, numbered steps with one thing per step and every command in its
+  own `command` field, and `done_when`: what the person answering should see if it worked, e.g.
+  `On the build host: 1. restart the viewer ... done when the page shows the new tag`.
+
+An ask without these fields shows as `unformatted` and may wait longer.
+
 ## When po-kit changes
 
 po-kit ships in releases that bundle several items. Each release's

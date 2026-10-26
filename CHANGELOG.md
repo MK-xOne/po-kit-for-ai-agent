@@ -12,6 +12,19 @@ Unreleased becomes `## Release N (YYYY-MM-DD): <theme>`.
 
 ## Unreleased
 
+## Release 13 (2026-10-26): decision kinds and the Projects tab
+
+Items v0.36 to v0.39.
+
+**Agents, in short:** an agent asking the owner for a decision now fills in the ask's `kind` (`choice` or `action`) and its fields, as AGENTS.md "Asking the owner" says; an ask without them shows as unformatted.
+
+**Adopt, in short:** optional: a Decisions feed entry may carry `kind`, `id` and the fields of its kind; a `--projects-url` feed (or `PO_DASHBOARD_PROJECTS_URL`) adds the Projects tab; `PO_DASHBOARD_DECISIONS_FILTER` names the Actions filter file.
+
+- v0.36 dashboard Decisions kinds and display, read-only: a decisions entry may carry `kind` (`choice` or `action`) with a required `id`, and the fields of its kind (`question` and `options`; `machine`, `steps` and `done_when`). Each kind has a badge and colour, a malformed one shows as `unformatted`, an entry without `kind` displays as before. Choices first, then Actions, then unformatted and legacy, oldest first in each; an `Actions` toggle (saved in `$XDG_CONFIG_HOME/po-dashboard/decisions.json`) hides Action entries and the status line says `N waiting · M action hidden`; a step's command has a Copy button. Pure helpers in `dashboard_core` (`decision_shape`, `sort_decisions`, `decision_row`, filter load/save, `filter_decisions`); `--check` prints the kind first. `examples/decisions-feed.json` has one of each, the demo server serves it. **Agents:** ask the owner with a kind, see AGENTS.md "Asking the owner". Nothing is sent from the window (answering comes later).
+- v0.37 dashboard Projects feed: `--projects-url` / `PO_DASHBOARD_PROJECTS_URL`, pure helpers in `dashboard_core` (`parse_projects`, `project_counts`, `project_light`, `filter_items`, `load_projects` keeping the last data on a failed fetch), `--check` lines, `examples/projects-feed.json` served by the demo server. The Projects view follows.
+- v0.38 dashboard Projects view, overview: a fourth header button (shown only with `--projects-url`) opens a grid of cards, one per project, with a status light (green active, yellow idle, red inactive; also named in the card's tooltip and accessible label), the name, and TODO, DOING and DONE counts. Cards are focusable (Enter, Space and click are a no-op until the project screen); empty and failed-fetch messages; a refresh keeps scroll and focus; `--view projects` and `--screenshot` work. New palette colour `warn` for the idle light, `project_card` helper in `dashboard_core`. Nothing for agents to do.
+- v0.39 dashboard Projects view, project screen: clicking, Enter or Space on a card opens that project in place of the overview: a Back button (and Escape), the name and light, filter buttons All, TODO, DOING, DONE with counts (kept per project while the window is open), and one row per item with id, title, status badge and its agents (TODO eligible, DOING current with the live dot, DONE in order; none is a muted dash). A refresh keeps the open project and filter; a project that leaves the feed returns to the overview. New option `--project <name>` (with `--view projects`) opens straight on a project screen. State helpers and `project_screen` in `dashboard_core`. Nothing for agents to do.
+
 ## Release 12 (2026-10-25): dashboard sortable columns, Reports, Decisions fix
 
 Items v0.31 to v0.35.

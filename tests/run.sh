@@ -1100,7 +1100,6 @@ expect "open next moves on" 0 '  \| admin: v1\.0\.7 Seven founded DOING$' -- -C 
 mkdir "$B/.wt/item-v1.0.7"
 expect "a taken worktree path is refused" 6 '\.wt/item-v1\.0\.7 already exists' -- -C "$B" --manifest "$BM" open next Seven
 
-
 # [close] checklist (item U).
 CM=$TMP/ck.toml
 ck_manifest() { # <array text>: BM plus [close] checklist = <array text>
@@ -2218,7 +2217,7 @@ unset PO_DASHBOARD_DECISIONS_URL  # never the tester's own decisions feed
 while IFS=$'\t' read -r status name detail; do
 	[[ $status == ok ]] && ok "$name" || bad "$name" "$detail"
 done < <(python3 -B -I - "$DBLIB" <<'PY'
-import datetime, http.server, json, sys, threading
+import datetime, http.server, json, os, subprocess, sys, tempfile, threading
 sys.path.insert(0, sys.argv[1])
 import dashboard_core as c
 import dashboard_reports as r
@@ -2507,7 +2506,7 @@ check("dashboard decisions: under a minute, or ahead of the clock, is just now",
       c.ago(now, now) == "just now" and c.ago(now - datetime.timedelta(seconds=59), now) == "just now" and c.ago(now + datetime.timedelta(hours=1), now) == "just now")
 check("dashboard decisions: the local time is kept for the tooltip", dr[1]["asked_local"] == "2026-10-24 09:00:00" and c.decision_row(dec[0], now, est)["asked_local"] == "2026-10-24 05:00:00")
 check("dashboard decisions: an unreadable asked_at is kept as text", c.decision_row({"asked_at": "soon"}, now)["asked"] == "soon" and c.decision_row({"asked_at": "soon"}, now)["asked_local"] == "")
-check("dashboard decisions: a sparse entry still has a row", c.decision_row({}, now) == {"project": "", "item": "-", "title": "", "waiting_for": "?", "asked": "?", "asked_local": "", "thread_url": "", "asked_by": ""})
+check("dashboard decisions: a sparse entry still has a row", c.decision_row({}, now) == {"kind": "legacy", "id": "", "project": "", "item": "-", "title": "", "waiting_for": "?", "asked": "?", "asked_local": "", "thread_url": "", "asked_by": ""})
 check("dashboard decisions: thread_url is kept as text, trimmed; absent or not a string is empty",
        dr[1]["thread_url"] == "https://chat.example.org/t/1" and dr[0]["thread_url"] == "" and c.decision_row({"thread_url": 4}, now)["thread_url"] == ""
        and c.decision_row({"thread_url": " https://x/t "}, now)["thread_url"] == "https://x/t")
@@ -2516,13 +2515,59 @@ check("dashboard decisions: asked_by is trimmed when a string, empty otherwise",
 check("dashboard decisions: markup in a field stays text", c.decision_row({"title": "<b>x</b>"}, now)["title"] == "<b>x</b>")
 check("dashboard decisions: short_title cuts at 80 and keeps short text", c.short_title("x" * 100) == "x" * 80 and c.short_title("abc") == "abc" and c.short_title(None) == "")
 check("dashboard decisions: a long title is cut in the row", len(c.decision_row({"title": "y" * 120}, now)["title"]) == 80)
-check("dashboard decisions: check lines show item project title waiting asked and the URL when there is one",
-      c.decision_check_lines(dec[:2], now, utc) == ["2.3 | orchard | Pick a format | waiting for: a ruling | asked 3h ago (2026-10-24 09:00:00) | https://chat.example.org/t/1",
-                                                   "0.7 | harbor | Accept the screen | waiting for: an acceptance | asked 30m ago (2026-10-24 11:30:00)"])
+check("dashboard decisions: check lines show kind item project title waiting asked and the URL when there is one",
+      c.decision_check_lines(dec[:2], now, utc) == ["legacy | 2.3 | orchard | Pick a format | waiting for: a ruling | asked 3h ago (2026-10-24 09:00:00) | https://chat.example.org/t/1",
+                                                   "legacy | 0.7 | harbor | Accept the screen | waiting for: an acceptance | asked 30m ago (2026-10-24 11:30:00)"])
 check("dashboard decisions: the feed is never changed", [e["item"] for e in dec] == ["2.3", "0.7", "2.5"])
 ex = c.parse_decisions(open(sys.argv[1] + "/../../examples/decisions-feed.json").read())
 check("dashboard decisions: the example feed parses, with and without a thread URL",
-      len(ex) == 3 and all(k in e for e in ex for k in ("project", "item", "title", "waiting_for", "asked_at")) and sorted(bool(r["thread_url"]) for r in c.decision_rows(ex)) == [False, True, True])
+      len(ex) == 4 and all(k in e for e in ex for k in ("project", "item", "title", "waiting_for", "asked_at")) and sorted(bool(r["thread_url"]) for r in c.decision_rows(ex)) == [False, False, True, True])
+# v0.36: kinds, group order, the Actions filter.
+CH = {"kind": "choice", "id": "a1", "question": "Approve?", "options": [{"label": "Yes", "recommended": True}, {"label": "No", "description": "back to spec"}]}
+AC = {"kind": "action", "id": "a2", "machine": "host", "steps": [{"text": "restart", "command": "systemctl restart x"}, {"text": "look"}], "done_when": "it is up"}
+check("dashboard decisions: a choice is a choice", c.decision_shape(CH) == "choice")
+check("dashboard decisions: an action is an action", c.decision_shape(AC) == "action")
+check("dashboard decisions: no kind is legacy", c.decision_shape({"item": "1"}) == "legacy")
+check("dashboard decisions: an unknown kind is unformatted", c.decision_shape(dict(CH, kind="poll")) == "unformatted")
+check("dashboard decisions: a kind without an id is unformatted", c.decision_shape({k: v for k, v in CH.items() if k != "id"}) == "unformatted" and c.decision_shape(dict(AC, id="  ")) == "unformatted")
+check("dashboard decisions: one option is unformatted", c.decision_shape(dict(CH, options=[{"label": "Yes"}])) == "unformatted")
+check("dashboard decisions: an option without a label is unformatted", c.decision_shape(dict(CH, options=[{"label": "Yes"}, {"description": "x"}])) == "unformatted")
+check("dashboard decisions: two recommended options are unformatted", c.decision_shape(dict(CH, options=[{"label": "a", "recommended": True}, {"label": "b", "recommended": True}])) == "unformatted")
+check("dashboard decisions: a choice without a question is unformatted", c.decision_shape({k: v for k, v in CH.items() if k != "question"}) == "unformatted")
+check("dashboard decisions: a step without text is unformatted", c.decision_shape(dict(AC, steps=[{"command": "x"}])) == "unformatted")
+check("dashboard decisions: an action without steps, machine or done_when is unformatted",
+      c.decision_shape(dict(AC, steps=[])) == "unformatted" and c.decision_shape({k: v for k, v in AC.items() if k != "machine"}) == "unformatted" and c.decision_shape({k: v for k, v in AC.items() if k != "done_when"}) == "unformatted")
+check("dashboard decisions: a field of the wrong type is unformatted", c.decision_shape(dict(CH, options="yes")) == "unformatted" and c.decision_shape(dict(AC, steps=[{"text": "x", "command": 4}])) == "unformatted")
+check("dashboard decisions: unknown extra fields are ignored", c.decision_shape(dict(CH, channel="c", thread="t")) == "choice")
+gs = [dict(AC, item="g1", asked_at="2026-10-24T01:00:00Z"), {"item": "g2", "asked_at": "2026-10-24T02:00:00Z"}, dict(CH, item="g3", asked_at="2026-10-24T05:00:00Z"),
+      dict(CH, item="g4", asked_at="2026-10-24T03:00:00Z"), dict(CH, item="g5", kind="poll", asked_at="2026-10-24T00:00:00Z")]
+check("dashboard decisions: choices, then actions, then unformatted and legacy, oldest first in each group", [e["item"] for e in c.sort_decisions(gs)] == ["g4", "g3", "g1", "g5", "g2"])
+gr = c.decision_row(dict(CH, item="g"), now)
+check("dashboard decisions: a choice row carries the kind, id, question and options in feed order, the recommended marked",
+      gr["kind"] == "choice" and gr["id"] == "a1" and gr["question"] == "Approve?" and gr["options"] == [{"label": "Yes", "description": "", "recommended": True}, {"label": "No", "description": "back to spec", "recommended": False}])
+ar = c.decision_row(dict(AC, item="g"), now)
+check("dashboard decisions: an action row carries the machine, numbered steps with their commands, and done_when",
+      ar["kind"] == "action" and ar["machine"] == "host" and ar["steps"] == [{"n": 1, "text": "restart", "command": "systemctl restart x"}, {"n": 2, "text": "look", "command": ""}] and ar["done_when"] == "it is up")
+check("dashboard decisions: an unformatted row has no kind fields", "options" not in c.decision_row(dict(CH, kind="poll"), now) and c.decision_row(dict(CH, kind="poll"), now)["kind"] == "unformatted")
+check("dashboard decisions: the key stays project and item, not the id", c.decision_key(dict(CH, project="p", item="1")) == ("p", "1"))
+kl = c.decision_check_lines([dict(CH, item="g4", project="p", title="T", waiting_for="w", asked_at="2026-10-24T09:00:00Z"), {"item": "g2", "project": "p", "title": "T", "waiting_for": "w", "asked_at": "2026-10-24T08:00:00Z"}], now, utc)
+check("dashboard decisions: check lines start with the kind, legacy for none", kl[0].startswith("choice | g4 | p | T") and kl[1].startswith("legacy | g2 | p | T"))
+check("dashboard decisions: check lines ignore the filter", len(c.decision_check_lines([AC, CH], now, utc)) == 2)
+check("dashboard decisions: the filter on shows everything", c.filter_decisions([AC, CH, {}], True) == ([AC, CH, {}], 0))
+check("dashboard decisions: the filter off hides the actions and counts them", c.filter_decisions([AC, CH, dict(AC, id="a3")], False) == ([CH], 2))
+check("dashboard decisions: the status line says how many actions are hidden", c.decisions_status(3, 0) == "3 waiting" and c.decisions_status(3, 1) == "3 waiting \u00b7 1 action hidden")
+check("dashboard decisions: the filter file is under the config dir, or named by the environment",
+      c.decisions_filter_path({"XDG_CONFIG_HOME": "/x/cfg"}) == "/x/cfg/po-dashboard/decisions.json" and c.decisions_filter_path({"PO_DASHBOARD_DECISIONS_FILTER": "/y/f.json", "XDG_CONFIG_HOME": "/x"}) == "/y/f.json")
+import tempfile
+with tempfile.TemporaryDirectory() as _d:
+    _f = os.path.join(_d, "sub", "decisions.json")
+    check("dashboard decisions: a missing filter file is on", c.load_actions_shown(_f) is True)
+    c.save_actions_shown(_f, False)
+    check("dashboard decisions: the filter round-trips off, and on", c.load_actions_shown(_f) is False and (c.save_actions_shown(_f, True), c.load_actions_shown(_f))[1] is True)
+    open(_f, "w").write("{broken")
+    check("dashboard decisions: a broken filter file is on", c.load_actions_shown(_f) is True)
+    open(_f, "w").write('{"actions": "no"}')
+    check("dashboard decisions: only false turns the filter off", c.load_actions_shown(_f) is True)
 
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -2627,6 +2672,107 @@ check("dashboard sort: sorting does not change the list it is given", [e["agent"
 check("dashboard css: the column header style exists with a focus ring", ".po-colhead" in c.css("light") and ".po-colhead:focus-visible" in c.css("dark"))
 check("dashboard css: the two variants differ", c.css("light") != c.css("dark"))
 check("dashboard: contrast of black on white is 21", round(c.contrast("#000000", "#ffffff")) == 21)
+# Projects feed (v0.37): parse, counts, light, filter, failed fetch.
+pr = c.parse_projects('[{"project":"p","items":[{"item":"1","status":"TODO","agents":"x"},{"item":"2","status":"DONE","agents":["a","b"],"title":"T"}]}, 42, "s", {"items":"nope"}, {"project":"q","last_event":null}]')
+check("dashboard projects: a broken entry is skipped, a missing field defaults",
+      [p["project"] for p in pr] == ["p", "", "q"] and pr[1]["items"] == [] and pr[2]["last_event"] is None and pr[0]["items"][0]["title"] == "")
+check("dashboard projects: agents is always a list, in the feed's order", pr[0]["items"][0]["agents"] == [] and pr[0]["items"][1]["agents"] == ["a", "b"])
+check("dashboard projects: a non-dict item is skipped", len(c.parse_projects('[{"project":"p","items":[1,null,{"item":"1","status":"TODO"}]}]')[0]["items"]) == 1)
+check("dashboard projects: empty text is no projects", c.parse_projects("  ") == [])
+for name, text in (("not JSON", "{oops"), ("a JSON object", '{"project":"p"}')):
+    try:
+        c.parse_projects(text)
+        check("dashboard projects: %s is a DashboardError" % name, False)
+    except c.DashboardError:
+        check("dashboard projects: %s is a DashboardError" % name, True)
+st = lambda *words: [{"status": w} for w in words]
+check("dashboard projects: PAUSED and BLOCKED count as DOING, HELD counts nowhere",
+      c.project_counts(st("TODO", "DOING", "PAUSED", "BLOCKED", "DONE", "HELD", "", "weird")) == {"todo": 1, "doing": 3, "done": 1})
+check("dashboard projects: an empty or missing item list counts zero", c.project_counts([]) == c.project_counts(None) == {"todo": 0, "doing": 0, "done": 0})
+pnow = datetime.datetime(2026, 10, 26, 12, 0, 0, tzinfo=utc)
+ago = lambda **kw: (pnow - datetime.timedelta(**kw)).strftime("%Y-%m-%dT%H:%M:%SZ")
+check("dashboard projects: the light thresholds are 30 minutes and 24 hours", c.PROJECT_ACTIVE_MINUTES == 30 and c.PROJECT_IDLE_HOURS == 24)
+check("dashboard projects: exactly 30 minutes old is active, one second more is idle",
+      c.project_light(ago(minutes=30), pnow) == "active" and c.project_light(ago(minutes=30, seconds=1), pnow) == "idle" and c.project_light(ago(), pnow) == "active")
+check("dashboard projects: exactly 24 hours old is idle, one second more is inactive",
+      c.project_light(ago(hours=24), pnow) == "idle" and c.project_light(ago(hours=24, seconds=1), pnow) == "inactive")
+check("dashboard projects: null, absent and unparseable are inactive",
+      c.project_light(None, pnow) == c.project_light("", pnow) == c.project_light("soon", pnow) == "inactive")
+check("dashboard projects: a time ahead of the clock is active within a minute, inactive beyond",
+      c.project_light(ago(seconds=-60), pnow) == "active" and c.project_light(ago(seconds=-61), pnow) == "inactive")
+check("dashboard projects: a zone is compared as an instant", c.project_light("2026-10-26T07:50:00-04:00", pnow) == "active")
+fi = [{"item": "a", "status": "TODO"}, {"item": "b", "status": "DONE"}, {"item": "c", "status": "DOING"}, {"item": "d", "status": "HELD"}, {"item": "e", "status": "BLOCKED"}, {"item": "f", "status": "TODO"}]
+fl = lambda f: [x["item"] for x in c.filter_items(fi, f)]
+check("dashboard projects: All keeps every item in the feed's order, HELD included", fl("All") == list("abcdef"))
+check("dashboard projects: TODO and DONE keep the feed's order", fl("TODO") == ["a", "f"] and fl("DONE") == ["b"])
+check("dashboard projects: DOING includes PAUSED and BLOCKED, not HELD", fl("DOING") == ["c", "e"])
+check("dashboard projects: the list given is not changed", [x["item"] for x in fi] == list("abcdef"))
+pf = c.parse_projects(open(sys.argv[1] + "/../../examples/projects-feed.json").read())
+pcl = c.project_check_lines(pf, datetime.datetime(2026, 10, 26, 1, 10, 0, tzinfo=utc))
+check("dashboard projects: the example feed has one project per light, items in every status",
+      [l.split(" | ")[1] for l in pcl] == ["active", "idle", "inactive"] and {i["status"] for p in pf for i in p["items"]} >= {"TODO", "DOING", "PAUSED", "HELD", "DONE"})
+check("dashboard projects: the example's DONE agents are in order", [i["agents"] for i in pf[0]["items"] if i["status"] == "DONE"] == [["dee", "cy", "ana"]])
+check("dashboard projects: --check prints name, light and todo/doing/done", pcl[0] == "orchard | active | 1/1/1" and pcl[1] == "harbor | idle | 0/1/0")
+_pn = datetime.datetime(2026, 10, 26, 1, 10, 0, tzinfo=utc)
+_st0 = c.project_view_state()
+check("dashboard project screen: the state starts on the overview with no filters", _st0 == {"open": None, "filters": {}})
+_st1 = c.project_state_open(_st0, "orchard")
+check("dashboard project screen: opening a project records it and leaves the old state alone", _st1["open"] == "orchard" and _st0["open"] is None)
+check("dashboard project screen: back returns to the overview", c.project_state_back(_st1)["open"] is None)
+check("dashboard project screen: the filter starts at All", c.project_state_filter(_st1, "orchard") == "all")
+_st2 = c.project_state_set_filter(_st1, "orchard", "DOING")
+check("dashboard project screen: a filter choice is kept for that project only", c.project_state_filter(_st2, "orchard") == "doing" and c.project_state_filter(_st2, "harbor") == "all")
+check("dashboard project screen: the filter survives back and reopening", c.project_state_filter(c.project_state_open(c.project_state_back(_st2), "orchard"), "orchard") == "doing")
+check("dashboard project screen: an unknown filter reads as All", c.project_state_filter(c.project_state_set_filter(_st1, "orchard", "bogus"), "orchard") == "all")
+check("dashboard project screen: a refresh keeps the open project and filter while it is in the feed", c.project_state_reconcile(_st2, pf) == _st2)
+_gone = c.project_state_reconcile(_st2, pf[1:])
+check("dashboard project screen: a project that left the feed returns to the overview and drops its filter", _gone["open"] is None and _gone["filters"] == {})
+check("dashboard project screen: no feed yet keeps nothing open", c.project_state_reconcile(_st2, None)["open"] is None)
+_ps = c.project_screen(pf[0], "all", _pn)
+check("dashboard project screen: the header has the name and the light in words", _ps["name"] == "orchard" and _ps["light"] == "active" and "active" in _ps["text"])
+check("dashboard project screen: filter buttons are All, TODO, DOING, DONE with their counts", [(f["label"], f["count"]) for f in _ps["filters"]] == [("All", 3), ("TODO", 1), ("DOING", 1), ("DONE", 1)])
+check("dashboard project screen: HELD counts in All only", [(f["label"], f["count"]) for f in c.project_screen(pf[1], "all", _pn)["filters"]] == [("All", 2), ("TODO", 0), ("DOING", 1), ("DONE", 0)])
+check("dashboard project screen: rows are in the feed's order with id, title and status badge", [(r["item"], r["title"], r["status"]) for r in _ps["rows"]] == [("3.1", "Plant", "TODO"), ("3.2", "Water", "DOING"), ("3.3", "Harvest", "DONE")])
+check("dashboard project screen: TODO lists the agents that could take it", _ps["rows"][0]["agents"] == ["ana", "ben"] and not _ps["rows"][0]["live"])
+check("dashboard project screen: DOING marks the current agent live", _ps["rows"][1]["agents"] == ["cy"] and _ps["rows"][1]["live"])
+check("dashboard project screen: DONE lists every agent in the feed's order, not live", _ps["rows"][2]["agents"] == ["dee", "cy", "ana"] and not _ps["rows"][2]["live"])
+check("dashboard project screen: no agent is a muted dash", c.project_screen(pf[1], "all", _pn)["rows"][1]["dash"] and not _ps["rows"][0]["dash"])
+check("dashboard project screen: a DOING row with no agent is not live", not c.project_screen({"project": "p", "items": [{"item": "1", "status": "DOING", "agents": []}]}, "all", _pn)["rows"][0]["live"])
+check("dashboard project screen: the filter narrows the rows, counts stay", [r["item"] for r in c.project_screen(pf[0], "done", _pn)["rows"]] == ["3.3"] and c.project_screen(pf[0], "done", _pn)["filters"][0]["count"] == 3)
+check("dashboard project screen: PAUSED shows under DOING", [r["item"] for r in c.project_screen(pf[1], "doing", _pn)["rows"]] == ["1.4"])
+check("dashboard project screen: a project with no items has no rows", c.project_screen({"project": "p"}, "all", _pn)["rows"] == [] and c.project_screen({"project": "p"}, "all", _pn)["filters"][0]["count"] == 0)
+pdir = tempfile.mkdtemp()
+pfile = os.path.join(pdir, "projects.json")
+open(pfile, "w").write(open(sys.argv[1] + "/../../examples/projects-feed.json").read())
+got, note = c.load_projects("file://" + pfile)
+check("dashboard projects: a good fetch gives the projects and no note", len(got) == 3 and note == "")
+open(pfile, "w").write("{oops")
+got2, note2 = c.load_projects("file://" + pfile, got)
+check("dashboard projects: a failed fetch keeps the last data and says so", got2 is got and "showing the last projects data" in note2)
+os.remove(pfile)
+got3, note3 = c.load_projects("file://" + pfile, got)
+check("dashboard projects: a missing file keeps the last data too", got3 is got and "showing the last projects data" in note3)
+got4, note4 = c.load_projects("file://" + pfile)
+check("dashboard projects: a failed first fetch has no data and the plain reason", got4 is None and note4 and "last projects data" not in note4)
+os.rmdir(pdir)
+# The Projects card (v0.38): the text a card's tooltip and accessible label carry names the light in words.
+_pc = c.project_card(pf[0], pnow)
+check("dashboard projects: a card carries name, light and the three counts", _pc["name"] == pf[0]["project"] and _pc["light"] in ("active", "idle", "inactive") and sorted(_pc["counts"]) == ["doing", "done", "todo"])
+_pl = {"project": "p", "last_event": "2026-10-26T11:50:00Z", "items": [{"item": "1", "status": "TODO"}, {"item": "2", "status": "DOING"}, {"item": "3", "status": "DONE"}, {"item": "4", "status": "DONE"}]}
+check("dashboard projects: the card text names the light in words, not only colour", c.project_card(_pl, pnow)["text"] == "p, active, TODO 1, DOING 1, DONE 2")
+check("dashboard projects: the card text names an idle and an inactive light too", ", idle," in c.project_card(dict(_pl, last_event="2026-10-26T01:00:00Z"), pnow)["text"] and ", inactive," in c.project_card(dict(_pl, last_event=None), pnow)["text"])
+check("dashboard projects: a card for an entry with no items counts zero", c.project_card({"project": "q"}, pnow)["text"] == "q, inactive, TODO 0, DOING 0, DONE 0")
+check("dashboard projects: the three lights have a colour class in both themes", all(".po-light-%s" % l in c.css_properties(c.css(v)) for l in ("active", "idle", "inactive") for v in ("light", "dark")))
+check("dashboard projects: the lights are green, yellow and red, three different colours", len({c.css_properties(c.css("light"))[".po-light-%s" % l]["color"] for l in ("active", "idle", "inactive")}) == 3)
+srv_proc = subprocess.Popen([sys.executable, "-I", sys.argv[1] + "/../../examples/events-demo-server.py", "--port", "0"], stdout=subprocess.PIPE, text=True)
+try:
+    port = int(srv_proc.stdout.readline().split("127.0.0.1:")[1].split("/")[0])
+    served = c.parse_projects(c.fetch("http://127.0.0.1:%d/projects.json" % port))
+    check("dashboard projects: the demo server serves the example feed, one project per light now",
+          [p["project"] for p in served] == [p["project"] for p in pf] and [c.project_light(p["last_event"]) for p in served] == ["active", "idle", "inactive"])
+finally:
+    srv_proc.kill()
+    srv_proc.wait()
 PY
 )
 
@@ -2689,10 +2835,22 @@ out=$(python3 -B "$DB" --url http://h/x --view bogus 2>&1)
 out=$(env -u PO_DASHBOARD_DECISIONS_URL python3 -B "$DB" --url http://h/x --view decisions 2>&1)
 [[ $? == 1 && $out == *'--decisions-url'* && $out == *PO_DASHBOARD_DECISIONS_URL* ]] &&
 	ok "po-dashboard --view decisions without a decisions feed is a usage error" || bad "dashboard view decisions" "$out"
+out=$(env -u PO_DASHBOARD_PROJECTS_URL python3 -B "$DB" --url http://h/x --view projects 2>&1)
+[[ $? == 1 && $out == *'--projects-url'* && $out == *PO_DASHBOARD_PROJECTS_URL* ]] &&
+	ok "po-dashboard --view projects without a projects feed is a usage error" || bad "dashboard view projects" "$out"
+grep -q '"child-activated"' "$DB" && grep -q 'def open_project' "$DB" && ok "po-dashboard Projects cards activate on Enter/Space (child-activated), a no-op until v0.39" || bad "dashboard projects activate"
+grep -q 'Gtk.AccessibleProperty.LABEL\], \[c\["text"\]' "$DB" && grep -q 'set_tooltip_text(c\["text"\])' "$DB" && ok "po-dashboard Projects cards carry the light in tooltip and accessible label" || bad "dashboard projects label"
 out=$(PO_DASHBOARD_DECISIONS_URL="$TMP/decisions.json" PO_DASHBOARD_TEAM_URL="$TMP/team.json" python3 -B "$DB" --url "$CHK_URL" --check 2>&1)
-[[ $(tail -3 <<<"$out" | head -1) == "decisions:" && $(tail -2 <<<"$out" | head -1) == "2.3 | orchard | Pick | waiting for: a ruling | asked "*" | https://chat.example.org/t/1" &&
-	$(tail -1 <<<"$out") == "0.7 | harbor | Accept | waiting for: an acceptance | asked "* && $out == *'team:'* ]] &&
+[[ $(tail -3 <<<"$out" | head -1) == "decisions:" && $(tail -2 <<<"$out" | head -1) == "legacy | 2.3 | orchard | Pick | waiting for: a ruling | asked "*" | https://chat.example.org/t/1" &&
+	$(tail -1 <<<"$out") == "legacy | 0.7 | harbor | Accept | waiting for: an acceptance | asked "* && $out == *'team:'* ]] &&
 	ok "po-dashboard --check lists the decisions, oldest asked first, after the events and the team" || bad "dashboard check decisions" "$out"
+out=$(XDG_CONFIG_HOME="$TMP/cfg" python3 -B "$DB" --url "$CHK_URL" --decisions-url "$(dirname "$PO")/../examples/decisions-feed.json" --check 2>&1)
+[[ $(tail -4 <<<"$out" | head -1) == "choice | 0.7 | harbor |"* && $(tail -3 <<<"$out" | head -1) == "action | 2.5 | orchard |"* &&
+	$(tail -2 <<<"$out" | head -1) == "legacy | 2.3 |"* && $(tail -1 <<<"$out") == "unformatted | 0.8 |"* ]] &&
+	ok "po-dashboard --check prints the kind first, choices, actions, then legacy and unformatted" || bad "dashboard check kinds" "$out"
+mkdir -p "$TMP/cfg/po-dashboard" && echo '{"actions": false}' >"$TMP/cfg/po-dashboard/decisions.json"
+out2=$(XDG_CONFIG_HOME="$TMP/cfg" python3 -B "$DB" --url "$CHK_URL" --decisions-url "$(dirname "$PO")/../examples/decisions-feed.json" --check 2>&1)
+[[ $out2 == "$out" ]] && ok "po-dashboard --check ignores the Actions filter" || bad "dashboard check filter" "$out2"
 out=$(PO_DASHBOARD_DECISIONS_URL="$TMP/none.json" python3 -B "$DB" --url "$CHK_URL" --decisions-url "$TMP/decisions.json" --check 2>&1)
 [[ $out == *'decisions:'* ]] && ok "po-dashboard --decisions-url wins over PO_DASHBOARD_DECISIONS_URL" || bad "dashboard decisions precedence" "$out"
 out=$(env -u PO_DASHBOARD_DECISIONS_URL python3 -B "$DB" --url "$CHK_URL" --check 2>&1)
@@ -2706,7 +2864,7 @@ out=$(python3 -B "$DB" --url "http://127.0.0.1:1/" --check 2>&1)
 if python3 -c 'import gi; gi.require_version("Gtk", "4.0"); from gi.repository import Gtk' >/dev/null 2>&1; then
 	if [[ -n ${DISPLAY:-}${WAYLAND_DISPLAY:-} ]]; then
 		# UI smoke: the window comes up with data and saves a screenshot.
-		python3 -I - "$SV/events.json" "$TMP/shot.png" "$DB" "$TMP/decisions.json" "$TMP/shot-decisions.png" "$TMP/team-limit.json" "$TMP/shot-team.png" "$TMP/shot-reports.png" <<'PY' &&
+		python3 -I - "$SV/events.json" "$TMP/shot.png" "$DB" "$TMP/decisions.json" "$TMP/shot-decisions.png" "$TMP/team-limit.json" "$TMP/shot-team.png" "$TMP/shot-reports.png" "$(dirname "$PO")/../examples/projects-feed.json" "$TMP/shot-projects.png" <<'PY' &&
 import http.server, subprocess, sys, threading
 body = open(sys.argv[1], "rb").read()
 class H(http.server.BaseHTTPRequestHandler):
@@ -2722,8 +2880,11 @@ if r.returncode == 0 and len(sys.argv) > 6:
     r = subprocess.run([sys.executable, sys.argv[3], "--url", "http://127.0.0.1:%d/" % srv.server_address[1], "--team-url", sys.argv[6], "--view", "team", "--screenshot", sys.argv[7]], timeout=60)
 if r.returncode == 0 and len(sys.argv) > 8:
     r = subprocess.run([sys.executable, sys.argv[3], "--url", "http://127.0.0.1:%d/" % srv.server_address[1], "--view", "reports", "--screenshot", sys.argv[8]], timeout=60)
+if r.returncode == 0 and len(sys.argv) > 10:
+    r = subprocess.run([sys.executable, sys.argv[3], "--url", "http://127.0.0.1:%d/" % srv.server_address[1], "--projects-url", sys.argv[9], "--view", "projects", "--screenshot", sys.argv[10]], timeout=60)
 sys.exit(r.returncode)
 PY
+			[[ -s $TMP/shot-projects.png ]] && ok "po-dashboard --view projects --screenshot saves the Projects pane" || bad "dashboard projects screenshot"
 			[[ -s $TMP/shot.png && -s $TMP/shot-decisions.png && -s $TMP/shot-team.png && -s $TMP/shot-reports.png ]] && ok "po-dashboard opens, loads events and saves a screenshot, also in the Decisions, Team (LIMIT and usage rows) and Reports views" || bad "dashboard ui smoke"
 	else
 		ok "po-dashboard UI smoke skipped: no display"
@@ -2757,6 +2918,12 @@ if command -v desktop-file-validate >/dev/null 2>&1; then
 else
 	ok "dashboard-install: desktop-file-validate not installed (skipped)"
 fi
+
+# ---- private test blocks (absent from a public snapshot) -------------------
+for _t in "$KITROOT"/private/tests.d/*.sh; do
+	# shellcheck source=/dev/null
+	[[ -f "$_t" ]] && source "$_t"
+done
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 ((fail == 0))

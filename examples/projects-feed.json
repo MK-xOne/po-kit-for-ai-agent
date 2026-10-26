@@ -1,0 +1,26 @@
+[
+  {
+    "project": "orchard",
+    "last_event": "2026-10-26T01:00:00Z",
+    "items": [
+      {"item": "3.1", "title": "Plant", "status": "TODO", "agents": ["ana", "ben"]},
+      {"item": "3.2", "title": "Water", "status": "DOING", "agents": ["cy"]},
+      {"item": "3.3", "title": "Harvest", "status": "DONE", "agents": ["dee", "cy", "ana"]}
+    ]
+  },
+  {
+    "project": "harbor",
+    "last_event": "2026-10-25T20:00:00Z",
+    "items": [
+      {"item": "1.4", "title": "Dock", "status": "PAUSED", "agents": ["ben"]},
+      {"item": "1.5", "title": "Sail", "status": "HELD", "agents": []}
+    ]
+  },
+  {
+    "project": "meadow",
+    "last_event": "2026-10-20T00:00:00Z",
+    "items": [
+      {"item": "2.1", "title": "Mow", "status": "DONE", "agents": ["eve"]}
+    ]
+  }
+]

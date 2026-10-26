@@ -331,7 +331,7 @@ the same from any worktree.
   interface's. There is no login, so bind only to an address whose reachers you
   trust. It prints `po serve: listening on http://<addr>:<port>/` and runs until
   stopped; `--port 0` picks a free port.
-- `po-dashboard [--url <url>] [--team-url <url>] [--decisions-url <url>] [--view events|team|decisions|reports] [--theme auto|light|dark] [--all] [--size WxH] [--check] [--screenshot <png>] [--screenshot-delay <s>]`
+- `po-dashboard [--url <url>] [--team-url <url>] [--decisions-url <url>] [--projects-url <url>] [--view events|team|decisions|projects|reports] [--project <name>] [--theme auto|light|dark] [--all] [--size WxH] [--check] [--screenshot <png>] [--screenshot-delay <s>]`
   (`bin/po-dashboard`, not a `po` subcommand) — a desktop window for the same
   events: the last 10 as soft raised single-line cards (result, item, project,
   kind, checks, agent, time in the local zone, note) in fixed columns that line
@@ -387,16 +387,70 @@ the same from any worktree.
   with the events; a failed fetch keeps the last decisions data and says so.
   An entry you expand stays open across refreshes (until it leaves the feed).
   The view is read-only. The feed is an http(s) URL or a file
-  (`examples/decisions-feed.json` is a sample); `--view decisions` starts in it.
+  (`examples/decisions-feed.json` is a sample, and the demo server serves it at
+  `/decisions.json`); `--view decisions` starts in it.
+  An entry may carry a `kind`, `"choice"` or `"action"`, and then a required `id` (stable,
+  unique per ask). A **choice** has `question` and `options` (2 or more of
+  `{label, description?, recommended?}`, at most one `recommended`, listed in feed order
+  with the recommended one marked, never reordered); an **action** has `machine`, `steps`
+  (`{text, command?}`, numbered, a `command` in its own selectable block with a Copy
+  button that only puts it on the clipboard) and `done_when`. `waiting_for` stays required
+  for every kind. Each kind has a badge and colour (Choice the accent, Action the `warn`
+  colour); a `kind` entry with an unknown kind, a missing `id` or a missing or malformed
+  field shows as `unformatted` in the error colour, so it stays visible. An entry without
+  `kind` displays as before. Order: Choices, then Actions, then unformatted and legacy,
+  each group oldest first. An `Actions` toggle in the second button row (on by default)
+  hides the Action entries and the status line says `3 waiting · 1 action hidden`; its
+  state is saved on the viewer's machine in `$XDG_CONFIG_HOME/po-dashboard/decisions.json`
+  (`{"actions": false}`; `PO_DASHBOARD_DECISIONS_FILTER` names another file; a missing or
+  broken file means on). Nothing is sent anywhere: answering a decision is not in the window.
   Esc closes it. `--check` prints the rows the window would show, without a
   display (`--all` for every event, then the team lines when a team feed is set, then the
-  decisions lines when a decisions feed is set; exit 2
-  when a URL is unreachable);
+  decisions lines (the kind first, `legacy` for no kind; the Actions filter is ignored) when a decisions feed is set, then one line per project when a
+  projects feed is set; exit 2 when a URL is unreachable);
+  `--projects-url` or `PO_DASHBOARD_PROJECTS_URL` (no default; `--projects-url`
+  wins; an http(s) URL or a file, like the team feed) reads the projects feed, refreshed
+  with the events; a failed fetch keeps the last projects data and says so. The feed is
+  a JSON array of `{project, last_event?, items: [{item, title?, status, agents: []}]}`:
+  `last_event` is an ISO time or null; `status` is the item's po status word: TODO,
+  DOING and DONE, with PAUSED and BLOCKED counted as DOING, and any other word (HELD)
+  listed under All only and counted nowhere; `agents` are the names tied to the item,
+  in order, filled by the producer of the feed: for TODO the agents that could take it,
+  for DOING the one working now, for DONE every agent involved, first event to last.
+  A project's light is `active` when its last event is at most 30 minutes old, `idle`
+  at most 24 hours old, else `inactive` (null, unreadable or in the future beyond a
+  minute is `inactive`). The kit defines the shape only; the producer is yours.
+  `examples/projects-feed.json` is a sample, and `examples/events-demo-server.py`
+  serves it at `/projects.json` with fresh times. `--check` prints
+  `name | light | todo/doing/done` per project.
+  The **Projects** view (the fourth button of the header toggle, shown only when a
+  projects feed is set; `--view projects` starts in it, and exits 1 without a feed) is a
+  grid of rectangular cards, one per project in the feed's order, wrapping to the window
+  width. A card shows a status light (a filled circle: green `active`, yellow `idle`, red
+  `inactive`), the project name, and the counts `TODO`, `DOING` and `DONE`. The light is also
+  spelled out in the card's tooltip and accessible label ("orchard, active, TODO 1, DOING 1,
+  DONE 1"), so colour is not the only signal. Cards take Tab focus; clicking one, or Enter or
+  Space on it, opens that project's screen. An empty feed shows "no
+  projects"; a failed fetch keeps the last cards and says so. A refresh that changes nothing
+  leaves the cards alone, and one that does keeps the scroll position and the focused card.
+  The **project screen** replaces the cards: a header with a Back button (Escape does the
+  same; the overview keeps its scroll and the project's card takes the focus back), the
+  project name and its light; filter buttons All, TODO, DOING and DONE, each with its
+  count (All at start; the choice is kept across refreshes and per project while the window
+  is open); and one row per item in the feed's order: item id, title, status badge and its
+  agents, as the feed gives them. TODO rows list the agents that could take the item, DOING
+  rows the agent working now (with the live dot of the Team view), DONE rows every agent
+  involved in order; none is a muted dash. A refresh rebuilds the rows without resetting
+  the filter or the open project, and a project that leaves the feed returns to the
+  overview. `--project <name>` with `--view projects` opens straight on that screen.
+  `--view projects --screenshot <png>` (add `--project orchard` for a project screen)
+  saves the pane once the feed has loaded. Light and
+  dark themes use the dashboard's palette.
   `--all` also starts the window with Show all on, `--size WxH` sets its size,
   and `--screenshot` saves the window to a PNG once it has data (after
   `--screenshot-delay` seconds, 0.6 by default), then quits.
   In the Events view a second, thinner row of buttons sits under the header: "Show all"
-  and "Reports". The row is hidden in Team and Decisions; the view buttons never move.
+  and "Reports". The row is hidden in Team; in Decisions it holds only the "Actions" toggle; the view buttons never move.
   "Reports" swaps the list for a report pane (a title, a time-range choice 24 h / 7 d / 30 d,
   7 d by default, and five charts; "no events in this range" when the range holds none);
   "Reports" again returns to the list. The charts (the numbers come from `lib/po/dashboard_reports.py`,
