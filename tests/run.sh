@@ -1,7 +1,19 @@
 #!/usr/bin/env bash
 # po-kit self-tests: small throwaway repositories under a temp dir.
 # shellcheck disable=SC2015 # ok/bad always return 0, so "A && ok || bad" is a true if/else here
+# shellcheck disable=SC2034 # RUN_DONE is read by the EXIT trap
 # Usage: tests/run.sh    (exit 0 when every case passes)
+#
+# A runner with no `set -e` hides a block that dies. So: a multi-check block
+# (a python heredoc or a shell function that prints several verdicts) runs
+# through `block <name> <cmd...>` (a heredoc is the command's stdin), prints
+# its verdicts as "ok<TAB>name<TAB>" / "FAIL<TAB>name<TAB>detail" lines and
+# ends with the line "BLOCK-END <name>"; a non-zero exit or a missing marker
+# is a FAIL. A heredoc that only builds a fixture or makes one request, whose
+# result the next line checks, carries the comment "# helper" on the line
+# above it. The audit near the end of this file fails on any other heredoc.
+# The run ends with "RUN-END <passed> <failed> <blocks>", then the summary; a
+# run that ends any other way prints RUN-ABORTED and exits non-zero.
 set -uo pipefail
 # Hermetic: no inherited GIT_* variable (an exported GIT_DIR — a git hook
 # sets one — would point every `git -C <fixture>` below at that repository,
@@ -12,8 +24,9 @@ export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 
 PO="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)/bin/po"
 TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
-pass=0 fail=0
+RUN_DONE=0
+trap 'rc=$?; rm -rf "$TMP"; if ((RUN_DONE == 0)); then printf "RUN-ABORTED\n"; exit "$((rc == 0 ? 1 : rc))"; fi' EXIT
+pass=0 fail=0 nblocks=0
 
 ok() {
 	pass=$((pass + 1))
@@ -23,6 +36,27 @@ bad() {
 	fail=$((fail + 1))
 	printf 'FAIL %s\n' "$1"
 	[[ -n ${2:-} ]] && printf '%s\n' "$2" | sed 's/^/     /'
+}
+
+# block <name> <cmd...>: run a multi-check block, feeding its verdict lines to
+# ok/bad; a non-zero exit or a last line other than "BLOCK-END <name>" is bad.
+block() {
+	local name=$1 out code status label detail
+	shift
+	nblocks=$((nblocks + 1))
+	out=$("$@" 2>&1)
+	code=$?
+	while IFS=$'\t' read -r status label detail; do
+		case $status in
+		ok) ok "$label" ;;
+		FAIL) bad "$label" "$detail" ;;
+		esac
+	done <<<"$out"
+	if ((code != 0)); then
+		bad "$name aborted (exit $code)" "$(tail -n 5 <<<"$out")"
+	elif [[ ${out##*$'\n'} != "BLOCK-END $name" ]]; then
+		bad "$name aborted (no BLOCK-END marker)" "$(tail -n 5 <<<"$out")"
+	fi
 }
 
 # expect <name> <exit> <stdout+stderr pattern> -- <po args...>
@@ -351,8 +385,11 @@ stamp_manifest() {
 	local leg
 	{
 		printf '%s' "$GOOD_MANIFEST"
-		[[ -z ${PREPARE:-} ]] || printf '[stamp]\nprepare = %s\n' "$PREPARE"
+		[[ -z ${PREPARE:-}${SLOW_AFTER:-} ]] || printf '[stamp]\n'
+		[[ -z ${PREPARE:-} ]] || printf 'prepare = %s\n' "$PREPARE"
+		[[ -z ${SLOW_AFTER:-} ]] || printf 'slow_after = %s\n' "$SLOW_AFTER"
 		printf '[gate]\ntest_count_cmd = "%s"\n' "${COUNT_CMD:-sh ./fake-test.sh 2>&1}"
+		[[ -z ${SENTINEL:-} ]] || printf 'run_sentinel = "required"\n'
 		[[ -z ${TEST_FORMAT:-} ]] || printf 'test_format = "%s"\n' "$TEST_FORMAT"
 		printf '[gate.legs]\n'
 		for leg; do printf '%s = "%s"\n' "${leg%%=*}" "${leg#*=}"; done
@@ -1634,8 +1671,8 @@ jfield() { python3 -I -c 'import json,sys; print(json.loads(sys.argv[1])[sys.arg
 first=$(grep -m1 '"result":"pass"' "$SLOG")
 [[ $(jfield "$first" kind) == stamp && $(jfield "$first" item) == 1.0.3 && $(jfield "$first" project) == stamp &&
 	$(jfield "$first" detail) == '' ]] &&
-	python3 -I -c 'import json,sys,re; e=json.loads(sys.argv[1]); assert list(e)==["time","kind","item","project","result","agent","legs","detail"]; assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", e["time"]); assert e["legs"]==[{"name":n,"result":"pass"} for n in ("check","test","clippy","fmt")]' "$first" &&
-	ok "events: a passing stamp logs time (UTC), kind, item, project, result and every leg" || bad "pass event" "$first"
+	python3 -I -c 'import json,sys,re; e=json.loads(sys.argv[1]); assert list(e)==["time","kind","item","project","result","agent","legs","seconds","detail"]; assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", e["time"]); assert [(l["name"],l["result"]) for l in e["legs"]]==[(n,"pass") for n in ("check","test","clippy","fmt")] and all(list(l)==["name","result","seconds"] for l in e["legs"])' "$first" &&
+	ok "events: a passing stamp logs time (UTC), kind, item, project, result, every leg and the seconds taken" || bad "pass event" "$first"
 fail1=$(grep -m1 '"clippy","result":"fail"' "$SLOG")
 [[ -n $fail1 && $(jfield "$fail1" result) == fail && $(jfield "$fail1" detail) == *"gate leg 'clippy'"* ]] &&
 	python3 -I -c 'import json,sys; e=json.loads(sys.argv[1]); assert [l["result"] for l in e["legs"]]==["pass","pass","fail","skip"], e["legs"]' "$fail1" &&
@@ -1675,7 +1712,7 @@ code=$?
 table() { awk 'done { next } /^$/ { done = 1; next } { print }'; }
 out=$(table <<<"$out")
 rows=$(($(wc -l <<<"$out") - 1))
-[[ $code == 0 && $rows == 10 ]] && head -1 <<<"$out" | grep -qE '^TIME +KIND +ITEM +PROJECT +RESULT +AGENT +LEGS$' &&
+[[ $code == 0 && $rows == 10 ]] && head -1 <<<"$out" | grep -qE '^TIME +KIND +ITEM +PROJECT +RESULT +AGENT +TOOK +LEGS$' &&
 	ok "events: by default the table shows the last 10 events under a header" || bad "events table (exit $code, rows $rows)" "$out"
 [[ $(wc -l <"$SLOG") -gt 10 ]] && out_all=$("$PO" -C "$S" --manifest "$TMP/s.toml" events --all 2>&1 | table) &&
 	[[ $(($(wc -l <<<"$out_all") - 1)) == "$(wc -l <"$SLOG")" ]] &&
@@ -1719,7 +1756,6 @@ stamp_manifest check=false
 code=$?
 [[ $code == 4 ]] && grep -q 'warning: could not write' "$TMP/ev.err" ||
 	bad "unwritable log on a failing stamp (exit $code)" "$(cat "$TMP/ev.err")"
-[[ $code == 4 ]] && ok "events: an unwritable log leaves a failing stamp's exit code at 4" || true
 rmdir "$SLOG"
 mv "$SLOG.keep" "$SLOG"
 stamp_manifest "${STD_LEGS[@]}"
@@ -1809,7 +1845,7 @@ zlog=$(python3 -I -c 'import json,sys; print(json.loads(sys.argv[1])["log"])' "$
 out=$("$PO" -C "$S" --manifest "$TMP/s.toml" events 2>&1)
 grep -qF "1.0.3: leg noisy failed; its last lines (full output: $zlog):" <<<"$out" &&
 	grep -qx '    noisy line 21' <<<"$out" && grep -qx '    token=\[REDACTED\] and password: \[REDACTED\]' <<<"$out" &&
-	! grep -qx '    noisy line 20' <<<"$out" && [[ $(table <<<"$out" | head -2 | tail -1) == *'first:pass noisy:fail last:skip'* ]] &&
+	! grep -qx '    noisy line 20' <<<"$out" && [[ $(table <<<"$out" | head -2 | tail -1) == *'first:pass(0s) noisy:fail(0s) last:skip(0s)'* ]] &&
 	ok "events: the table is followed by each failed stamp's tail, indented, naming the leg and the log" || bad "events tail" "$out"
 out=$("$PO" -C "$S" --manifest "$TMP/s.toml" events --json 2>&1)
 [[ $(wc -l <<<"$out") == 10 ]] && python3 -I -c 'import json,sys; e=json.loads(sys.stdin.readline()); assert e["legs"][1]["tail"].count("\n")==39' <<<"$out" &&
@@ -1825,6 +1861,45 @@ out=$("$PO" -C "$S" --manifest "$TMP/s.toml" events --json 2>&1)
 	ok "evidence: a secret in the failing leg's command is redacted in the event's detail" || bad "detail redaction" "$zd"
 stamp_manifest "${STD_LEGS[@]}"
 rm -f "$W"/gate-*.txt
+
+# ---- stamp: time taken (item v0.54) -----------------------------------------
+# Each leg and the run record whole wall-clock seconds; readers treat a missing
+# value as unknown, never 0.
+rm -f "$W"/gate-*.txt
+stamp_manifest check=true "test=sleep 2; sh ./fake-test.sh"
+"$PO" -C "$W" --manifest "$TMP/s.toml" stamp >/dev/null 2>&1
+tk=$(tail -1 "$SLOG")
+python3 -I -c 'import json,sys; e=json.loads(sys.argv[1]); assert e["result"]=="pass"; assert e["legs"][1]["seconds"]>=2, e; assert e["seconds"]>=e["legs"][1]["seconds"]>=2, e; assert e["legs"][0]["seconds"]<2, e' "$tk" &&
+	ok "time taken: a leg that sleeps 2 s records seconds >= 2 on the leg and on the run" || bad "stamp seconds" "$tk"
+out=$("$PO" -C "$S" --manifest "$TMP/s.toml" events 2>&1)
+[[ $(table <<<"$out" | sed -n 2p) =~ \ [0-9]+s\ +check:pass\([0-9]+s\)\ test:pass\([0-9]+s\)$ ]] &&
+	ok "time taken: po events shows the run's time and each leg's seconds" || bad "events took" "$out"
+rm -f "$W"/gate-*.txt
+SLOW_AFTER=1 stamp_manifest check=true "test=sleep 2; sh ./fake-test.sh"
+"$PO" -C "$W" --manifest "$TMP/s.toml" stamp >/dev/null 2>&1
+out=$("$PO" -C "$S" --manifest "$TMP/s.toml" events 2>&1)
+[[ $(table <<<"$out" | sed -n 2p) =~ \ [0-9]+s\ slow\ +check:pass ]] &&
+	ok "time taken: slow_after = 1 marks the sleeping run with the word slow" || bad "events slow" "$out"
+rm -f "$W"/gate-*.txt
+stamp_manifest "${STD_LEGS[@]}"
+out=$("$PO" -C "$S" --manifest "$TMP/s.toml" events 2>&1)
+[[ $(table <<<"$out" | sed -n 2p) != *slow* ]] &&
+	ok "time taken: without slow_after a quick run is not marked (default 300)" || bad "events not slow" "$out"
+rm -f "$W"/gate-*.txt
+# Synthetic lines: an old event without the keys, one of 252 s, one over the default 300 s.
+printf '%s\n' \
+	'{"time":"2026-10-20T10:00:00Z","kind":"stamp","item":"1.0.1","project":"oldfmt","result":"pass","agent":"x","legs":[{"name":"lint","result":"pass"}],"detail":""}' \
+	'{"time":"2026-10-20T10:01:00Z","kind":"stamp","item":"1.0.1","project":"mid","result":"pass","agent":"x","legs":[{"name":"lint","result":"pass","seconds":61}],"seconds":252,"detail":""}' \
+	'{"time":"2026-10-20T10:02:00Z","kind":"stamp","item":"1.0.1","project":"long","result":"pass","agent":"x","legs":[{"name":"lint","result":"pass","seconds":0}],"seconds":301,"detail":""}' >>"$SLOG"
+out=$("$PO" -C "$S" --manifest "$TMP/s.toml" events --all 2>&1 | table)
+grep -qE 'oldfmt +pass +x +- +lint:pass$' <<<"$out" &&
+	ok "time taken: an old-format event still prints and shows - for its time" || bad "old event" "$out"
+grep -qE 'mid +pass +x +4m12s +lint:pass\(1m01s\)$' <<<"$out" && grep -qE 'long +pass +x +5m01s slow +lint:pass\(0s\)$' <<<"$out" &&
+	ok "time taken: 252 s reads 4m12s, 301 s reads 5m01s slow" || bad "events format" "$out"
+out=$("$PO" -C "$S" --manifest "$TMP/s.toml" events --all --json 2>&1)
+grep -qF '"legs":[{"name":"lint","result":"pass"}],"detail":""' <<<"$out" && grep -qF '"seconds":252,"detail"' <<<"$out" &&
+	ok "time taken: --json carries the raw keys and leaves an old event as it is" || bad "events json seconds"
+sed -i '/"project":"\(oldfmt\|mid\|long\)"/d' "$SLOG"
 
 # ---- stamp: prepare lines (item AA) -----------------------------------------
 # A formatter fixes the tree before the gate looks at it.
@@ -1851,7 +1926,7 @@ want=$(
 [[ $out == *'tests 5 passed'* ]] &&
 	ok "prepare: test summaries a prepare line prints are not counted" || bad "prepare count" "$out"
 pev=$(tail -1 "$SLOG")
-python3 -I -c 'import json,sys; e=json.loads(sys.argv[1]); assert e["result"]=="pass"; assert e["legs"]==[{"name":n,"result":"pass"} for n in ("prepare","check","test","fmt","order")], e["legs"]' "$pev" &&
+python3 -I -c 'import json,sys; e=json.loads(sys.argv[1]); assert e["result"]=="pass"; assert [(l["name"],l["result"]) for l in e["legs"]]==[(n,"pass") for n in ("prepare","check","test","fmt","order")], e["legs"]' "$pev" &&
 	ok "prepare: the stamp event records it as a leg named prepare, ahead of the gate's" || bad "prepare event" "$pev"
 # The state is taken after prepare: what it writes is counted dirty and is not a change during the gate.
 rm -f "$W"/gate-*.txt
@@ -1937,16 +2012,16 @@ code=$?
 	ok "doctor lists each adopter (~/ expanded, comments and blanks skipped), exit 0" || bad "doctor adopters (exit $code)" "$out"
 [[ $(grep -cE '^  manifest +ok$' <<<"$out") == 2 && $(grep -cE '^  status +ok$' <<<"$out") == 2 ]] &&
 	ok "doctor says the manifest parses and status runs" || bad "doctor ok lines" "$out"
-block() { awk -v p="$1" '$1 == "adopter" { on = ($2 == p) } on' <<<"$out"; }
-block "$KH/ad1" | grep -q '^  adopt  *\[hooks\] on_close$' && block "$KH/ad1" | grep -q '^  adopt  *\[layout\] owner_column$' &&
+adopter_block() { awk -v p="$1" '$1 == "adopter" { on = ($2 == p) } on' <<<"$out"; }
+adopter_block "$KH/ad1" | grep -q '^  adopt  *\[hooks\] on_close$' && adopter_block "$KH/ad1" | grep -q '^  adopt  *\[layout\] owner_column$' &&
 	ok "doctor lists the optional keys a manifest does not set" || bad "doctor adopt keys" "$out"
-block "$KH/ad1" | grep -q '^  adopt  *\[kickoff\] preamble$' &&
+adopter_block "$KH/ad1" | grep -q '^  adopt  *\[kickoff\] preamble$' &&
 	ok "doctor offers [kickoff] preamble to a manifest without it" || bad "doctor kickoff adopt" "$out"
-block "$KH/ad1" | grep -q '^  adopt  *\[close\] checklist$' &&
+adopter_block "$KH/ad1" | grep -q '^  adopt  *\[close\] checklist$' &&
 	ok "doctor offers [close] checklist to a manifest without it" || bad "doctor close adopt" "$out"
-block "$KH/ad1" | grep -q '^  adopt  *\[stamp\] prepare$' &&
+adopter_block "$KH/ad1" | grep -q '^  adopt  *\[stamp\] prepare$' &&
 	ok "doctor offers [stamp] prepare to a manifest without it" || bad "doctor stamp adopt" "$out"
-! block "$TMP/ad2" | grep -q 'owner_column' && block "$TMP/ad2" | grep -q '^  adopt  *\[hooks\] on_close$' &&
+! adopter_block "$TMP/ad2" | grep -q 'owner_column' && adopter_block "$TMP/ad2" | grep -q '^  adopt  *\[hooks\] on_close$' &&
 	ok "a key the manifest sets is not offered" || bad "doctor offered a set key" "$out"
 [[ $(dsnap) == "$before" ]] && ok "doctor is read-only" || bad "doctor wrote something"
 printf '%s\n%s\n/nonexistent/adopter\n' "$KH/ad1" "$TMP/ad3" >"$KH/.config/po-kit/adopters"
@@ -2041,6 +2116,7 @@ code=$?
 SV="$TMP/serve"
 mkdir -p "$SV/bin" "$SV/repo"
 make_repo "$SV/repo"
+# helper
 python3 -I - "$SV/events.json" <<'PY'
 import json, sys
 ev = [{"time": "2026-10-23T%02d:00:00Z" % i, "kind": "stamp", "item": "1.%d" % i, "project": "demo",
@@ -2086,6 +2162,7 @@ sv_start() {
 sv_stop() { kill "$SV_PID" 2>/dev/null; wait "$SV_PID" 2>/dev/null; }
 # sv_req <method> <path>: first line "<status>", then the body.
 sv_req() {
+	# helper
 	python3 -I - "$1" "$SV_URL$2" <<'PY'
 import sys, urllib.request, urllib.error
 req = urllib.request.Request(sys.argv[2], method=sys.argv[1], data=b"x" if sys.argv[1] in ("POST", "PUT", "PATCH") else None)
@@ -2167,6 +2244,7 @@ for _ in $(seq 1 100); do
 	sleep 0.1
 done
 before=$(sv_req GET /events.json | tail -n +2 | python3 -I -c 'import json,sys; print(len(json.load(sys.stdin)))')
+# helper
 python3 -I - "$SV/events-live.json" <<'PY'
 import json, sys
 e = {"time": "2026-10-24T00:00:00Z", "kind": "close", "item": "9.9", "project": "demo", "result": "pass", "agent": "x", "legs": [], "detail": ""}
@@ -2176,6 +2254,7 @@ out=$(sv_req GET /)
 [[ $before == 12 && $(grep -m1 '^<tr ' <<<"$out") == *9.9* ]] &&
 	ok "a new event shows on the next request, newest on top" || bad "live update" "$out"
 # One JSON object per line is read as well as one array.
+# helper
 python3 -I - "$SV/events-live.json" <<'PY'
 import json, sys
 d = [json.loads(l) for l in open(sys.argv[1])]
@@ -2208,15 +2287,159 @@ expect "serve --port needs a value" 1 "needs a value" -- -C "$SV/repo" serve --p
 out=$(cd "$SV/repo" && PATH="$SV/bin:$PATH" "$PO" serve --port 99999 2>&1)
 [[ $? == 1 ]] && ok "an out-of-range port is a usage error" || bad "port range" "$out"
 
+# ---- po team, the Team-view feed (item AR) ---------------------------------
+TM=$TMP/team
+mkdir -p "$TM/docs" "$TM/bin"
+git init -q -b main "$TM"
+git -C "$TM" config user.name t
+git -C "$TM" config user.email t@example.invalid
+cat >"$TM/docs/BACKLOG.md" <<'MD'
+# Backlog
+
+| Item | Status | Owner |
+|---|---|---|
+| v1.1 | DOING | Ada |
+| v1.2 | PAUSED | Bo |
+| v1.3 | DOING | Di |
+| v1.4 | DONE | Ada |
+| v1.5 | TODO | Cy |
+MD
+team_manifest() { # [extra [team] lines...]
+	cat <<'TOML'
+[versioning]
+tag = "v{version}"
+
+[layout]
+backlog = "docs/BACKLOG.md"
+specs_dir = "docs"
+worktrees = ".wt"
+branch = "item-v{version}"
+owner_column = "Owner"
+
+TOML
+	if (($# > 0)); then
+		printf '[team]\n'
+		printf '%s\n' "$@"
+		printf '\n'
+	fi
+	cat <<'TOML'
+[[team.agent]]
+name = "ada"
+model = "Big Model (API)"
+role = "dev"
+
+[[team.agent]]
+name = "bo"
+role = "dev"
+
+[[team.agent]]
+name = "cy"
+
+[[team.agent]]
+name = "di"
+model = "small-model (local GPU)"
+
+[[team.agent]]
+name = "ed"
+TOML
+}
+team_manifest 'limits_file = "limits.json"' 'usage_file = "usage.json"' >"$TM/po.toml"
+printf '{"ada": null, "di": "2099-01-01T15:30:00Z", "ghost": "2099-01-01T00:00:00Z"}\n' >"$TM/limits.json"
+printf '{"ada": {"five_hour": 0.42, "seven_day": 0.18}, "di": {"five_hour": 1.0}}\n' >"$TM/usage.json"
+git -C "$TM" add -A
+git -C "$TM" commit -qm init
+# The gate event log: ada 2 min ago, bo 40 min, cy and di 3 h; ed has none.
+tev() { printf '{"time":"%s","kind":"stamp","item":"%s","project":"team","result":"pass","agent":"%s","legs":[],"detail":""}\n' \
+	"$(date -u -d "$1 ago" +%Y-%m-%dT%H:%M:%SZ)" "$2" "$3"; }
+{
+	tev "3 hours" 1.3 di
+	tev "3 hours" 1.0 cy
+	tev "40 minutes" 1.2 bo
+	tev "2 minutes" 1.1 ada
+} >"$TM/.git/po-events.jsonl"
+tjson() { python3 -I -c '
+import json, sys
+d = json.load(sys.stdin)
+a = {e["agent"]: e for e in d}
+print(" ".join(str(x) for x in eval(sys.argv[1])))' "$1"; }
+TJ=$("$PO" -C "$TM" team --json 2>&1)
+[[ $(tjson 'list(a)' <<<"$TJ") == "ada bo cy di ed" ]] &&
+	ok "team --json lists the roster in manifest order" || bad "team roster order" "$TJ"
+[[ $(tjson '[a["ada"]["state"], a["ada"]["now"], a["ada"]["owns"], a["ada"]["free"]]' <<<"$TJ") == "WORKING 1.1 ['1.1'] False" ]] &&
+	ok "team: an owner of a DOING item with a fresh event is WORKING, now names the item" || bad "team WORKING" "$TJ"
+[[ $(tjson '[a["bo"]["state"], a["bo"]["now"], a["bo"]["owns"], a["bo"]["free"]]' <<<"$TJ") == "idle 40m None ['1.2'] True" ]] &&
+	ok "team: idle 15+ minutes owning only a held item is idle and FREE" || bad "team held-only free" "$TJ"
+[[ $(tjson '[a["cy"]["state"], a["cy"]["owns"], a["cy"]["free"]]' <<<"$TJ") == "idle 3h [] True" ]] &&
+	ok "team: owning nothing (a TODO row is not owned) is FREE, idle in hours" || bad "team nothing owned" "$TJ"
+[[ $(tjson '[a["di"]["state"], a["di"]["owns"], a["di"]["free"]]' <<<"$TJ") == "idle 3h ['1.3'] False" ]] &&
+	ok "team: idle with a DOING item is not FREE" || bad "team DOING idle" "$TJ"
+[[ $(tjson '[a["ed"]["state"], a["ed"]["free"]]' <<<"$TJ") == "idle never True" ]] &&
+	ok "team: an agent with no events is idle never and FREE when it owns nothing" || bad "team no events" "$TJ"
+[[ $(tjson '["model" in a["bo"], a["ada"]["model"], a["di"]["model"]]' <<<"$TJ") == "False Big Model (API) small-model (local GPU)" ]] &&
+	ok "team: model comes from the roster, absent when not given" || bad "team model" "$TJ"
+[[ $(tjson '[a["ada"]["limit_until"], a["ada"]["usage"], a["di"]["limit_until"], a["di"]["usage"], "limit_until" in a["bo"], "usage" in a["bo"], "ghost" in a]' <<<"$TJ") == "None {'five_hour': 0.42, 'seven_day': 0.18} 2099-01-01T15:30:00Z {'five_hour': 1.0} False False False" ]] &&
+	ok "team: limits_file and usage_file are merged by agent name" || bad "team merge" "$TJ"
+out=$("$PO" -C "$TM" team 2>&1)
+[[ $out == AGENT*STATE* && $out == *ada*WORKING*1.1* && $out == *bo*'idle 40m'* ]] &&
+	ok "team prints a table without --json" || bad "team table" "$out"
+team_manifest 'limits_file = "no-such.json"' 'usage_file = "nor-this.json"' >"$TM/po.toml"
+out=$("$PO" -C "$TM" team --json 2>&1)
+[[ $out == *'"agent":"ada"'* && $out != *limit_until* && $out != *usage* && $out != *warning* ]] &&
+	ok "team: a missing limits or usage file is ignored" || bad "team missing files" "$out"
+printf 'not json\n' >"$TM/limits.json"
+team_manifest 'limits_file = "limits.json"' >"$TM/po.toml"
+out=$("$PO" -C "$TM" team --json 2>&1)
+[[ $out == *'warning'*limits.json* && $out == *'"agent":"ada"'* && $out != *limit_until* ]] &&
+	ok "team: an unreadable limits file warns and is left out" || bad "team broken limits" "$out"
+team_manifest >"$TM/po.toml"
+before=$(git -C "$TM" status --porcelain; cat "$TM/.git/po-events.jsonl")
+"$PO" -C "$TM" team >/dev/null 2>&1
+[[ $before == "$(git -C "$TM" status --porcelain; cat "$TM/.git/po-events.jsonl")" ]] &&
+	ok "team is read-only" || bad "team wrote"
+expect "team rejects an unknown argument" 1 "team: unknown argument" -- -C "$TM" team --nope
+sed '/^\[\[team.agent\]\]/,$d' "$TM/po.toml" >"$TMP/team-none.toml"
+expect "team without a roster is an error" 2 'no \[\[team.agent\]\]' -- -C "$TM" --manifest "$TMP/team-none.toml" team
+{ cat "$TM/po.toml"; printf '[[team.agent]]\nname = "ada"\n'; } >"$TMP/team-dup.toml"
+expect "a duplicate roster name is a manifest error" 2 "name 'ada' appears twice" -- -C "$TM" --manifest "$TMP/team-dup.toml" team
+{ cat "$TM/po.toml"; printf '[[team.agent]]\nmodel = "x"\n'; } >"$TMP/team-noname.toml"
+expect "a roster entry without a name is a manifest error" 2 'needs a non-empty "name"' -- -C "$TM" --manifest "$TMP/team-noname.toml" team
+{ cat "$TM/po.toml"; printf '[[team.agent]]\nname = "zed"\nsize = "big"\n'; } >"$TMP/team-key.toml"
+expect "an unknown roster key is a manifest error" 2 "unknown key 'size' in \[\[team.agent\]\]" -- -C "$TM" --manifest "$TMP/team-key.toml" team
+# po serve exposes it at /team.json (real po, found on PATH as `po`).
+ln -sf "$PO" "$TM/bin/po"
+(cd "$TM" && PATH="$TM/bin:$PATH" exec "$PO" serve --port 0 >"$TM/out" 2>"$TM/err") &
+TM_PID=$!
+TM_URL=
+for _ in $(seq 1 100); do
+	TM_URL=$(sed -nE 's/^po serve: listening on (http:\/\/[^ ]+)\/$/\1/p' "$TM/out")
+	[[ -n $TM_URL ]] && break
+	kill -0 "$TM_PID" 2>/dev/null || break
+	sleep 0.1
+done
+if [[ -n $TM_URL ]]; then
+	# helper
+	out=$(python3 -I - "$TM_URL/team.json" <<'PY'
+import json, sys, urllib.request
+r = urllib.request.urlopen(sys.argv[1], timeout=10)
+d = json.load(r)
+print(r.status, [e["agent"] for e in d], d[0]["state"])
+PY
+)
+	[[ $out == "200 ['ada', 'bo', 'cy', 'di', 'ed'] WORKING" ]] &&
+		ok "po serve serves the feed at /team.json" || bad "/team.json" "$out"
+	kill "$TM_PID" 2>/dev/null
+	wait "$TM_PID" 2>/dev/null
+else
+	bad "po serve (team) starts" "$(cat "$TM/out" "$TM/err")"
+fi
+
 # ---- the desktop viewer (item N) -------------------------------------------
 # The logic is lib/po/dashboard_core.py (no GTK); bin/po-dashboard draws it.
 DB="$(dirname "$PO")/po-dashboard"
 DBLIB="$(dirname "$PO")/../lib/po"
 export PO_DASHBOARD_TEAM_ORDER="$TMP/no-team-order.json"  # never the tester's own saved order
 unset PO_DASHBOARD_DECISIONS_URL  # never the tester's own decisions feed
-while IFS=$'\t' read -r status name detail; do
-	[[ $status == ok ]] && ok "$name" || bad "$name" "$detail"
-done < <(python3 -B -I - "$DBLIB" <<'PY'
+block dashboard-core python3 -B -I - "$DBLIB" <<'PY'
 import datetime, http.server, json, os, subprocess, sys, tempfile, threading
 sys.path.insert(0, sys.argv[1])
 import dashboard_core as c
@@ -2324,7 +2547,22 @@ _cs = r.layout_cycle_time(_t, 640)[1] + r.layout_failed_legs(_fl, 640)[1] + r.la
 check("dashboard reports: cycle time shows the median and n as text and boxes for each agent", any(s[0] == "text" and s[3] == "3.0 h  n=2" for s in _cs) and sum(1 for s in r.layout_cycle_time(_t, 640)[1] if s[0] == "rect" and s[5] == ("series", 0)) == 2)
 check("dashboard reports: other is hatched muted, never one of the six colours", any(s[0] == "rect" and s[5] == "muted" and s[6] for s in r.layout_failed_legs(_seven, 640)[1]) and not any(s[0] == "rect" and s[5] == ("series", 6 % 6) and s[6] for s in r.layout_failed_legs(_seven, 640)[1]))
 check("dashboard reports: new charts stay inside the width", all(s[1] >= 0 and s[1] + (s[3] if s[0] == "rect" else 0) <= 640 + 1e-6 for s in _cs if s[0] in ("rect", "line")))
-check("dashboard reports: nice axis tops", [r.nice_max(v) for v in (0, 1, 3, 7, 20, 21, 101)] == [1, 1, 5, 10, 20, 50, 200])
+check("dashboard reports: nice axis tops sit just above the value", [r.nice_max(v) for v in (0, 1, 3, 7, 11, 20, 21, 51, 101)] == [1, 1, 3, 8, 12, 20, 24, 60, 120])
+_hid = r.gate_runs([_st("2026-10-25T12:10:00Z"), _st("2026-10-25T12:20:00Z", result="fail"), _st("2026-10-25T09:10:00Z", agent="b")], 86400, _n)
+_hs = r.layout_gate_runs(_hid, 640)[1]
+check("dashboard reports: gate runs draw only the hours with runs", len({round(s[1], 3) for s in _hs if s[0] == "rect" and s[5] == "pass" and s[3] > 20}) == 2 and sum(1 for s in _hs if s[0] == "text" and s[3] == "09") == 2)
+check("dashboard reports: hidden empty hours are counted in a muted note", any(s[0] == "text" and s[3] == "22 empty hours hidden" and s[4] == "muted" for s in _hs) and not any(s[0] == "text" and "hidden" in s[3] for s in r.layout_gate_runs(r.gate_runs([_st("2026-10-25T%02d:10:00Z" % h) for h in range(13)] + [_st("2026-10-24T%02d:10:00Z" % h) for h in range(13, 24)], 86400, _n), 640)[1]))
+check("dashboard reports: gate runs label every bar with its count above and its hour below, in every row", sum(1 for s in _hs if s[0] == "text" and s[3] == "12") == 2 and sorted(s[3] for s in _hs if s[0] == "text" and s[4] == "text" and s[5] == "middle") == ["1", "2"])
+check("dashboard reports: gate runs say what a bar is", any(s[0] == "text" and s[3] == "each bar = one hour" for s in _hs) and any(s[0] == "text" and s[3] == "each bar = one day" for s in r.layout_gate_runs(r.gate_runs([_st("2026-10-23T12:00:00Z")], 7 * 86400, _n), 640)[1]))
+_cl = r.layout_closed(_c, 640)[1]
+check("dashboard reports: closed per day hides empty days, labels bars and says how many were hidden", any(s[0] == "text" and s[3] == "each bar = one day" for s in _cl) and not any(s[0] == "text" and "hidden" in s[3] for s in _cl)
+      and any(s[0] == "text" and s[3] == "29 empty days hidden" for s in r.layout_closed(r.closed([_st("2026-10-25T01:00:00Z", kind="close")], 30 * 86400, _n), 640)[1])
+      and any(s[0] == "text" and s[3] == "1 empty day hidden" for s in r.layout_closed(r.closed([_st("2026-10-25T01:00:00Z", kind="close")], 86400, _n), 640)[1]))
+_fh = r.layout_failed_legs(r.failed_legs([_lg("2026-10-25T12:10:00Z", [("t", "fail")])], 86400, _n), 640)[1]
+check("dashboard reports: failed legs hide empty hours, label the bar and count it above", any(s[0] == "text" and s[3] == "23 empty hours hidden" for s in _fh) and any(s[0] == "text" and s[3] == "12" and s[5] == "middle" and s[4] == "muted" for s in _fh) and any(s[0] == "text" and s[3] == "1" and s[4] == "text" for s in _fh))
+check("dashboard reports: charts with nothing to draw stay empty", all(r.layout_gate_runs(r.gate_runs([], 86400, _n), 640)[0] > 0 and not any(s[0] == "rect" and s[5] in ("pass", "fail") and s[3] > 20 for s in r.layout_gate_runs(r.gate_runs([], 86400, _n), 640)[1]) for _ in (0,)) and r.layout_closed(r.closed([], 86400, _n), 640)[0] > 0 and r.layout_failed_legs(r.failed_legs([], 86400, _n), 640)[0] > 0)
+_tall = r.layout_closed(r.closed([_st("2026-10-25T%02d:00:00Z" % h, kind="close", item=str(h)) for h in range(11)], 86400, _n), 640)[1]
+check("dashboard reports: the axis top is the closer round step above the tallest bar", any(s[0] == "text" and s[3] == "12" and s[4] == "muted" and s[5] == "end" for s in _tall))
 _shapes = r.layout_gate_runs(_g, 640)[1] + r.layout_first_try(_f, 640)[1] + r.layout_closed(_c, 640)[1]
 check("dashboard reports: fail is hatched, pass solid, so colour is not the only cue", any(s[0] == "rect" and s[5] == "fail" and s[6] for s in _shapes) and any(s[0] == "rect" and s[5] == "pass" and not s[6] for s in _shapes))
 check("dashboard reports: first-try rows carry the share and n as text", any(s[0] == "text" and s[3] == "67%  n=3" for s in r.layout_first_try(_f, 640)[1]))
@@ -2350,7 +2588,7 @@ check("dashboard: pass has a symbol and a word", c.row(ev[1], utc)["result"] == 
 check("dashboard: fail has a symbol and a word", c.row(ev[0], utc)["result"] == "✘ fail" and c.row(ev[0], utc)["result_class"] == "fail")
 check("dashboard: an unknown result keeps its word", c.row({"result": "weird"}, utc)["result"] == "– weird")
 keys = [col[0] for col in c.COLUMNS]
-check("dashboard: the columns are result item project kind checks agent time", keys == ["result", "item", "project", "kind", "legs", "agent", "time"])
+check("dashboard: the columns are result item project kind checks agent took time", keys == ["result", "item", "project", "kind", "legs", "agent", "took", "time"])
 check("dashboard: every column key is a row field", all(k in c.row(ev[0], utc) for k in keys))
 check("dashboard: only project and checks grow", [col[0] for col in c.COLUMNS if col[4]] == ["project", "legs"])
 check("dashboard: fixed columns are as wide as they may get", all(col[2] == col[3] for col in c.COLUMNS if not col[4]))
@@ -2599,6 +2837,78 @@ try:
 except c.DashboardError as e:
     check("dashboard: an unreachable URL is a DashboardError", "cannot reach" in str(e))
 
+# v0.49: answering decisions.
+check("dashboard answers: --answer-url wins over the environment", c.resolve_answer_url("http://a/x", {"PO_DASHBOARD_ANSWER_URL": "http://b/x"}) == "http://a/x")
+check("dashboard answers: the environment is used without --answer-url", c.resolve_answer_url(None, {"PO_DASHBOARD_ANSWER_URL": "http://b/x"}) == "http://b/x")
+check("dashboard answers: no option and no environment is None (read-only)", c.resolve_answer_url(None, {}) is None and c.resolve_answer_url(" ", {"PO_DASHBOARD_ANSWER_URL": " "}) is None)
+check("dashboard answers: the decisions variable is not the answer variable", c.resolve_answer_url(None, {"PO_DASHBOARD_DECISIONS_URL": "http://b/d"}) is None)
+for bad_url in ("ftp://h/x", "file:///etc/passwd", "notaurl"):
+    try:
+        c.resolve_answer_url(bad_url, {})
+        check("dashboard answers: %s is refused" % bad_url, False)
+    except c.DashboardError:
+        check("dashboard answers: %s is refused" % bad_url, True)
+_check_entry_choice = {"id": "ask-0707", "project": "harbor", "item": "0.7", "kind": "choice", "question": "?", "options": [{"label": "Yes", "description": "", "recommended": True}, {"label": "No", "description": ""}]}
+_check_entry_action = {"id": "ask-0205", "project": "orchard", "item": "2.5", "kind": "action", "machine": "m", "done_when": "d", "steps": [{"text": "s", "command": ""}]}
+_b = c.answer_body(_check_entry_choice, "uuid-1", option="Yes", text="")
+check("dashboard answers: answer_body for a choice without text",
+      _b["answer_id"] == "uuid-1" and _b["id"] == "ask-0707" and _b["project"] == "harbor" and _b["item"] == "0.7"
+      and _b["kind"] == "choice" and _b["option"] == "Yes" and _b["text"] == ""
+      and _b["result"] is None and _b["step"] is None and _b["note"] is None
+      and "answered_at" in _b and _b["client"] == c.CLIENT)
+_bv = c.answer_body(_check_entry_choice, "uuid-2", option="Yes", text="good idea")
+check("dashboard answers: answer_body for a choice with text", _bv["option"] == "Yes" and _bv["text"] == "good idea")
+_bp = c.answer_body(_check_entry_action, "uuid-3", result="pass")
+check("dashboard answers: answer_body for an action pass", _bp["result"] == "pass" and _bp["step"] is None and _bp["note"] is None and _bp["option"] is None and _bp["text"] is None)
+_bf = c.answer_body(_check_entry_action, "uuid-4", result="failed", step=1, note="the key was missing")
+check("dashboard answers: answer_body for an action failed with step and note", _bf["result"] == "failed" and _bf["step"] == 1 and _bf["note"] == "the key was missing" and _bf["option"] is None and _bf["text"] is None)
+_bu = c.answer_body({"id": "ask-0808", "project": "harbor", "item": "0.8", "kind": "unformatted"}, "uuid-5", text="custom answer")
+check("dashboard answers: answer_body for unformatted text", _bu["text"] == "custom answer" and _bu["kind"] == "unformatted" and _bu["option"] is None and _bu["result"] is None and _bu["step"] is None)
+check("dashboard answers: answer_id is a uuid4 hex string", len(c.answer_id()) == 32 and c.answer_id() != c.answer_id())
+check("dashboard answers: answer_state maps 200/201 to answered · sent", c.answer_state(200) == "answered \u00b7 sent" and c.answer_state(201) == "answered \u00b7 sent")
+check("dashboard answers: answer_state maps 409 to already answered", c.answer_state(409) == "already answered")
+check("dashboard answers: answer_state maps 404 to no longer waiting", c.answer_state(404) == "no longer waiting")
+check("dashboard answers: answer_state maps 401/403 to refused by host", c.answer_state(401, host="h") == "refused by h: 401" and c.answer_state(403, host="h") == "refused by h: 403")
+check("dashboard answers: answer_state maps other codes to not sent", c.answer_state(500) == "not sent" and c.answer_state(0) == "not sent")
+check("dashboard answers: answer_state takes a reason for other codes", c.answer_state(500, "Internal Server Error") == "not sent: Internal Server Error")
+check("dashboard answers: answer_needs_retry distinguishes states",
+      c.answer_needs_retry("refused by h: 401") and c.answer_needs_retry("not sent: boom")
+      and not c.answer_needs_retry("answered \u00b7 sent") and not c.answer_needs_retry("already answered")
+      and not c.answer_needs_retry("no longer waiting"))
+check("dashboard answers: answer_state_class maps states to CSS",
+      c.answer_state_class("answered \u00b7 sent") == "po-answered" and c.answer_state_class("already answered") == "po-already"
+      and c.answer_state_class("no longer waiting") == "po-fail" and c.answer_state_class("refused by h: 401") == "po-fail"
+      and c.answer_state_class("not sent") == "po-fail" and c.answer_state_class("not sent: boom") == "po-fail")
+check("dashboard answers: po-answered and po-already colours are in the CSS", ".po-answered" in c.css("light") and ".po-already" in c.css("dark"))
+class AnswerH(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        self.rfile.read(length)
+        token = self.headers.get("Authorization", "")
+        code = int(self.path[1:])
+        if code == 401 and token:
+            self.send_response(201)  # a bearer token is accepted
+        else:
+            self.send_response(code)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+    def log_message(self, *a):
+        pass
+asrv = http.server.HTTPServer(("127.0.0.1", 0), AnswerH)
+threading.Thread(target=asrv.serve_forever, daemon=True).start()
+abase = "http://127.0.0.1:%d" % asrv.server_address[1]
+ab = c.answer_body(_check_entry_choice, "answer-uuid", option="Yes", text="")
+check("dashboard answers: 201 is answered · sent", c.post_answer(abase + "/201", ab) == "answered \u00b7 sent")
+check("dashboard answers: 200 is answered · sent", c.post_answer(abase + "/200", ab) == "answered \u00b7 sent")
+check("dashboard answers: 409 is already answered", c.post_answer(abase + "/409", ab) == "already answered")
+check("dashboard answers: 404 is no longer waiting", c.post_answer(abase + "/404", ab) == "no longer waiting")
+check("dashboard answers: 401 without a token is refused", c.post_answer(abase + "/401", ab).startswith("refused by"))
+check("dashboard answers: 401 with a token is answered · sent", c.post_answer(abase + "/401", ab, token="secret") == "answered \u00b7 sent")
+check("dashboard answers: 500 is not sent", c.post_answer(abase + "/500", ab).startswith("not sent:"))
+check("dashboard answers: a connection failure is not sent", c.post_answer("http://127.0.0.1:1/", ab).startswith("not sent:"))
+asrv.shutdown()
+asrv.server_close()
+
 # The style: contrast of the palette, read back from the generated CSS.
 for variant in sorted(c.PALETTES):
     props = c.css_properties(c.css(variant))
@@ -2643,6 +2953,19 @@ check("serve page: a row that appears fades over 60 s, from the page's own anima
 check("serve page: reduced motion drops the animation but keeps the highlight", pg.count("prefers-reduced-motion:reduce") == 2 and "tr.new td{animation:none}" in pg)
 check("serve page: rows rendered by the server start normal", 'class="new"' not in pg and "<tr class" not in pg)
 check("serve page: the script marks only events seen after the first fetch", "if (seen) for (const k of keys) if (!seen.has(k)) born.set" in pg)
+# time taken (item v0.54): the dashboard column and the po serve page
+tk_old, tk_mid, tk_long = ev[0], dict(ev[1], seconds=252), dict(ev[2], seconds=301)
+check("dashboard took: 57 s reads 57s, 252 s reads 4m12s, 3723 s reads 1h02m03s, unknown reads -",
+      [c.row(dict(ev[0], seconds=n), utc)["took"] for n in (57, 252, 3723)] == ["57s", "4m12s", "1h02m03s"] and c.row(tk_old, utc)["took"] == "-")
+check("dashboard took: only a run over slow_after (default 300) is slow; unknown never", [c.row(dict(ev[0], seconds=n), utc)["slow"] for n in (300, 301)] == [False, True] and not c.row(tk_old, utc)["slow"])
+os.environ["PO_SLOW_AFTER"] = "1"
+check("dashboard took: PO_SLOW_AFTER moves the threshold", c.row(dict(ev[0], seconds=2), utc)["slow"] and not c.row(dict(ev[0], seconds=1), utc)["slow"])
+del os.environ["PO_SLOW_AFTER"]
+check("dashboard sort: took sorts by seconds, not text, unknown first", [e.get("seconds") for e in c.sorted_events([dict(ev[0], seconds=252), dict(ev[1], seconds=57), ev[2]], ("took", False))] == [None, 57, 252])
+check("dashboard took: a boolean or negative seconds is unknown", c.row(dict(ev[0], seconds=True), utc)["took"] == "-" and c.row(dict(ev[0], seconds=-3), utc)["took"] == "-")
+pg = sv.page([tk_long, tk_mid, tk_old], None, True)
+check("serve page: the took column has a header and shows 5m01s, 4m12s and -", '<th class="c-took">took</th>' in pg and '>5m01s<' in pg and '>4m12s<' in pg and '<td class="c-took" title="-">-</td>' in pg)
+check("serve page: a run over slow_after is marked slow, others are not", pg.count('<td class="c-took slow"') == 1)
 for variant, base, target, normal in (("light", "#ffffff", "#000000", {"text": "#222222", "muted": "#555555"}), ("dark", "#181818", "#ffffff", {"text": "#dddddd", "muted": "#aaaaaa"})):
     start = c.mix(base, target, 0.25)
     for role, col in sv.NEW_TEXT[variant].items():
@@ -2773,8 +3096,8 @@ try:
 finally:
     srv_proc.kill()
     srv_proc.wait()
+print("BLOCK-END dashboard-core")
 PY
-)
 
 grep -q 'sort by %s' "$DB" && grep -q 'Gtk.Button' "$DB" && ok "po-dashboard headers are buttons labelled sort by <column>" || bad "dashboard header buttons"
 # bin/po-dashboard: argument handling needs no display.
@@ -2792,6 +3115,7 @@ out=$(python3 -B "$DB" --url http://h/x --team-url ftp://h/x 2>&1)
 [[ $? == 1 && $out == *'not an http'* ]] && ok "po-dashboard refuses a non-http team URL" || bad "dashboard team url" "$out"
 printf '[{"agent":"ada","state":"WORKING","now":"1.4","owns":["1.4"],"free":false},{"agent":"cy","state":"idle 3h","now":null,"owns":[],"free":true}]\n' >"$TMP/team.json"
 # --check prints the rows without a display (and needs no GTK).
+# helper
 python3 -I - "$SV/events.json" "$TMP/chk.port" <<'PY' &
 import http.server, sys, threading, time
 body = open(sys.argv[1], "rb").read()
@@ -2838,7 +3162,6 @@ out=$(env -u PO_DASHBOARD_DECISIONS_URL python3 -B "$DB" --url http://h/x --view
 out=$(env -u PO_DASHBOARD_PROJECTS_URL python3 -B "$DB" --url http://h/x --view projects 2>&1)
 [[ $? == 1 && $out == *'--projects-url'* && $out == *PO_DASHBOARD_PROJECTS_URL* ]] &&
 	ok "po-dashboard --view projects without a projects feed is a usage error" || bad "dashboard view projects" "$out"
-grep -q '"child-activated"' "$DB" && grep -q 'def open_project' "$DB" && ok "po-dashboard Projects cards activate on Enter/Space (child-activated), a no-op until v0.39" || bad "dashboard projects activate"
 grep -q 'Gtk.AccessibleProperty.LABEL\], \[c\["text"\]' "$DB" && grep -q 'set_tooltip_text(c\["text"\])' "$DB" && ok "po-dashboard Projects cards carry the light in tooltip and accessible label" || bad "dashboard projects label"
 out=$(PO_DASHBOARD_DECISIONS_URL="$TMP/decisions.json" PO_DASHBOARD_TEAM_URL="$TMP/team.json" python3 -B "$DB" --url "$CHK_URL" --check 2>&1)
 [[ $(tail -3 <<<"$out" | head -1) == "decisions:" && $(tail -2 <<<"$out" | head -1) == "legacy | 2.3 | orchard | Pick | waiting for: a ruling | asked "*" | https://chat.example.org/t/1" &&
@@ -2857,6 +3180,17 @@ out=$(env -u PO_DASHBOARD_DECISIONS_URL python3 -B "$DB" --url "$CHK_URL" --chec
 [[ $out != *'decisions:'* ]] && ok "po-dashboard --check without a decisions feed prints no decisions section" || bad "dashboard no decisions" "$out"
 out=$(python3 -B "$DB" --url "$CHK_URL" --decisions-url "http://127.0.0.1:1/" --check 2>&1)
 [[ $? == 2 && $out == *'cannot reach'* ]] && ok "po-dashboard --check with an unreachable decisions feed exits 2" || bad "dashboard check decisions unreachable" "$out"
+# --answer-url: http(s) only; none is read-only (no error); flag wins over env.
+out=$(python3 -B "$DB" --url "$CHK_URL" --answer-url ftp://h/x --check 2>&1)
+[[ $? == 1 && $out == *'not an http'* ]] && ok "po-dashboard refuses a non-http answer URL" || bad "dashboard answer url" "$out"
+out=$(PO_DASHBOARD_ANSWER_URL=ftp://h/x python3 -B "$DB" --url "$CHK_URL" --check 2>&1)
+[[ $? == 1 && $out == *'not an http'* ]] && ok "po-dashboard refuses a non-http PO_DASHBOARD_ANSWER_URL" || bad "dashboard answer url env" "$out"
+out=$(PO_DASHBOARD_ANSWER_URL=ftp://h/x python3 -B "$DB" --url "$CHK_URL" --answer-url http://h/a --check 2>&1)
+[[ $? == 0 && -n "$out" ]] && ok "po-dashboard --answer-url wins over PO_DASHBOARD_ANSWER_URL" || bad "dashboard answer precedence" "$out"
+out=$(python3 -B "$DB" --url "$CHK_URL" --answer-url http://h/a --check 2>&1)
+[[ $? == 0 && -n "$out" ]] && ok "po-dashboard --answer-url is accepted, --check runs (read-only)" || bad "dashboard answer check" "$out"
+out=$(python3 -B "$DB" --url "$CHK_URL" --answer-url " " --check 2>&1)
+[[ $? == 0 && -n "$out" ]] && ok "po-dashboard --answer-url blank is read-only (no error)" || bad "dashboard answer blank" "$out"
 kill "$CHK_PID" 2>/dev/null
 wait "$CHK_PID" 2>/dev/null
 out=$(python3 -B "$DB" --url "http://127.0.0.1:1/" --check 2>&1)
@@ -2864,6 +3198,7 @@ out=$(python3 -B "$DB" --url "http://127.0.0.1:1/" --check 2>&1)
 if python3 -c 'import gi; gi.require_version("Gtk", "4.0"); from gi.repository import Gtk' >/dev/null 2>&1; then
 	if [[ -n ${DISPLAY:-}${WAYLAND_DISPLAY:-} ]]; then
 		# UI smoke: the window comes up with data and saves a screenshot.
+		# helper
 		python3 -I - "$SV/events.json" "$TMP/shot.png" "$DB" "$TMP/decisions.json" "$TMP/shot-decisions.png" "$TMP/team-limit.json" "$TMP/shot-team.png" "$TMP/shot-reports.png" "$(dirname "$PO")/../examples/projects-feed.json" "$TMP/shot-projects.png" <<'PY' &&
 import http.server, subprocess, sys, threading
 body = open(sys.argv[1], "rb").read()
@@ -2885,13 +3220,97 @@ if r.returncode == 0 and len(sys.argv) > 10:
 sys.exit(r.returncode)
 PY
 			[[ -s $TMP/shot-projects.png ]] && ok "po-dashboard --view projects --screenshot saves the Projects pane" || bad "dashboard projects screenshot"
+		# Activating a Projects card (child-activated, as Enter/Space do) opens that project's screen.
+		# helper
+		out=$(timeout 60 python3 -I - "$DB" "$SV/events.json" "$(dirname "$PO")/../examples/projects-feed.json" 2>/dev/null <<'PY'
+import http.server, importlib.machinery, importlib.util, sys, threading
+sys.dont_write_bytecode = True
+import gi
+gi.require_version("Gtk", "4.0")
+from gi.repository import GLib, Gtk
+db, events, feed = sys.argv[1:4]
+body = open(events, "rb").read()
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def log_message(self, *a): pass
+srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+sys.argv = [db, "--url", "http://127.0.0.1:%d/" % srv.server_address[1], "--projects-url", feed, "--view", "projects"]
+loader = importlib.machinery.SourceFileLoader("po_dashboard", db)
+mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("po_dashboard", loader))
+loader.exec_module(mod)
+result = {"n": 0}
+def walk(w):
+    yield w
+    c = w.get_first_child()
+    while c:
+        yield from walk(c)
+        c = c.get_next_sibling()
+def tick():
+    result["n"] += 1
+    wins = Gtk.Window.list_toplevels()
+    nodes = [n for w in wins for n in walk(w)]
+    stacks = [n for n in nodes if isinstance(n, Gtk.Stack) and n.get_child_by_name("screen")]
+    cards = [n for n in nodes if isinstance(n, Gtk.FlowBoxChild)]
+    if stacks and cards and stacks[0].get_visible_child_name() == "overview":
+        cards[0].get_parent().emit("child-activated", cards[0])
+        GLib.timeout_add(200, check, stacks[0])
+        return False
+    if result["n"] > 100:
+        print("no project cards"); sys.exit(1)
+    return True
+def check(stack):
+    ok = stack.get_visible_child_name() == "screen"
+    print("opened" if ok else "stayed on " + str(stack.get_visible_child_name()))
+    sys.stdout.flush()
+    import os; os._exit(0 if ok else 1)
+GLib.timeout_add(100, tick)
+mod.main()
+PY
+		)
+		[[ $out == opened ]] && ok "po-dashboard Projects card activation opens the project screen" || bad "dashboard projects activate" "$out"
 			[[ -s $TMP/shot.png && -s $TMP/shot-decisions.png && -s $TMP/shot-team.png && -s $TMP/shot-reports.png ]] && ok "po-dashboard opens, loads events and saves a screenshot, also in the Decisions, Team (LIMIT and usage rows) and Reports views" || bad "dashboard ui smoke"
 	else
 		ok "po-dashboard UI smoke skipped: no display"
 	fi
 else
-	ok "po-dashboard UI smoke skipped: GTK 4 or PyGObject missing"
+\tok "po-dashboard UI smoke skipped: GTK 4 or PyGObject missing"
 fi
+
+# demo server POST /answers (v0.49).
+DEMO_OUT="$TMP/demo.out"
+python3 -B "$(dirname "$PO")/../examples/events-demo-server.py" --port 0 --every 999 >"$DEMO_OUT" 2>&1 &
+DEMO_PID=$!
+for _ in $(seq 1 50); do [[ -s "$DEMO_OUT" ]] && break; sleep 0.1; done
+DEMO_PORT=$(sed -n 's/.*127\.0\.0\.1:\([0-9]*\).*/\1/p' "$DEMO_OUT" | head -1)
+if [[ -n "$DEMO_PORT" ]]; then
+    # helper
+    if demo_out=$(python3 -B -I - "$DEMO_PORT" <<'PY'
+import http.client, json, sys
+port = int(sys.argv[1])
+def post(body, token=None):
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    h = {"Content-Type": "application/json"}
+    if token: h["Authorization"] = "Bearer " + token
+    c.request("POST", "/answers", json.dumps(body).encode(), h)
+    r = c.getresponse(); r.read(); c.close()
+    return r.status
+b = {"project": "harbor", "id": "ask-0808", "answer_id": "demo-uuid", "kind": "choice", "option": "Yes", "text": ""}
+assert post(b) == 401, "no token should be 401"
+assert post(b, "secret") == 201, "first answer should be 201"
+assert post(b, "secret") == 200, "repeat answer_id should be 200"
+assert post({"project": "harbor", "answer": "Yes"}, "secret") == 404, "missing id should be 404"
+PY
+    ); then
+    ok "demo server: POST /answers (401, 201, 200, 404)"
+else
+    bad "demo server: POST /answers" "$demo_out"
+fi
+else
+    ok "demo server: POST /answers skipped (server did not start)"
+fi
+kill $DEMO_PID 2>/dev/null; wait $DEMO_PID 2>/dev/null
 
 # po-dashboard-install.
 INST2=""$(cd "$(dirname "$PO")/.." && pwd)/bin/po-dashboard-install""
@@ -2919,11 +3338,295 @@ else
 	ok "dashboard-install: desktop-file-validate not installed (skipped)"
 fi
 
+# ---- the runner fails when a block dies (item AV) --------------------------
+# Throwaway copies of this runner's own prelude and tail around a deliberately
+# broken body: each must exit non-zero, never print "0 failed", and say why.
+RUNNER=$(readlink -f "${BASH_SOURCE[0]}")
+mkdir -p "$TMP/crash"
+mini() { # <name> <body>: a copy of the runner with <body> as its only content
+	{
+		sed -n '1,/^# expect <name>/p' "$RUNNER"
+		printf '%s\n' "$2"
+		sed -n '/^# ---- run end/,$p' "$RUNNER"
+	} >"$TMP/crash/$1.sh"
+}
+crash_case() { # <name> <want pattern> <body>
+	local out code
+	mini "$1" "$3"
+	out=$(bash "$TMP/crash/$1.sh" 2>&1)
+	code=$?
+	[[ $code != 0 ]] && ! grep -qE '[0-9] passed, 0 failed$' <<<"$out" && grep -qE -- "$2" <<<"$out" &&
+		ok "runner: $1 gives a non-zero exit, no '0 failed' line and '$2'" || bad "runner: $1 (exit $code)" "$out"
+}
+crash_case "a python block that raises" '^FAIL .*aborted \(exit 1\)' "block py python3 -I -c 'import sys; print(\"ok\tx\t\"); raise RuntimeError(\"boom\")'"
+crash_case "a shell block that exits 3" '^FAIL .*aborted \(exit 3\)' "block sh bash -c 'printf \"ok\tx\t\n\"; exit 3'"
+crash_case "a block that exits 0 without its marker" '^FAIL .*aborted \(no BLOCK-END marker\)' "block early bash -c 'printf \"ok\tx\t\n\"; exit 0'"
+crash_case "a block that ends with another name's marker" '^FAIL .*aborted \(no BLOCK-END marker\)' "block one bash -c 'echo \"BLOCK-END two\"'"
+# shellcheck disable=SC2016 # the body is the text of a broken runner
+crash_case "an unbound variable" '^RUN-ABORTED$' 'ok before; printf "%s\n" "$never_set_anywhere"; ok after'
+crash_case "an exit 0 in the runner" '^RUN-ABORTED$' 'ok before; exit 0'
+crash_case "an exit 3 in the runner" '^RUN-ABORTED$' 'ok before; exit 3'
+crash_case "a signal" '^RUN-ABORTED$' 'ok before; kill -TERM $$; sleep 5'
+mini clean 'ok first
+block good bash -c '"'"'printf "ok\tsecond\t\nok\tthird\t\nBLOCK-END good\n"'"'"
+out=$(bash "$TMP/crash/clean.sh" 2>&1)
+code=$?
+[[ $code == 0 && $(tail -1 <<<"$out") == '3 passed, 0 failed' && $(tail -2 <<<"$out" | head -1) == 'RUN-END 3 0 1' ]] &&
+	! grep -q '^RUN-ABORTED' <<<"$out" &&
+	ok "runner: a clean copy ends RUN-END 3 0 1 then '3 passed, 0 failed', exit 0" || bad "runner: clean copy (exit $code)" "$out"
+
+# po stamp on a fixture whose test count comes from such a runner.
+crash_count() { # the po-kit count command, run on the runner copy $1
+	printf 'bash -o pipefail -c '"'"'bash %s 2>&1 | sed -nE \\"s/^([0-9]+) passed, 0 failed$/test result: ok. \\\\1 passed; 0 failed/p; /^(RUN-END|RUN-ABORTED)/p\\"'"'"'' "$1"
+}
+rm -f "$W"/gate-*.txt
+for c in "a python block that raises" "a shell block that exits 3" "a block that exits 0 without its marker" "an unbound variable" "an exit 0 in the runner" "a signal"; do
+	f=${c// /_}
+	cp "$TMP/crash/$c.sh" "$TMP/crash/$f.sh"
+	COUNT_CMD=$(crash_count "$TMP/crash/$f.sh") SENTINEL=1 stamp_manifest check=true
+	out=$("$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>&1)
+	code=$?
+	[[ $code == 4 ]] && grep -qE 'test_count_cmd .*(exited|printed)' <<<"$out" && ! compgen -G "$W/gate-*.txt" >/dev/null &&
+		ok "stamp refuses (exit 4) a test count from a runner with $c, nothing written" || bad "stamp: $c (exit $code)" "$out"
+done
+COUNT_CMD=$(crash_count "$TMP/crash/clean.sh") SENTINEL=1 stamp_manifest check=true
+out=$("$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>&1)
+code=$?
+[[ $code == 0 ]] && grep -qx 'gate PASS: check   tests 3 passed' <<<"$out" &&
+	ok "stamp counts a clean copy of the runner (3 passed)" || bad "stamp: clean copy (exit $code)" "$out"
+rm -f "$W"/gate-*.txt
+# The sentinel rule itself, on canned output.
+COUNT_CMD="echo 'test result: ok. 5 passed; 0 failed'" SENTINEL=1 stamp_manifest check=true
+out=$("$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>&1)
+code=$?
+[[ $code == 4 ]] && grep -q 'printed no RUN-END sentinel' <<<"$out" && ! compgen -G "$W/gate-*.txt" >/dev/null &&
+	ok "stamp refuses (exit 4) a count with no RUN-END, naming why" || bad "stamp: no sentinel (exit $code)" "$out"
+COUNT_CMD="echo 'test result: ok. 5 passed; 0 failed'; echo 'RUN-END 5 0 1'; echo RUN-ABORTED" SENTINEL=1 stamp_manifest check=true
+out=$("$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>&1)
+code=$?
+[[ $code == 4 ]] && grep -q 'printed RUN-ABORTED' <<<"$out" && ! compgen -G "$W/gate-*.txt" >/dev/null &&
+	ok "stamp refuses (exit 4) a count beside a RUN-ABORTED line" || bad "stamp: RUN-ABORTED (exit $code)" "$out"
+COUNT_CMD="echo 'test result: ok. 5 passed; 0 failed'; echo 'RUN-END 5 0 1'" SENTINEL=1 stamp_manifest check=true
+out=$("$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>&1)
+code=$?
+[[ $code == 0 ]] && grep -qx 'gate PASS: check   tests 5 passed' <<<"$out" &&
+	ok "stamp takes a count that has RUN-END" || bad "stamp: sentinel present" "$out"
+rm -f "$W"/gate-*.txt
+COUNT_CMD="echo 'test result: ok. 5 passed; 0 failed'" stamp_manifest check=true
+out=$("$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>&1)
+code=$?
+[[ $code == 0 ]] && grep -qx 'gate PASS: check   tests 5 passed' <<<"$out" &&
+	ok "without run_sentinel a count needs no RUN-END (other projects' runners)" || bad "stamp: no run_sentinel key" "$out"
+rm -f "$W"/gate-*.txt
+printf '%s[gate]\ntest_count_cmd = "true"\nrun_sentinel = "yes"\n' "$GOOD_MANIFEST" >"$TMP/m.toml"
+expect "run_sentinel must be \"required\"" 2 'run_sentinel must be "required": yes' -- -C "$W" --manifest "$TMP/m.toml" stamp
+
+# Self-audit: a multi-check heredoc or `bash -c` block must go through `block`.
+audit=$(awk '
+	{ line = $0 }
+	line ~ /^[ \t]*#/ { prev = line; next }
+	(line ~ ("python" "3 [^<]* - [^<]*<<") || line ~ ("bash" " -c ")) && line !~ /^[ \t]*(block|crash_case) / && prev !~ /^[ \t]*# helper$/ {
+		printf "%d: %s\n", NR, line
+	}
+	{ prev = line }
+' "$RUNNER")
+[[ -z $audit ]] && ok "self-audit: every python and shell block goes through block (or is marked # helper)" ||
+	bad "self-audit: a block is not run through block" "$audit"
+
+# ---- po ready tests -------------------------------------------------------
+R2=$TMP/readyrepo
+make_repo "$R2"
+# add a candidate file + ready config
+cat >"$R2/ready.jsonl" <<'EOF'
+{"item":"v1.0.5","title":"Fifth","agents":["a"],"depends":["v1.0.2"],"needs_note":"docs/backlog/v1.md"}
+{"item":"v1.0.4","title":"Fourth","depends":["v1.0.9"],"needs_note":"docs/nope.md"}
+{"item":"v1.0.1","title":"done one"}
+{"item":"v1.0.5","title":"absent"}
+{"item":"v1.0.5","title":"corrected fifth"}
+malformed line here
+EOF
+# configure ready.file and project filter
+python3 - "$R2/po.toml" <<'PY2'
+import re,sys
+p=sys.argv[1]
+s=open(p).read()
+s=s.replace('[versioning]','[ready]\nfile = "ready.jsonl"\n\n[versioning]',1)
+open(p,'w').write(s)
+PY2
+# add a TODO item to the backlog
+python3 - "$R2" <<'PY2'
+import sys
+d=sys.argv[1]
+# backlog table row
+bp=d+"/docs/BACKLOG.md"
+s=open(bp).read()
+s=s.replace("| v1.0.2 | Second | DONE | backlog/v1.md |","| v1.0.2 | Second | DONE | backlog/v1.md |\n| v1.0.5 | Fifth | TODO | backlog/v1.md |")
+open(bp,"w").write(s)
+# spec heading
+sp=d+"/docs/backlog/v1.md"
+s=open(sp).read()
+s+="\n## v1.0.5 — Fifth — TODO\n"
+open(sp,"w").write(s)
+PY2
+git -C "$R2" add -A && git -C "$R2" commit -qm readycfg >/dev/null 2>&1
+
+# DONE excluded: v1.0.1 not in output
+out=$(cd "$R2" && "$PO" ready 2>&1); code=$?; echo "STDOUT: [$out]" >&2
+if grep -q "v1.0.1" <<<"$out"; then bad "ready: DONE excluded"; else ok "ready: DONE excluded"; fi
+# TODO with met depends + present note listed (v1.0.3 corrected)
+if grep -q "v1.0.5" <<<"$out" && grep -q "corrected fifth" <<<"$out"; then ok "ready: ready item listed"; else bad "ready: ready item listed" "$out"; fi
+# unmet depends excluded
+if grep -q "v1.0.4" <<<"$out"; then bad "ready: unmet depends excluded"; else ok "ready: unmet depends excluded"; fi
+# --json
+out=$(cd "$R2" && "$PO" ready --json 2>/dev/null)
+if python3 -c "import json,sys; d=json.load(sys.stdin); assert any(x['item']=='v1.0.5' for x in d)" <<<"$out" 2>/dev/null; then ok "ready: --json valid"; else bad "ready: --json valid" "$out"; fi
+# --explain reports reasons
+out=$(cd "$R2" && "$PO" ready --explain 2>&1)
+if grep -q "depends" <<<"$out" || grep -q "missing note" <<<"$out" || grep -q "absent" <<<"$out"; then ok "ready: --explain reasons"; else bad "ready: --explain reasons" "$out"; fi
+# malformed line reported with line number
+if grep -q "malformed line" <<<"$out"; then ok "ready: malformed line reported"; else bad "ready: malformed line reported" "$out"; fi
+# last-line-wins: corrected third title present already checked
+# [project] name (v0.46): the manifest accepts it, and po ready keeps the
+# shared file's lines for this project and those that name none.
+printf '{"item":"v1.0.5","title":"ours","project":"alpha"}\n{"item":"v1.0.5","title":"theirs","project":"beta"}\n' >"$TMP/ready-shared.jsonl"
+sed "s|^file = \"ready.jsonl\"|file = \"$TMP/ready-shared.jsonl\"|" "$R2/po.toml" >"$TMP/ready-project.toml"
+printf '\n[project]\nname = "alpha"\n' >>"$TMP/ready-project.toml"
+out=$("$PO" -C "$R2" --manifest "$TMP/ready-project.toml" ready 2>&1); code=$?
+[[ $code == 0 && $out == *'v1.0.5  ours'* && $out != *theirs* ]] &&
+	ok "ready: [project] name is a manifest key and filters a shared ready file" || bad "ready: [project] name (exit $code)" "$out"
+printf '\n[project]\nnmae = "alpha"\n' >"$TMP/ready-typo.toml"
+expect "manifest: a typo in [project] is an error" 2 "nmae" -- -C "$R2" --manifest "$TMP/ready-typo.toml" status
+
+# ---- po dispatch (item AS) -------------------------------------------------
+# A fake roster and ready list: ada is WORKING on 1.1, bo and cy are free, di
+# is free but only eligible where named. Order: cy first, then bo, then ada.
+DP=$TMP/dispatch
+mkdir -p "$DP/docs" "$DP/bin"
+git init -q -b main "$DP"
+git -C "$DP" config user.name t
+git -C "$DP" config user.email t@example.invalid
+cat >"$DP/docs/BACKLOG.md" <<'MD'
+# Backlog
+
+| Item | Status | Owner |
+|---|---|---|
+| v1.1 | DOING | ada |
+| v1.2 | TODO |  |
+| v1.3 | TODO |  |
+| v1.4 | TODO |  |
+| v1.5 | TODO |  |
+| v1.6 | TODO |  |
+MD
+cat >"$DP/ready.jsonl" <<'JL'
+{"item":"v1.2","title":"Two","agents":["ada","bo","cy"]}
+{"item":"v1.3","title":"Three","agents":["cy","bo"]}
+{"item":"v1.4","title":"Four","agents":["cy"]}
+{"item":"v1.5","title":"Five","agents":["nobody"]}
+{"item":"v1.6","title":"Six"}
+JL
+cat >"$DP/po.toml" <<'TOML'
+[versioning]
+tag = "v{version}"
+admin_prefix = "admin:"
+insert_segment = 2
+
+[layout]
+backlog = "docs/BACKLOG.md"
+specs_dir = "docs"
+worktrees = ".wt"
+branch = "item-v{version}"
+owner_column = "Owner"
+
+[ready]
+file = "ready.jsonl"
+
+[dispatch]
+order = ["cy", "bo", "ada"]
+notify = "printf '%s|%s|%s\\n' \"$1\" \"$2\" \"$(basename \"$3\")\" >>notified.txt; test -s \"$3\""
+
+[[team.agent]]
+name = "ada"
+
+[[team.agent]]
+name = "bo"
+
+[[team.agent]]
+name = "cy"
+
+[[team.agent]]
+name = "di"
+TOML
+echo notified.txt >"$DP/.gitignore"
+git -C "$DP" add -A
+git -C "$DP" commit -qm init
+printf '{"time":"%s","kind":"stamp","item":"v1.1","project":"dispatch","result":"pass","agent":"ada","legs":[],"detail":""}\n' \
+	"$(date -u -d "1 minute ago" +%Y-%m-%dT%H:%M:%SZ)" >"$DP/.git/po-events.jsonl"
+dp_before=$(git -C "$DP" rev-parse main)
+DPLAN=$("$PO" -C "$DP" dispatch --plan 2>&1)
+[[ $DPLAN == *'assign    v1.2  to cy'* && $DPLAN == *'assign    v1.3  to bo'* ]] &&
+	ok "dispatch --plan: cheapest free eligible agent first, in [dispatch] order" || bad "dispatch plan order" "$DPLAN"
+[[ $DPLAN == *'skip      v1.4  no free eligible agent'* ]] &&
+	ok "dispatch --plan: an agent already given an item this run gets no second" || bad "dispatch no double assignment" "$DPLAN"
+[[ $DPLAN == *'skip      v1.5  no roster agent is eligible'* ]] &&
+	ok "dispatch --plan: an item no roster agent may take is skipped with the reason" || bad "dispatch ineligible reason" "$DPLAN"
+[[ $DPLAN == *'assign    v1.6  to di'* && $DPLAN != *'to ada'* ]] &&
+	ok "dispatch --plan: an item with no agents list goes to any free agent; a WORKING agent gets nothing" || bad "dispatch open item, working agent" "$DPLAN"
+[[ $(git -C "$DP" rev-parse main) == "$dp_before" && ! -e $DP/.wt ]] &&
+	ok "dispatch --plan changes nothing" || bad "dispatch plan wrote"
+expect "dispatch needs --plan or --commit" 1 'give --plan or --commit' -- -C "$DP" dispatch
+expect "dispatch refuses both modes" 1 'not both' -- -C "$DP" dispatch --plan --commit
+# A failed open is reported and the others still go: v1.3 is made unopenable
+# (a taken worktree path) before the run.
+mkdir -p "$DP/.wt/item-v1.3"
+DCOM=$("$PO" -C "$DP" dispatch --commit 2>&1); dcode=$?
+[[ $dcode == 6 && $DCOM == *'FAILED    v1.3  to bo'* && $DCOM == *'opened    v1.2  for cy'* && $DCOM == *'opened    v1.6  for di'* ]] &&
+	ok "dispatch --commit: a failed open is reported (exit 6) and the run continues" || bad "dispatch failed open (exit $dcode)" "$DCOM"
+rmdir "$DP/.wt/item-v1.3"
+[[ $("$PO" -C "$DP" status 2>&1) == *v1.2* && -d $DP/.wt/item-v1.2 && -d $DP/.wt/item-v1.6 ]] &&
+	ok "dispatch --commit: opens through po open (worktrees made)" || bad "dispatch open effect"
+DEV=$(python3 -I -c '
+import json, sys
+for l in open(sys.argv[1]):
+    e = json.loads(l)
+    if e["kind"] == "open":
+        print(e["item"], e["agent"])' "$DP/.git/po-events.jsonl" | sort | paste -sd, -)
+[[ $DEV == '1.2 dispatcher,1.6 dispatcher' ]] &&
+	ok "dispatch --commit: the open events carry the agent dispatcher" || bad "dispatcher tag" "$DEV"
+[[ $(sort "$DP/notified.txt" | paste -sd, -) == 'v1.2|cy|v1.2.md,v1.6|di|v1.6.md' ]] &&
+	ok "dispatch --commit: notify runs once per opened item with item, agent and a prompt file" || bad "dispatch notify" "$(cat "$DP/notified.txt" 2>&1)"
+# po open --for fills the empty owner cell, so with no manual write a second run opens
+# only what is left: v1.3 for bo, and cy (now owning v1.2) gets no more.
+DAGAIN=$("$PO" -C "$DP" dispatch --commit 2>&1)
+[[ $(grep -c '^opened' <<<"$DAGAIN") == 1 && $DAGAIN == *'opened    v1.3  for bo'* && $DAGAIN == *'skip      v1.4  no free eligible agent'* && $(wc -l <"$DP/notified.txt") == 3 ]] &&
+	ok "dispatch --commit: a second run does not reopen what is open, nor give an owner a second item" || bad "dispatch idempotent" "$DAGAIN"
+DNONE=$("$PO" -C "$DP" dispatch --commit 2>&1)
+[[ $DNONE == *'dispatch: 0 opened'* && $(wc -l <"$DP/notified.txt") == 3 ]] &&
+	ok "dispatch --commit: with nothing left to give it is a no-op" || bad "dispatch no-op" "$DNONE"
+[[ $(grep -c '^| v1.[236] | DOING | \(cy\|bo\|di\) |$' "$DP/docs/BACKLOG.md") == 3 ]] &&
+	ok "dispatch --commit: po open --for wrote the owner cells itself" || bad "owner cells" "$(cat "$DP/docs/BACKLOG.md")"
+# Two consecutive runs on a clean repository: each agent at most once, then nothing.
+DQ=$TMP/dispatch2
+git clone -q "$DP" "$DQ" 2>/dev/null
+git -C "$DQ" reset -q --hard "$dp_before"
+git -C "$DQ" config user.name t
+git -C "$DQ" config user.email t@example.invalid
+printf '{"item":"v1.2","agents":["cy","bo"]}\n{"item":"v1.3","agents":["cy","bo"]}\n{"item":"v1.4","agents":["cy","bo"]}\n' >"$DQ/ready.jsonl"
+git -C "$DQ" commit -qam "ready"
+Q1=$("$PO" -C "$DQ" dispatch --commit 2>&1)
+Q2=$("$PO" -C "$DQ" dispatch --commit 2>&1)
+[[ $(grep -c '^opened' <<<"$Q1") == 2 && $Q1 == *'opened    v1.2  for cy'* && $Q1 == *'opened    v1.3  for bo'* && $Q1 == *'skip      v1.4  no free eligible agent'* ]] &&
+	ok "dispatch --commit twice: the first run gives each agent one item" || bad "dispatch run 1" "$Q1"
+[[ $(grep -c '^opened' <<<"$Q2") == 0 && $Q2 == *'dispatch: 0 opened, 1 skipped, 0 failed'* ]] &&
+	ok "dispatch --commit twice: the second run, with no owner written by hand, does nothing" || bad "dispatch run 2" "$Q2"
+
 # ---- private test blocks (absent from a public snapshot) -------------------
 for _t in "$KITROOT"/private/tests.d/*.sh; do
 	# shellcheck source=/dev/null
 	[[ -f "$_t" ]] && source "$_t"
 done
 
-printf '\n%s passed, %s failed\n' "$pass" "$fail"
+# ---- run end ---------------------------------------------------------------
+printf '\nRUN-END %s %s %s\n' "$pass" "$fail" "$nblocks"
+RUN_DONE=1
+printf '%s passed, %s failed\n' "$pass" "$fail"
 ((fail == 0))

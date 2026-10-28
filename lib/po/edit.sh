@@ -25,6 +25,7 @@ PO_EDIT_FILES=()         # repo paths with a planned edit, first-touched order
 declare -gA PO_EDIT_N=() # repo path -> scratch file number
 PO_EDIT_NOTES=()         # sources that carry no record of an edited item
 PO_EF=
+PO_EDIT_OWNER=          # when set, po_edit_table also writes it into an empty owner cell
 
 po_conflict() {
 	printf 'po: %s\n' "$*" >&2
@@ -188,6 +189,8 @@ po_edit_heading() {
 # backlog table row. Non-zero when no table row names it.
 po_edit_table() {
 	local version=$1 from=$2 to=$3 tpl tag backlog i j line in_table=0 status_col=-1 col=-1 hit=-1 n=0
+	local owner_name='' owner_col=-1 hit_owner=-1
+	[[ -z ${PO_MANIFEST[layout.owner_column]+x} ]] || owner_name=${PO_MANIFEST[layout.owner_column]}
 	tpl=$(po_get versioning.tag)
 	tag=$(po_fill "$tpl" "$version")
 	backlog=$(po_get layout.backlog)
@@ -200,9 +203,10 @@ po_edit_table() {
 		fi
 		po_split_row "$line"
 		if ((in_table == 0)); then
-			in_table=1 status_col=-1
+			in_table=1 status_col=-1 owner_col=-1
 			for j in "${!PO_CELLS[@]}"; do
 				[[ ${PO_CELLS[j]} == Status ]] && status_col=$j
+				[[ -n $owner_name && ${PO_CELLS[j]} == "$owner_name" ]] && owner_col=$j
 			done
 			continue
 		fi
@@ -213,7 +217,7 @@ po_edit_table() {
 		for j in "${!PO_CELLS[@]}"; do
 			po_unfill "$tpl" "${PO_CELLS[j]}" >/dev/null || continue
 			if [[ ${PO_CELLS[j]} == "$tag" ]]; then
-				n=$((n + 1)) hit=$i col=$status_col
+				n=$((n + 1)) hit=$i col=$status_col hit_owner=$owner_col
 			fi
 			break
 		done
@@ -232,6 +236,9 @@ po_edit_table() {
 			[[ $(po_trim "$cell") == "$from" ]] ||
 				po_conflict "$backlog:$((hit + 1)): the $tag row says '$(po_trim "$cell")', expected $from"
 			cell=${cell/"$from"/"$to"}
+		fi
+		if ((k == hit_owner)) && [[ -n $PO_EDIT_OWNER && -z $(po_trim "$cell") ]]; then
+			cell=" $PO_EDIT_OWNER "
 		fi
 		out+="$cell|"
 		k=$((k + 1))

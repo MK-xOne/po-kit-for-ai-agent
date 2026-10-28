@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """po-dashboard: a desktop window showing the gate events of a po serve.
 
-    po-dashboard [--url <url>] [--team-url <url>] [--decisions-url <url>] [--view events|team|decisions|reports] [--theme auto|light|dark] [--all] [--size WxH] [--check] [--screenshot <png>] [--screenshot-delay <s>]
+    po-dashboard [--url <url>] [--team-url <url>] [--decisions-url <url>] [--answer-url <url>] [--view events|team|decisions|reports] [--theme auto|light|dark] [--all] [--size WxH] [--check] [--screenshot <png>] [--screenshot-delay <s>]
 
 The URL is the events JSON (a JSON array or one object per line, e.g. the
 /events.json of `po serve`); --url or PO_DASHBOARD_URL, no default. GTK 4 and
@@ -13,7 +13,20 @@ JSON array of {agent, model?, state, now, owns[], free, limit_until?, usage?}; w
 --decisions-url or PO_DASHBOARD_DECISIONS_URL (no default) adds a Decisions view to the toggle, read-only:
 a JSON array of {project, item, title, waiting_for, asked_at, thread_url?, asked_by?, kind?, id?, ...}: Choices first, then
 Actions, then unformatted and legacy entries, oldest asked first in each group; an Actions toggle (saved in $XDG_CONFIG_HOME/po-dashboard/decisions.json)
-hides the Action entries. One line per entry, asked_at as "3h ago" (local time in the tooltip), thread_url as copyable muted text. Esc closes the window. Exit codes: 1 usage, 2 GTK or PyGObject missing
+hides the Action entries. One line per entry, asked_at as "3h ago" (local time in the tooltip), thread_url as copyable muted text. Esc closes the window.
+--answer-url or PO_DASHBOARD_ANSWER_URL (no default; --answer-url wins) sets an http(s) answer sink:
+when it is set, expanded decision cards gain pick controls (one radio row per option plus an
+`or write your own` text box for a Choice; Pass and Failed with a step chooser and note for an
+Action; a free-text box for an unformatted entry) and a Send button that POSTs one JSON object
+{answer_id, id, project, item, kind, option, text, result, step, note, answered_at, client} per
+answer; PO_DASHBOARD_ANSWER_TOKEN (env only, never a flag) is sent as a bearer token. The card
+shows the result: `answered · sent` (muted, controls disabled; 200/201), `already answered`
+(409, controls disabled), `no longer waiting` (404), `refused by <host>: <code>` (401/403) or
+`not sent: <reason>` (anything else or no connection), each failed state with a Retry button that
+re-posts the same body. The POST runs in a worker thread and never blocks the UI; the answer
+state is kept in the window state keyed by id, re-applied on rebuild, pruned when the entry
+leaves the feed. Without the sink the view stays read-only (`read-only` shown once in the
+status line). No Enter-to-send, no confirmation dialog. Exit codes: 1 usage, 2 GTK or PyGObject missing
 (or, with --check, the feed unreachable).
 """
 import argparse
@@ -62,6 +75,7 @@ def main():
     ap.add_argument("--team-url", help="team feed JSON URL or file (default: $%s; none = no Team view)" % core.TEAM_URL_ENV)
     ap.add_argument("--decisions-url", help="decisions feed JSON URL or file (default: $%s; none = no Decisions view)" % core.DECISIONS_URL_ENV)
     ap.add_argument("--projects-url", help="projects feed JSON URL or file (default: $%s; none = no Projects view)" % core.PROJECTS_URL_ENV)
+    ap.add_argument("--answer-url", help="where to POST answers (default: $%s; none = read-only Decisions)" % core.ANSWER_URL_ENV)
     ap.add_argument("--view", choices=("events", "team", "decisions", "projects", "reports"), default="events", help="the view to start in (team, decisions and projects need their feed)")
     ap.add_argument("--project", metavar="NAME", help="with --view projects: open straight on this project's screen")
     ap.add_argument("--theme", choices=("auto", "light", "dark"), default="auto")
@@ -82,6 +96,7 @@ def main():
         team_url = core.resolve_team_url(a.team_url)
         decisions_url = core.resolve_decisions_url(a.decisions_url)
         projects_url = core.resolve_projects_url(a.projects_url)
+        answer_url = core.resolve_answer_url(a.answer_url)
     except core.DashboardError as e:
         die(str(e))
     if a.view == "team" and not team_url:
@@ -200,6 +215,10 @@ def main():
             self.filter_path = core.decisions_filter_path()
             self.actions_shown = core.load_actions_shown(self.filter_path)  # the viewer's own Actions filter
             self.decisions_text = None
+            self.answer_url = answer_url
+            self.answer_token = os.environ.get(core.ANSWER_TOKEN_ENV, "")
+            self.answers = {}  # entry id -> {"answer_id": str, "body": dict, "display": str}
+            self.read_only_said = False  # shows "read-only" once in the status line
             self.view = "events"
             self.events_failed = False
             self.team_failed = False
@@ -601,8 +620,15 @@ def main():
             if self.view == "decisions":
                 if self.decisions_failed:
                     self.status.set_text("decisions not updated")
+                elif self.decisions_text is not None:
+                    base = core.decisions_status(*self.decisions_counts())
+                    if self.answer_url is None and not self.read_only_said:
+                        self.read_only_said = True
+                        self.status.set_text(base + " · read-only")
+                    else:
+                        self.status.set_text(base)
                 else:
-                    self.status.set_text(core.decisions_status(*self.decisions_counts()) if self.decisions_text is not None else "loading…")
+                    self.status.set_text("loading…")
             elif self.view == "team":
                 if self.team_failed:
                     self.status.set_text("team not updated")
@@ -828,7 +854,7 @@ def main():
                     card.add_css_class("po-fade-%d" % step)
                 self.cards.append((card, key, step))
                 for (key, _title, width, widest, grow), group in zip(core.COLUMNS, groups):
-                    cls = "po-" + r["result_class"] if key == "result" else "po-muted" if key in ("kind", "legs", "agent", "time") else "po-text"
+                    cls = "po-" + r["result_class"] if key == "result" else "po-warn" if key == "took" and r["slow"] else "po-muted" if key in ("kind", "legs", "agent", "took", "time") else "po-text"
                     lab = self.label(r[key], cls, width_chars=width, max_width_chars=widest, hexpand=grow, ellipsize=3)
                     lab.set_tooltip_text(r[key])
                     group.add_widget(lab)
@@ -883,6 +909,8 @@ def main():
 
         def redraw_decisions(self):
             self.decisions_expanded = core.prune_expanded(self.decisions_expanded, self.decisions)
+            answer_ids = {str(e.get("id") or "") for e in self.decisions if e.get("id")}
+            self.answers = {k: v for k, v in self.answers.items() if k in answer_ids}
             child = self.decisions_list.get_first_child()
             while child is not None:
                 nxt = child.get_next_sibling()
@@ -918,6 +946,8 @@ def main():
                 expanded = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
                 expanded.set_visible(key in self.decisions_expanded)
                 self.fill_decision(expanded, r)
+                if r["kind"] != "legacy" and r["id"]:
+                    self.fill_answer(expanded, r, key)
                 # collapsed header: click toggles the full waiting_for
                 header = Gtk.Button()
                 header.set_child(top)
@@ -970,6 +1000,142 @@ def main():
         def on_decision_toggle(self, _button, box, key):
             self.decisions_expanded = core.toggle_expanded(self.decisions_expanded, key)
             box.set_visible(key in self.decisions_expanded)
+
+        def fill_answer(self, box, r, key):
+            """The answer controls (or sent/failed state) at the bottom of an expanded card."""
+            aid = r["id"]
+            ans = self.answers.get(aid)
+            if ans:
+                box.append(self.label(ans["display"], core.answer_state_class(ans["display"]), margin_top=6))
+                if core.answer_needs_retry(ans["display"]):
+                    retry = Gtk.Button(label="Retry")
+                    retry.add_css_class("po-small")
+                    retry.connect("clicked", self.on_retry_answer, aid)
+                    box.append(retry)
+                return
+            if not self.answer_url:
+                box.append(self.label("read-only", "po-muted", margin_top=6))
+                return
+            # read-write: controls based on kind. picks holds the draft in a closure dict.
+            picks = {"choice": None, "text": "", "result": None, "step": None, "note": ""}
+            controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, margin_top=6)
+            send = Gtk.Button(label="Send")
+            send.add_css_class("po-small")
+            send.set_sensitive(False)
+            if r["kind"] == "choice":
+                group = None
+                for n, o in enumerate(r["options"]):
+                    btn = Gtk.ToggleButton(label=o["label"], group=group)
+                    if group is None:
+                        group = btn
+                    btn.connect("toggled", self.on_choice_pick, aid, o["label"], send, picks)
+                    controls.append(btn)
+                write_in = Gtk.Entry()
+                write_in.set_placeholder_text("or write your own")
+                write_in.connect("changed", self.on_answer_note, aid, send, picks)
+                controls.append(write_in)
+            elif r["kind"] == "action":
+                group = None
+                for label in ("Pass", "Failed"):
+                    btn = Gtk.ToggleButton(label=label, group=group)
+                    if group is None:
+                        group = btn
+                    btn.connect("toggled", self.on_action_result, aid, label, send, picks)
+                    controls.append(btn)
+                step_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, visible=False)
+                for n in range(1, len(r["steps"]) + 1):
+                    btn = Gtk.Button(label=str(n))
+                    btn.set_size_request(32, -1)
+                    btn.connect("clicked", self.on_action_step, aid, n, send, picks)
+                    step_box.append(btn)
+                controls.append(step_box)
+                note = Gtk.Entry()
+                note.set_placeholder_text("note")
+                note.connect("changed", self.on_answer_note, aid, send, picks)
+                controls.append(note)
+                picks["step_box"] = step_box
+            else:  # unformatted
+                text = Gtk.Entry()
+                text.set_placeholder_text("Type your answer…")
+                text.set_hexpand(True)
+                text.connect("changed", self.on_answer_text, aid, send, picks)
+                controls.append(text)
+            send.connect("clicked", self.on_send_answer, aid, r, picks)
+            controls.append(send)
+            box.append(controls)
+
+        def on_choice_pick(self, button, aid, label, send, picks):
+            """A choice radio was toggled; store the option and enable Send."""
+            if button.get_active():
+                picks["choice"] = label
+                send.set_sensitive(True)
+            else:
+                picks["choice"] = None
+                send.set_sensitive(False)
+
+        def on_action_result(self, button, aid, label, send, picks):
+            """Pass/Failed was toggled; Failed shows the step chooser and enables Send only after a step."""
+            if not button.get_active():
+                return
+            if label == "Failed" and picks.get("step_box"):
+                picks["step_box"].set_visible(True)
+            picks["result"] = label
+            if label == "Pass":
+                send.set_sensitive(True)
+
+        def on_action_step(self, button, aid, step, send, picks):
+            """A step number was chosen for Failed; enable Send."""
+            picks["step"] = step
+            send.set_sensitive(True)
+
+        def on_answer_note(self, entry, aid, send, picks):
+            """The note or write-your-own text box changed."""
+            picks["note"] = entry.get_text().strip()
+            # Send stays enabled only when a choice option is picked, or for Failed with a step
+            ready = picks["choice"] is not None or (picks["result"] == "Failed" and picks.get("step") is not None)
+            send.set_sensitive(ready)
+
+        def on_answer_text(self, entry, aid, send, picks):
+            """The unformatted text box changed; enable Send when non-empty."""
+            text = entry.get_text().strip()
+            picks["text"] = text
+            send.set_sensitive(bool(text))
+
+        def on_send_answer(self, button, aid, r, picks):
+            """Build the body, stash the draft, POST in a worker thread."""
+            kind = r["kind"]
+            params = {}
+            if kind == "choice":
+                params["option"] = picks["choice"]
+                params["text"] = picks["note"]
+            elif kind == "action":
+                params["result"] = picks["result"]
+                params["step"] = picks.get("step")
+                params["note"] = picks["note"]
+            else:  # unformatted
+                params["text"] = picks["text"]
+            body = core.answer_body(r, core.answer_id(), **params)
+            self.answers[aid] = {"answer_id": body["answer_id"], "body": body, "display": "sending…"}
+            button.set_sensitive(False)
+            threading.Thread(target=self._send_answer, args=(aid, body), daemon=True).start()
+
+        def on_retry_answer(self, button, aid):
+            """Re-post the same body (same answer_id)."""
+            body = self.answers[aid]["body"]
+            self.answers[aid]["display"] = "sending…"
+            button.set_sensitive(False)
+            threading.Thread(target=self._send_answer, args=(aid, body), daemon=True).start()
+
+        def _send_answer(self, aid, body):
+            """Worker thread: POST and queue the state update on the main thread."""
+            display = core.post_answer(self.answer_url, body, self.answer_token)
+            GLib.idle_add(self.on_answer_state, aid, display)
+
+        def on_answer_state(self, aid, display):
+            """The POST finished; store the display string and redraw the card."""
+            if aid in self.answers:
+                self.answers[aid]["display"] = display
+                self.redraw_decisions()
 
         def make_movable(self, card, agent):
             """Drag the line onto another to take its place; Alt+Up/Down moves the focused line."""

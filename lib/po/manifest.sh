@@ -9,10 +9,14 @@
 #     values are shell commands, kept in file order
 #   - `key = "basic string"` or `key = 123`, optionally followed by a
 #     `# comment`; the only escapes are \" and \\
+#   - `[[team.agent]]`, repeatable: one roster entry each, with the string keys
+#     `name` (required, unique), `model` and `role`, kept in file order
 #   - `key = ["a", "b"]`, a one-line array of basic strings, only for the
 #     keys in PO_ARRAYS; kept as its strings joined by newlines
-# Sections and keys are checked against the schema below: a typo is an
-# error, not a silently ignored setting.
+#   - `[project] name = "..."`, optional: a label the kit uses to filter a
+#     shared `[ready] file` per repo (used by `po ready`)
+# Sections and keys are checked against the schema below: a typo is an error,
+# not a silently ignored setting.
 
 # section.key -> 1 (required) or 0 (optional). The keys items B-E use are
 # known now so a manifest written once stays valid as the kit grows.
@@ -20,6 +24,7 @@ declare -gA PO_SCHEMA=(
 	[gate.command]=0
 	[gate.test_count_cmd]=0
 	[gate.test_format]=0
+	[gate.run_sentinel]=0
 	[versioning.scheme]=0
 	[versioning.tag]=1
 	[versioning.item_commit]=0
@@ -38,6 +43,13 @@ declare -gA PO_SCHEMA=(
 	[kickoff.preamble]=0
 	[close.checklist]=0
 	[stamp.prepare]=0
+	[stamp.slow_after]=0
+	[project.name]=0
+	[team.limits_file]=0
+	[team.usage_file]=0
+	[ready.file]=0
+	[dispatch.order]=0
+	[dispatch.notify]=0
 )
 
 # The keys whose value is an array of strings, not a string or an integer.
@@ -45,12 +57,14 @@ declare -gA PO_ARRAYS=(
 	[kickoff.preamble]=1
 	[close.checklist]=1
 	[stamp.prepare]=1
+	[dispatch.order]=1
 )
 
 # Defaults for optional keys the kit reads.
 declare -gA PO_DEFAULTS=(
 	[layout.main]=main
 	[versioning.tag_style]=light
+	[stamp.slow_after]=300
 )
 
 # The parsed manifest: section.key -> value.
@@ -58,6 +72,10 @@ declare -gA PO_MANIFEST=()
 PO_MANIFEST_FILE=
 # [gate.legs] names in file order; each command is PO_MANIFEST[gate.legs.<name>].
 PO_GATE_LEGS=()
+# The [[team.agent]] roster, in file order: parallel arrays.
+PO_TEAM_NAME=()
+PO_TEAM_MODEL=()
+PO_TEAM_ROLE=()
 
 po_die() {
 	printf 'po: %s\n' "$*" >&2
@@ -72,6 +90,8 @@ po_manifest_load() {
 	PO_MANIFEST=()
 	PO_MANIFEST_FILE=$file
 	PO_GATE_LEGS=()
+	PO_TEAM_NAME=() PO_TEAM_MODEL=() PO_TEAM_ROLE=()
+	local in_agent=0 n
 	while IFS= read -r line || [[ -n $line ]]; do
 		lineno=$((lineno + 1))
 		local where="$file:$lineno"
@@ -80,7 +100,13 @@ po_manifest_load() {
 		line=${line#"${line%%[![:blank:]]*}"}
 		line=${line%"${line##*[![:blank:]]}"}
 		[[ -z $line || $line == '#'* ]] && continue
+		if [[ $line == '[[team.agent]]' ]]; then
+			section=team.agent in_agent=1
+			PO_TEAM_NAME+=("") PO_TEAM_MODEL+=("") PO_TEAM_ROLE+=("")
+			continue
+		fi
 		if [[ $line =~ ^\[([a-z0-9_]+|gate\.legs)\]$ ]]; then
+			in_agent=0
 			section=${BASH_REMATCH[1]}
 			[[ -n ${seen_sections[$section]:-} ]] &&
 				po_die "$where: section [$section] appears twice"
@@ -96,6 +122,21 @@ po_manifest_load() {
 		key=${BASH_REMATCH[1]}
 		rest=${BASH_REMATCH[2]}
 		[[ -n $section ]] || po_die "$where: key '$key' before any [section]"
+		if ((in_agent)); then
+			n=$((${#PO_TEAM_NAME[@]} - 1))
+			[[ $key == name || $key == model || $key == role ]] ||
+				po_die "$where: unknown key '$key' in [[team.agent]]"
+			[[ $rest == '"'* ]] || po_die "$where: '$key' in [[team.agent]] must be a \"quoted string\""
+			po_manifest_string "$rest" "$where" || exit 2
+			value=$PO_PARSED
+			case $key in
+			name) [[ -z ${PO_TEAM_NAME[n]} ]] || po_die "$where: key 'name' in [[team.agent]] set twice"
+				PO_TEAM_NAME[n]=$value ;;
+			model) PO_TEAM_MODEL[n]=$value ;;
+			role) PO_TEAM_ROLE[n]=$value ;;
+			esac
+			continue
+		fi
 		local full="$section.$key"
 		[[ $section == gate.legs || -n ${PO_SCHEMA[$full]+x} ]] ||
 			po_die "$where: unknown key '$key' in [$section]"
@@ -131,6 +172,16 @@ po_manifest_load() {
 		po_die "$file: [versioning] tag_style must be \"light\" or \"annotated\": ${PO_MANIFEST[versioning.tag_style]}"
 	[[ -z ${PO_MANIFEST[gate.test_format]+x} || ${PO_MANIFEST[gate.test_format]} == libtest || ${PO_MANIFEST[gate.test_format]} == pytest ]] ||
 		po_die "$file: [gate] test_format must be \"libtest\" or \"pytest\": ${PO_MANIFEST[gate.test_format]}"
+	[[ -z ${PO_MANIFEST[gate.run_sentinel]+x} || ${PO_MANIFEST[gate.run_sentinel]} == required ]] ||
+		po_die "$file: [gate] run_sentinel must be \"required\": ${PO_MANIFEST[gate.run_sentinel]}"
+	local i j
+	for i in "${!PO_TEAM_NAME[@]}"; do
+		[[ -n ${PO_TEAM_NAME[i]} ]] || po_die "$file: [[team.agent]] number $((i + 1)) needs a non-empty \"name\""
+		for ((j = 0; j < i; j++)); do
+			[[ ${PO_TEAM_NAME[j]} != "${PO_TEAM_NAME[i]}" ]] ||
+				po_die "$file: [[team.agent]] name '${PO_TEAM_NAME[i]}' appears twice"
+		done
+	done
 	local required
 	for required in "${!PO_SCHEMA[@]}"; do
 		[[ ${PO_SCHEMA[$required]} == 1 && -z ${PO_MANIFEST[$required]+x} ]] &&

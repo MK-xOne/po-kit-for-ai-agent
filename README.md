@@ -12,6 +12,7 @@ branch is fresh, close the item (fast-forward, tag, record), and prune.
 It suits a workflow with a product owner (a person or an agent) who opens and
 closes items, and developers (people or agents) who each work one item in its
 own branch and worktree. It is opinionated: one item is one commit is one tag.
+See AGENTS.md for the dev/PO cadence, including the rule that an item changing behaviour updates or deletes the tests that pinned it.
 
 Three laws, non-negotiable:
 - **Dry-run is the default mode, not a flag.** Nothing writes without
@@ -89,6 +90,7 @@ po [-C <repo>] [--manifest <file>] open <version|next> [<title>] [--for <name>] 
 po [-C <repo>] [--manifest <file>] close <version> [--next <version> [--next-title <title>] [--for <name>]]
                                          [--also-done <version>]... [--body-file <f>] [--commit]
 po [-C <repo>] [--manifest <file>] kickoff <version>
+po [-C <repo>] [--manifest <file>] team [--json]
 po [-C <repo>] [--manifest <file>] serve [--bind <addr>] [--port <n>]
 po version
 po doctor
@@ -121,6 +123,18 @@ the same from any worktree.
   with no worktree). `--idle <minutes>` also lists the DOING items idle
   longer under `IDLE (n)` and exits 8 after printing everything; without
   it the exit codes are unchanged (3 outranks 8). Read-only.
+- `po ready` — the ready list from backlog status. Reads the repo's
+  candidate file (`[ready] file` in po.toml, JSON lines
+  `{item, title?, agents[], depends[], needs_note?}`; one repo may point at
+  a shared file with a `project` field filtered by `[project] name`) and
+  prints only items that can run now: the item's status on main is TODO (a
+  DONE, DOING, HELD, PAUSED, BLOCKED item or an item absent from the backlog
+  is never listed), every `depends` item is DONE, and `needs_note`, when
+  present, names a repo path (a design note) that must exist on main; a line
+  is later overridden by a corrected line for the same item (last wins).
+  `--json` prints a JSON array; `--explain` prints per-candidate exclusion
+  reasons to stderr. Exit 0 always for a readable list; a malformed line is
+  reported with its line number and skipped. Read-only.
 - `po prune` — worktrees and branches merged into main, minus the main
   worktree, open items' branches, and anything dirty, locked or outside
   `[layout] worktrees` (each listed with its reason). `--commit` removes
@@ -177,6 +191,12 @@ the same from any worktree.
   leg and cross-checked the same way. A summary naming `failed` or
   `error`/`errors`, or no passed tests, exits 4; so does output with no
   pytest summary.
+
+  A line `RUN-ABORTED` in a leg's or the count command's output exits 4, and
+  with `[gate] run_sentinel = "required"` so does a count command whose output
+  has no `RUN-END ...` line (a test runner prints it last but for its summary).
+  A count command that pipes the runner should keep the runner's exit code
+  (`bash -o pipefail -c '...'`).
 - `po fresh <version>` — the item branch (`[layout] branch`) against the
   local main: ahead/behind, the merge-base, and every main commit since
   it, oldest first, classed ADMIN (`admin_prefix`), ITEM vX
@@ -233,8 +253,9 @@ the same from any worktree.
   One JSON object per line: `time` (ISO 8601, UTC), `kind` (`stamp`, `open`,
   `close`), `item` (null off an item branch), `project` (the checkout's
   directory name), `result` (`pass`, `fail`), `agent` (`$BUZZ_AGENT`, else the
-  user), `legs` (each leg's `name` and `result`: `pass`, `fail`, or `skip` when
-  an earlier leg failed) and `detail` (why a stamp failed). A failed stamp
+  user), `legs` (each leg's `name`, `result`: `pass`, `fail`, or `skip` when
+  an earlier leg failed, and, on a stamp, `seconds`), for a stamp the run's
+  own `seconds`, and `detail` (why a stamp failed). A failed stamp
   also has the failing leg's `tail` (its last 40 lines, redacted, one string
   with `\n` between lines) and `log` (the absolute path of the run's full
   output, null when it could not be written); see `po stamp`. Logging never
@@ -244,6 +265,20 @@ the same from any worktree.
   tail, indented, under a line naming the leg and the log; `--all` prints
   every event; `--json` prints the stored lines (UTC) for machines; the two
   combine.
+
+  **Time taken.** A stamp event records whole seconds of wall clock: each
+  leg's `seconds` (from the leg starting to its exit; a leg not reached has
+  `seconds` 0; the `prepare` leg is the time of its lines) and, after `legs`,
+  the run's `seconds` (prepare plus legs; the test-count command is in the
+  run, not a leg). Older events, and open and close events, have no
+  `seconds`: every reader treats that as unknown, never 0. `po events` adds a
+  `TOOK` column (`57s`, `4m12s`, `1h02m03s`, `-` when unknown), shows each
+  leg's time after its result (`test:pass(4m09s)`; no suffix when unknown),
+  and prints the word `slow` after the time of a run over `[stamp]
+  slow_after`; `--json` carries the raw keys. The mark is information only:
+  no exit code changes. **The trigger:** when a gate goes over about 5
+  minutes (the `slow` mark), the PO specs a fast per-item gate and runs the
+  full suite nightly and before each release. Those tiers are not built.
 - `po open <version|next> [<title>]` — the founding boundary. A new number
   must be latest founded + 1 (`next`), an epoch step with `--epoch`
   (1.10.0, 2.0.0), or the next insert in the `insert_segment`-th segment
@@ -302,9 +337,13 @@ the same from any worktree.
   leg: exit 4, nothing written, later lines and the gate not run, the
   `prepare` leg failed with its tail (the output of every line so far) and
   the full output in the stamp log. Absent or `[]`, `po stamp` is
-  unchanged. A value that is not an array of quoted strings, or any other
-  key under `[stamp]`, is a manifest error (2); `po doctor` lists the key as
-  `adopt [stamp] prepare` for a manifest without it.
+  unchanged. A value that is not an array of quoted strings, or any key
+  under `[stamp]` other than `prepare` and `slow_after`, is a manifest error
+  (2); `po doctor` lists the key as `adopt [stamp] prepare` for a manifest
+  without it.
+- `[stamp] slow_after` — an optional integer, seconds (default 300): a stamp
+  run that took longer is marked `slow` in `po events` and in the
+  dashboard. Information only.
 - The backlog edits both make are status words only — a spec heading's
   status word, a table row's Status cell, the one status word after the
   item's id in BACKLOG prose (`v1.9.11 parser TODO` → `DOING`; a close
@@ -315,13 +354,62 @@ the same from any worktree.
   whole plan — steps, the edits as a diff, the admin message, `--commit`
   readiness — and change nothing. Exit 6: refused by the item law.
 
+- `po team [--json]` — the feed the dashboard Team view reads
+  (`--team-url`, below), built from what the kit knows, read-only. The roster is
+  the manifest's `[[team.agent]]` tables, in file order: `name` (required,
+  unique, matched without regard to case), optional `model` and `role`. Per
+  agent it prints `{agent, model?, state, now, owns[], free, limit_until?,
+  usage?}` (`--json`: one JSON array; otherwise a table). `state` is
+  `WORKING`, or `idle <time>` (`22m`, `3h`, `2d`; `idle never` with no event)
+  from the age of the agent's newest event in the gate event log (`BUZZ_AGENT`
+  or the user name is the event's agent). `owns` is the open items (DOING,
+  PAUSED, BLOCKED) whose `[layout] owner_column` cell names the agent, by
+  version; without that key nobody owns anything. An agent is `WORKING`, with
+  `now` its lowest-numbered DOING item, while it owns a DOING item and its
+  newest event is under 15 minutes old. `free` is true for an agent that is
+  not WORKING and either owns nothing, or has been idle 15 minutes or more
+  with every owned item held (PAUSED or BLOCKED, waiting on someone else);
+  an agent with a DOING item is never free. Host facts are not probed:
+  `[team] limits_file` (a JSON object, agent to an ISO time or `null`) and
+  `usage_file` (agent to `{five_hour, seven_day}`, numbers) are merged into
+  `limit_until` and `usage` when the files exist; a missing file is ignored,
+  an unreadable one warns on stderr and is left out (both need `python3`;
+  paths are relative to the main worktree). An empty roster is an error (2).
+  `po serve` exposes the same array at `/team.json`. `examples/team.po.toml`
+  is a sample roster.
+- `po dispatch --plan | --commit` — gives the ready items to the free eligible
+  agents. For each item of `po ready --json`, in that order, the first agent of
+  `po team --json` that is `free` and eligible gets it: an item whose `agents`
+  list is non-empty is eligible only to those names (case-insensitive), one
+  with no list to any roster agent. Candidates are tried in the order of
+  `[dispatch] order` (a one-line array of names, cheapest first; agents not
+  named come after, in roster order). An agent gets at most one item per run,
+  and an agent that is not free (WORKING, or owning an item) never gets one.
+  `--plan` prints one `assign <item> to <agent>` or `skip <item> <reason>` line
+  per ready item (`no free eligible agent`, `no roster agent is eligible`) and
+  changes nothing. `--commit` runs `po open <item> --for <agent> --commit` for
+  each assignment with `BUZZ_AGENT=dispatcher`, so the open events carry the
+  agent `dispatcher` (a fixed name); a failed open is reported (`FAILED`) and the
+  run goes on, then exits 6. After each open it writes the item's prompt (a
+  first line `<item> → <agent> · PROMPT`, then `po kickoff`) to
+  `<git dir>/po-dispatch/<item>.md` and runs the optional `[dispatch] notify`
+  command (`sh -c`, in the main worktree) with three arguments: the item, the
+  agent and the prompt path; the kit knows no chat, a wrapper command posts
+  the message. A second run finds the opened items DOING and opens nothing
+  twice. `po open <item> --for <agent>` writes the agent into the item's
+  empty `owner_column` cell in its own admin commit (a cell already naming
+  another agent is refused, exit 3), so `po team` sees the agent as busy and
+  a repeated run gives no agent a second item. Needs `python3`.
 - `po serve [--bind <addr>] [--port <n>]` — a small read-only web viewer of the
   gate events, for a screen you leave open. `/` shows the last 10 events, newest on top,
   one row each: result (symbol and word), item, project, kind, checks (each
-  gate leg and its result), agent, time, and a note icon when the event has a
+  gate leg and its result), agent, took (the run's time, `-` when unknown,
+  in the warning colour when over `[stamp] slow_after`; `po serve` reads the
+  threshold from po.toml, `PO_SLOW_AFTER` sets it for `po-dashboard`, default
+  300), time, and a note icon when the event has a
   detail (its tooltip and aria-label are the detail, then, for a failed
   stamp, the failing leg's tail and the log's path); each row links to `/all`,
-  the full list, in the same layout; `/events.json` is the same data as JSON. The pages poll it every
+  the full list, in the same layout; `/events.json` is the same data as JSON, and `/team.json` is `po team --json`. The pages poll it every
   few seconds and redraw in place; times are UTC in the data and shown in the
   browser's local time. Every field is HTML-escaped. It reads events only by
   running `po events --json` (so it needs a po that has `po events`) and needs
@@ -334,7 +422,8 @@ the same from any worktree.
 - `po-dashboard [--url <url>] [--team-url <url>] [--decisions-url <url>] [--projects-url <url>] [--view events|team|decisions|projects|reports] [--project <name>] [--theme auto|light|dark] [--all] [--size WxH] [--check] [--screenshot <png>] [--screenshot-delay <s>]`
   (`bin/po-dashboard`, not a `po` subcommand) — a desktop window for the same
   events: the last 10 as soft raised single-line cards (result, item, project,
-  kind, checks, agent, time in the local zone, note) in fixed columns that line
+  kind, checks, agent, took (sortable like the others; `-` when unknown,
+  the warning colour when slow), time in the local zone, note) in fixed columns that line
   up from card to card, long values ellipsized with the full text as a tooltip,
   the project and checks columns widening with the window, and a note icon for
   an event with a detail (tooltip and accessible label are the detail, with
@@ -403,8 +492,12 @@ the same from any worktree.
   hides the Action entries and the status line says `3 waiting · 1 action hidden`; its
   state is saved on the viewer's machine in `$XDG_CONFIG_HOME/po-dashboard/decisions.json`
   (`{"actions": false}`; `PO_DASHBOARD_DECISIONS_FILTER` names another file; a missing or
-  broken file means on). Nothing is sent anywhere: answering a decision is not in the window.
-  Esc closes it. `--check` prints the rows the window would show, without a
+  broken file means on). `--answer-url` or `PO_DASHBOARD_ANSWER_URL` (no default; the flag
+wins over the environment) sets an http(s) answer sink: when it is set, expanded decision
+cards gain pick controls and a Send button (see below). Without it the view stays
+read-only and the status line says `read-only` once when the view opens. The bearer token
+for the POST is read only from `PO_DASHBOARD_ANSWER_TOKEN` (never a flag). Esc closes the
+window. `--check` prints the rows the window would show, without a
   display (`--all` for every event, then the team lines when a team feed is set, then the
   decisions lines (the kind first, `legacy` for no kind; the Actions filter is ignored) when a decisions feed is set, then one line per project when a
   projects feed is set; exit 2 when a URL is unreachable);
@@ -423,6 +516,40 @@ the same from any worktree.
   `examples/projects-feed.json` is a sample, and `examples/events-demo-server.py`
   serves it at `/projects.json` with fresh times. `--check` prints
   `name | light | todo/doing/done` per project.
+
+  Answering decisions (v0.49). When `--answer-url` (or `PO_DASHBOARD_ANSWER_URL`)
+  is set to an http(s) URL, each expanded decision card below the fold gains Send
+  controls, and the dashboard POSTs one JSON object per answer there. The bearer
+  token is read only from `PO_DASHBOARD_ANSWER_TOKEN` (env only, never a flag).
+  The body is:
+  ```
+  {"answer_id": "<uuid4>", "id": "<entry id>", "project": "<name>", "item": "<num>",
+   "kind": "choice"|"action"|"unformatted", "option": "<label>"|null, "text": "<str>"|null,
+   "result": "pass"|"failed"|null, "step": <n>|null, "note": "<str>"|null,
+   "answered_at": "<utc iso8601>", "client": "po-dashboard"}
+  ```
+  `answer_id` is a uuid4 made once per Send and kept with the draft, so Retry
+  re-posts the same body. The card controls differ by kind:
+  - **Choice** — one radio row per option plus an `or write your own` text box;
+    Send is enabled once an option is chosen (the text, if any, travels along).
+  - **Action** — `Pass` and `Failed` buttons; Failed opens a step chooser (the
+    step numbers) and a one-line note box; Send is enabled once a step is chosen
+    (for Pass, immediately).
+  - **Unformatted** — a free-text box; Send is enabled once it is non-empty.
+  No Enter-to-send, no confirmation dialog. The POST runs in a worker thread and
+  never blocks the UI; the answer state is kept in the window state keyed by
+    `id`, re-applied on rebuild, pruned when the entry leaves the feed. The card
+    shows the result:
+  | HTTP | state |
+  |---|---|
+  | 200 / 201 | `answered · sent` (muted; controls disabled) |
+  | 409 | `already answered` (controls disabled) |
+  | 404 | `no longer waiting` |
+  | 401 / 403 | `refused by <host>: <code>` (Retry) |
+  | other / no connection | `not sent: <reason>` (Retry) |
+  Each failing state shows a Retry button that re-posts the same body. `examples/events-demo-server.py`
+  serves a `POST /answers` handler for manual testing: 201 the first time it sees an
+  `answer_id`, 200 for a repeat, 404 for a missing id, 401 without a bearer token.
   The **Projects** view (the fourth button of the header toggle, shown only when a
   projects feed is set; `--view projects` starts in it, and exits 1 without a feed) is a
   grid of rectangular cards, one per project in the feed's order, wrapping to the window
@@ -456,7 +583,7 @@ the same from any worktree.
   "Reports" again returns to the list. The charts (the numbers come from `lib/po/dashboard_reports.py`,
   no GTK; drawn with GTK's own snapshot API, no drawing library to install): gate runs per agent, one
   row per agent with stacked pass (solid) and fail (hatched) bars per bucket, hourly for 24 h and daily
-  for 7 d and 30 d, busiest agent first; first-try pass rate per agent, the share of items whose first
+  for 7 d and 30 d, busiest agent first; an empty bucket is not drawn (a muted note under the chart counts the hidden days or hours), each bar shows its count above and its date or hour below, a line under the title says "each bar = one day" (or hour), and every axis top is the closest round step above the highest value, so bars use the height; first-try pass rate per agent, the share of items whose first
   stamp (per project, item and agent) passed, a horizontal bar with the percentage and n; items closed
   per day, stacked by project with a legend (a project past the palette's six colours reuses one,
   hatched); item cycle time per agent, a box plot of the time from an item's open event to its
@@ -522,7 +649,7 @@ the same from any worktree.
 
 ## Development
 
-Tests: `tests/run.sh` (throwaway repos in a temp dir). Lint:
+Tests: `tests/run.sh` (throwaway repos in a temp dir). The runner fails loudly when a block dies: it ends with a `RUN-END` line (or prints `RUN-ABORTED` and exits non-zero), and `[gate] run_sentinel = "required"` makes `po stamp` refuse a test count from a run that has no `RUN-END`. Lint:
 `shellcheck -x bin/po bin/po-install lib/po/*.sh tests/run.sh`.
 `AGENTS.md` is a short guide for coding agents that use po;
 `CHANGELOG.md` lists what each release changed.

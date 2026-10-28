@@ -20,5 +20,5 @@ po_cmd_serve() {
 		esac
 	done
 	command -v python3 >/dev/null 2>&1 || po_die "serve needs python3"
-	exec python3 -I "$PO_LIB/serve.py" "${args[@]}" --repo "$PWD"
+	PO_SLOW_AFTER=${PO_MANIFEST[stamp.slow_after]:-300} exec python3 -I "$PO_LIB/serve.py" "${args[@]}" --repo "$PWD"
 }

@@ -318,14 +318,18 @@ def reports(events, seconds, now=None, tz=None):
 
 
 def nice_max(value):
-    """A round axis top at or above `value` (1, 2, 5 times a power of ten; at least 1)."""
+    """A round axis top just at or above `value`: 1, 1.2, 1.5, 2, 2.4, 3, 4, 5, 6 or 8 times a power of ten.
+
+    Whole numbers only (a count or an hour never gets a fractional tick), at least 1.
+    """
     value = max(1, value)
-    step = 1
-    while step * 10 <= value:
-        step *= 10
-    for m in (1, 2, 5, 10):
-        if m * step >= value:
-            return m * step
+    power = 1
+    while True:
+        for m in (10, 12, 15, 20, 24, 30, 40, 50, 60, 80):
+            top = m * power
+            if top % 10 == 0 and top // 10 >= value:
+                return top // 10
+        power *= 10
 
 
 # ---- layout: each chart as shapes, for the window to paint ---------------------
@@ -360,35 +364,60 @@ def _legend(items, x, y):
     return shapes, x
 
 
-def _x_labels(shapes, labels, x0, slot, y):
-    step = max(1, -(-len(labels) // 6))
-    for i in range(0, len(labels), step):
-        shapes.append(("text", x0 + slot * (i + 0.5), y, labels[i], "muted", "middle"))
+def _x_labels(shapes, labels, slots, x0, slot, y):
+    """The label of each drawn bucket under its bar; `slots` are the drawn buckets' indices."""
+    for k, i in enumerate(slots):
+        shapes.append(("text", x0 + slot * (k + 0.5), y, labels[i], "muted", "middle"))
+
+
+def _bar_labels(data):
+    """Bar labels: a day as its date, an hour as its number (the title line says which)."""
+    return [x[:-3] for x in data["labels"]] if data.get("hourly") else data["labels"]
+
+
+def _hidden_note(shapes, hidden, unit, y):
+    """A muted note under the chart saying how many empty buckets were left out; returns the new y."""
+    if not hidden:
+        return y
+    shapes.append(("text", PAD, y + 4, "%s hidden" % plural(hidden, "empty " + unit), "muted", "start"))
+    return y + TEXT_H + 4
 
 
 def layout_gate_runs(data, width):
+    unit = "hour" if data["hourly"] else "day"
     shapes, y = _legend([("pass", False, "pass"), ("fail", True, "fail")], PAD, 0)[0], TEXT_H + 6
-    n = len(data["labels"])
+    labels = _bar_labels(data)
+    totals = [sum(data["series"][a][i][0] + data["series"][a][i][1] for a in data["agents"]) for i in range(len(labels))]
+    slots = [i for i, t in enumerate(totals) if t]
+    if not slots:
+        return y, shapes
+    shapes.append(("text", PAD, y, "each bar = one %s" % unit, "muted", "start"))
+    y += TEXT_H + 4
+    n = len(slots)
     x0, slot = AXIS_W + PAD, (width - AXIS_W - 2 * PAD) / n
-    top = nice_max(max((p + f for a in data["agents"] for p, f in data["series"][a]), default=1))
+    top = nice_max(max(totals))
     for agent in data["agents"]:
         runs = data["series"][agent]
         p = sum(x for x, _ in runs)
         f = sum(x for _, x in runs)
         shapes.append(("text", PAD, y, "%s: %s, %d pass, %d fail" % (agent, plural(p + f, "run"), p, f), "text", "start"))
-        base = y + TEXT_H + 4 + ROW_H
+        base = y + TEXT_H + 4 + TEXT_H + ROW_H  # the count above the tallest bar fits between title and plot
         shapes.append(("text", x0 - 4, base - ROW_H - 2, str(top), "muted", "end"))
         shapes.append(("text", x0 - 4, base - 14, "0", "muted", "end"))
         shapes.append(("line", x0, base, x0 + slot * n, base, "muted"))
-        for i, (pa, fa) in enumerate(runs):
-            bx, bw = x0 + slot * i + slot * 0.15, slot * 0.7
+        for k, i in enumerate(slots):
+            pa, fa = runs[i]
+            bx, bw = x0 + slot * k + slot * 0.15, slot * 0.7
             hp, hf = ROW_H * pa / top, ROW_H * fa / top
             if pa:
                 shapes.append(("rect", bx, base - hp, bw, hp, "pass", False))
             if fa:
                 shapes.append(("rect", bx, base - hp - hf, bw, hf, "fail", True))
-        y = base + ROW_GAP - TEXT_H
-    _x_labels(shapes, data["labels"], x0, slot, y - 6)
+            if pa + fa:
+                shapes.append(("text", bx + bw / 2, base - hp - hf - TEXT_H, str(pa + fa), "text", "middle"))
+        _x_labels(shapes, labels, slots, x0, slot, base + 4)
+        y = base + TEXT_H + 12
+    y = _hidden_note(shapes, len(labels) - n, unit, y)
     return y + TEXT_H, shapes
 
 
@@ -406,8 +435,8 @@ def layout_first_try(data, width):
     return max(y, TEXT_H), shapes
 
 
-def _layout_stacked(names, series, labels, width, colour_of):
-    """Stacked bars per bucket under a wrapping legend, with each bucket's total above it."""
+def _layout_stacked(names, series, labels, width, colour_of, unit):
+    """Stacked bars per bucket with an empty bucket left out, under a wrapping legend; each bar has its total above and its label below."""
     shapes, y = [], 0
     x = PAD
     for j, name in enumerate(names):  # the legend wraps when the window is narrow
@@ -418,36 +447,42 @@ def _layout_stacked(names, series, labels, width, colour_of):
         shapes += row
         x = nx
     y += TEXT_H + 10
-    n = len(labels)
+    sums = [sum(series[p][i] for p in names) for i in range(len(labels))]
+    slots = [i for i, s in enumerate(sums) if s]
+    if not slots:
+        return y, shapes
+    shapes.append(("text", PAD, y - 4, "each bar = one %s" % unit, "muted", "start"))
+    y += TEXT_H
+    n = len(slots)
     x0, slot = AXIS_W + PAD, (width - AXIS_W - 2 * PAD) / n
-    sums = [sum(series[p][i] for p in names) for i in range(n)]
-    top = nice_max(max(sums, default=1))
+    top = nice_max(max(sums))
     base = y + ROW_H + TEXT_H
     shapes.append(("text", x0 - 4, base - ROW_H - 2 - TEXT_H, str(top), "muted", "end"))
     shapes.append(("text", x0 - 4, base - 14, "0", "muted", "end"))
     shapes.append(("line", x0, base, x0 + slot * n, base, "muted"))
-    for i in range(n):
-        bx, bw, level = x0 + slot * i + slot * 0.15, slot * 0.7, base
+    for k, i in enumerate(slots):
+        bx, bw, level = x0 + slot * k + slot * 0.15, slot * 0.7, base
         for j, p in enumerate(names):
             count = series[p][i]
             if count:
                 h = ROW_H * count / top
                 level -= h
                 shapes.append(("rect", bx, level, bw, h, *colour_of(j)))
-        if sums[i]:
-            shapes.append(("text", bx + bw / 2, level - TEXT_H, str(sums[i]), "text", "middle"))
-    _x_labels(shapes, labels, x0, slot, base + 4)
-    return base + TEXT_H + 8, shapes
+        shapes.append(("text", bx + bw / 2, level - TEXT_H, str(sums[i]), "text", "middle"))
+    _x_labels(shapes, labels, slots, x0, slot, base + 4)
+    y = _hidden_note(shapes, len(labels) - n, unit, base + TEXT_H + 4)
+    return y + 4, shapes
 
 
 def layout_closed(data, width):
-    return _layout_stacked(data["projects"], data["series"], data["labels"], width, series_colour)
+    return _layout_stacked(data["projects"], data["series"], data["labels"], width, series_colour, "day")
 
 
 def layout_failed_legs(data, width):
     def colour_of(j):  # OTHER is always last and hatched muted, apart from the six palette colours
         return (("muted", True) if data["legs"][j] == OTHER else series_colour(j))
-    return _layout_stacked(data["legs"], data["series"], data["labels"], width, colour_of)
+    return _layout_stacked(data["legs"], data["series"], _bar_labels(data), width, colour_of,
+                           "hour" if data["hourly"] else "day")
 
 
 def layout_cycle_time(data, width):

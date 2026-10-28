@@ -12,6 +12,7 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 LAST = 10
 INTERVAL_MS = 5000
@@ -27,6 +28,9 @@ TEAM_URL_ENV = "PO_DASHBOARD_TEAM_URL"
 DECISIONS_URL_ENV = "PO_DASHBOARD_DECISIONS_URL"
 PROJECTS_URL_ENV = "PO_DASHBOARD_PROJECTS_URL"
 DECISIONS_FILTER_ENV = "PO_DASHBOARD_DECISIONS_FILTER"  # the saved Actions filter's file, instead of the default under the config dir
+ANSWER_URL_ENV = "PO_DASHBOARD_ANSWER_URL"  # where to POST answers (v0.49); none = read-only Decisions
+ANSWER_TOKEN_ENV = "PO_DASHBOARD_ANSWER_TOKEN"  # bearer token for the answer POST (v0.49), env only
+CLIENT = "po-dashboard v0.49"
 TEAM_ORDER_ENV = "PO_DASHBOARD_TEAM_ORDER"  # the saved order's file, instead of the default under the config dir
 FADE_SECONDS = 60
 FADE_STEPS = 60  # one CSS class per step, po-fade-<n>: n steps of highlight left
@@ -101,6 +105,102 @@ def fetch(url, timeout=5):
         raise DashboardError("cannot reach %s: %s" % (url, getattr(e, "reason", e)))
 
 
+# ---- answering decisions (v0.49) --------------------------------------------
+
+
+def resolve_answer_url(arg, env=None):
+    """--answer-url wins over the environment; neither is None (read-only mode, no default). http(s) only."""
+    env = os.environ if env is None else env
+    url = (arg or env.get(ANSWER_URL_ENV) or "").strip()
+    if not url:
+        return None
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        raise DashboardError("not an http(s) URL: %s" % url)
+    return url
+
+
+def answer_id():
+    """A uuid4 hex string for a new answer (made once per Send, kept with the draft)."""
+    return uuid.uuid4().hex
+
+
+def answer_body(entry, answer_id, option=None, text=None, result=None, step=None, note=None):
+    """The POST body for answering a decision entry.
+
+    One JSON object per answer, flat, null for fields the kind does not use:
+    {answer_id, id, project, item, kind, option, text, result, step, note,
+     answered_at, client}. answer_id is made once per Send and kept with the
+     draft, so Retry re-posts the same body.
+    """
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return {
+        "answer_id": answer_id,
+        "id": str(entry.get("id") or ""),
+        "project": str(entry.get("project") or ""),
+        "item": str(entry.get("item") or ""),
+        "kind": decision_shape(entry),
+        "option": option,
+        "text": text,
+        "result": result,
+        "step": step,
+        "note": note,
+        "answered_at": now,
+        "client": CLIENT,
+    }
+
+
+def answer_state(status_code, reason="", host=None):
+    """The display string for an answer POST response code.
+
+    200/201 -> 'answered \\u00b7 sent' (muted, controls disabled); 409 -> 'already answered'
+    (controls disabled); 404 -> 'no longer waiting'; 401/403 -> 'refused by <host>: <code>'
+    with a Retry button; anything else or no connection -> 'not sent: <reason>' with Retry.
+    """
+    if status_code in (200, 201):
+        return "answered \u00b7 sent"
+    if status_code == 409:
+        return "already answered"
+    if status_code == 404:
+        return "no longer waiting"
+    if status_code in (401, 403):
+        return "refused by %s: %d" % (host or "?", status_code)
+    if reason:
+        return "not sent: " + str(reason)
+    return "not sent"
+
+
+def answer_needs_retry(state):
+    """Whether an answer display string has a Retry button (refused or not sent)."""
+    return state.startswith("refused by") or state.startswith("not sent")
+
+
+def answer_state_class(state):
+    """The CSS class for an answer display string."""
+    if state == "answered \u00b7 sent":
+        return "po-answered"
+    if state == "already answered":
+        return "po-already"
+    return "po-fail"
+
+
+def post_answer(url, body, token=None):
+    """POST the answer body as JSON to url. Returns the answer display string."""
+    data = json.dumps(body).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    host = urllib.parse.urlsplit(url).netloc
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return answer_state(r.status, host=host)
+    except urllib.error.HTTPError as e:
+        return answer_state(e.code, e.reason, host=host)
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return answer_state(0, str(getattr(e, "reason", e)))
+
+
 # ---- parse, sort, limit ----------------------------------------------------
 
 
@@ -159,6 +259,32 @@ def local_time(iso, tz=None):
     return d.astimezone(tz).strftime("%Y-%m-%d %H:%M:%S")
 
 
+SLOW_ENV = "PO_SLOW_AFTER"  # seconds; a run over it is marked slow (po.toml [stamp] slow_after, default 300)
+SLOW_DEFAULT = 300
+
+
+def slow_after():
+    try:
+        return int(os.environ.get(SLOW_ENV, SLOW_DEFAULT))
+    except ValueError:
+        return SLOW_DEFAULT
+
+
+def event_seconds(event):
+    """The run's whole seconds, or None when the event has none (an older one: unknown, never 0)."""
+    n = event.get("seconds")
+    return n if isinstance(n, int) and not isinstance(n, bool) and n >= 0 else None
+
+
+def took_text(n):
+    """57s, 4m12s, 1h02m03s; - when unknown."""
+    if n is None:
+        return "-"
+    if n >= 3600:
+        return "%dh%02dm%02ds" % (n // 3600, n % 3600 // 60, n % 60)
+    return "%dm%02ds" % (n // 60, n % 60) if n >= 60 else "%ds" % n
+
+
 def legs_text(legs):
     if not isinstance(legs, list):
         return ""
@@ -194,6 +320,7 @@ COLUMNS = (
     ("kind", "kind", 5, 5, False),
     ("legs", "checks", 10, 44, True),
     ("agent", "agent", 7, 7, False),
+    ("took", "took", 7, 7, False),
     ("time", "time", 17, 17, False),
 )
 NOTE_ICONS = ("document-edit-symbolic", "text-x-generic-symbolic", "dialog-information-symbolic")
@@ -212,6 +339,8 @@ def row(event, tz=None):
         "result": CUES[cls] if result.lower() in CUES else "– %s" % (result or "?"),
         "result_class": cls,
         "agent": str(event.get("agent") or ""),
+        "took": took_text(event_seconds(event)),
+        "slow": event_seconds(event) is not None and event_seconds(event) > slow_after(),
         "time": local_time(event.get("time"), tz),
         "legs": legs_text(event.get("legs")),
         "detail": note_text(event),
@@ -256,6 +385,10 @@ def sorted_events(events, sort, tz=None):
         def value(e):
             t = parse_time(e.get("time"))
             return (1, t.timestamp(), ()) if t else (0, 0.0, natural_key(e.get("time") or ""))
+    elif key == "took":
+        def value(e):
+            n = event_seconds(e)
+            return (0, 0) if n is None else (1, n)
     else:
         def value(e):
             return natural_key(row(e, tz)[key])
@@ -810,7 +943,7 @@ def readable(fg, bg, variant, need=4.5):
     return fg
 
 
-FADE_TEXT = (("po-text", "text"), ("po-muted", "muted"), ("po-note", "muted"),
+FADE_TEXT = (("po-text", "text"), ("po-muted", "muted"), ("po-note", "muted"), ("po-warn", "warn"),
              ("po-pass", "pass"), ("po-fail", "fail"), ("po-skip", "skip"))
 
 
@@ -861,6 +994,7 @@ window.po-dashboard { background-color: %(base)s; color: %(text)s; }
   box-shadow: 5px 5px 10px %(dark)s, -5px -5px 10px %(light)s; }
 .po-text { color: %(text)s; }
 .po-muted { color: %(muted)s; font-size: 12px; }
+.po-warn { color: %(warn)s; font-size: 12px; font-weight: 700; }
 .po-note { color: %(muted)s; }
 .po-note:focus-visible { outline: 2px solid %(text)s; outline-offset: 2px; }
 .po-pass { color: %(pass)s; font-weight: 700; }
@@ -873,6 +1007,8 @@ window.po-dashboard { background-color: %(base)s; color: %(text)s; }
 .po-kind-choice { color: %(accent)s; }
 .po-kind-action { color: %(warn)s; }
 .po-kind-unformatted { color: %(fail)s; }
+.po-answered { color: %(accent)s; font-weight: 700; }
+.po-already { color: %(warn)s; font-weight: 700; }
 .po-light-active { color: %(pass)s; }
 .po-light-idle { color: %(warn)s; }
 .po-light-inactive { color: %(fail)s; }
@@ -901,6 +1037,7 @@ CONTRAST_PAIRS = [
     (".po-text", ".po-card", "card text"),
     (".po-muted", ".po-card", "card detail text"),
     (".po-note", ".po-card", "note icon"),
+    (".po-warn", ".po-card", "slow run time"),
     (".po-pass", ".po-card", "pass status"),
     (".po-fail", ".po-card", "fail status"),
     (".po-skip", ".po-card", "skip status"),
@@ -912,6 +1049,8 @@ CONTRAST_PAIRS = [
     (".po-kind-choice", ".po-card", "choice badge"),
     (".po-kind-action", ".po-card", "action badge"),
     (".po-kind-unformatted", ".po-card", "unformatted badge"),
+    (".po-answered", ".po-card", "answered/sent status"),
+    (".po-already", ".po-card", "already answered status"),
     (".po-view", ".po-view", "view toggle label"),
     (".po-title", ".po-header", "header title"),
     (".po-status", ".po-header", "header status line"),

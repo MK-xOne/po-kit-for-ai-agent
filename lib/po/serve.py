@@ -10,20 +10,24 @@ import html
 import http.server
 import ipaddress
 import json
+import os
 import socket
 import subprocess
 import sys
 
 LAST = 10
-COLUMNS = ("result", "item", "project", "kind", "checks", "agent", "time", "note")
+COLUMNS = ("result", "item", "project", "kind", "checks", "agent", "took", "time", "note")
+SLOW_ENV = "PO_SLOW_AFTER"  # seconds; po serve sets it from po.toml [stamp] slow_after (default 300)
+SLOW_DEFAULT = 300
 CUES = {"pass": "\u2714 pass", "fail": "\u2718 fail", "skip": "\u2013 skip"}
-WIDTHS = {"result": 9, "item": 8, "kind": 7, "agent": 10, "time": 20, "note": 4}  # ch; project and checks share the rest
+WIDTHS = {"result": 9, "item": 8, "kind": 7, "agent": 10, "took": 10, "time": 20, "note": 4}  # ch; project and checks share the rest
 FADE_SECONDS = 60  # a row that appears while the page is open starts 25% darker (lighter in dark) and eases back
 # Text colours inside a highlighted row: darker (lighter in dark) than the normal ones, so they stay AA
 # (4.5:1) on the strongest highlight; the tests check them against it.
 NEW_TEXT = {"light": {"text": "#222222", "muted": "#333333", "pass": "#06471a", "fail": "#7a1610"},
             "dark": {"text": "#f2f2f2", "muted": "#e6e6e6", "pass": "#8ff0b0", "fail": "#ffc2bd"}}
 PO_CMD = ("po", "events", "--all", "--json")
+TEAM_CMD = ("po", "team", "--json")
 
 
 def die(msg, code=1):
@@ -77,6 +81,23 @@ def load_events(repo):
     return events
 
 
+def load_team(repo):
+    """The Team-view feed as po team --json prints it. Raises RuntimeError with a message for the client."""
+    try:
+        p = subprocess.run(TEAM_CMD, cwd=repo, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError("cannot run po team: %s" % e)
+    if p.returncode != 0:
+        raise RuntimeError("po team exited %d: %s" % (p.returncode, p.stderr.strip()))
+    try:
+        data = json.loads(p.stdout)
+    except ValueError as e:
+        raise RuntimeError("po team --json is not JSON: %s" % e)
+    if not isinstance(data, list):
+        raise RuntimeError("po team --json is not a JSON array")
+    return data
+
+
 def legs_text(legs):
     if not isinstance(legs, list):
         return ""
@@ -101,8 +122,32 @@ def text(value):
     return "" if value is None else str(value)
 
 
+def slow_after():
+    try:
+        return int(os.environ.get(SLOW_ENV, SLOW_DEFAULT))
+    except ValueError:
+        return SLOW_DEFAULT
+
+
+def seconds(e):
+    """The run's whole seconds, or None (an older event: unknown, never 0)."""
+    n = e.get("seconds")
+    return n if isinstance(n, int) and not isinstance(n, bool) and n >= 0 else None
+
+
+def took_text(n):
+    """57s, 4m12s, 1h02m03s; - when unknown."""
+    if n is None:
+        return "-"
+    if n >= 3600:
+        return "%dh%02dm%02ds" % (n // 3600, n % 3600 // 60, n % 60)
+    return "%dm%02ds" % (n // 60, n % 60) if n >= 60 else "%ds" % n
+
+
 def field(e, col):
     """The text of one column of event e."""
+    if col == "took":
+        return took_text(seconds(e))
     if col == "result":
         r = text(e.get("result"))
         return CUES.get(r.lower(), "\u2013 %s" % (r or "?"))
@@ -137,7 +182,8 @@ def rows_html(events):
                 inner = '<span class="r-%s">%s</span>' % (cls, v)
             else:
                 inner = v
-            tds.append('<td class="c-%s" title="%s">%s</td>' % (col, t, inner))
+            slow = " slow" if col == "took" and (seconds(e) or 0) > slow_after() else ""
+            tds.append('<td class="c-%s%s" title="%s">%s</td>' % (col, slow, t, inner))
         out.append('<tr onclick="location=\'/all\'">%s</tr>' % "".join(tds))
     return "\n".join(out)
 
@@ -152,7 +198,7 @@ table{{border-collapse:collapse;width:100%;table-layout:fixed;min-width:44rem}}
 th,td{{text-align:left;padding:.35rem .6rem;border-bottom:1px solid #ddd;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
 tbody tr{{cursor:pointer}} tbody tr:hover{{background:#f3f3f3}}
 .r-pass,.r-ok{{color:#0a7a2f;font-weight:600}} .r-fail{{color:#b3261e;font-weight:600}} .r-skip{{color:#555;font-weight:600}}
-.c-kind,.c-checks,.c-agent,.c-time{{color:#555}} .note{{color:#555;cursor:help}}
+.c-kind,.c-checks,.c-agent,.c-took,.c-time{{color:#555}} .c-took.slow{{color:#8a5a00;font-weight:600}} .note{{color:#555;cursor:help}}
 .note:focus-visible{{outline:2px solid currentColor;outline-offset:2px}}
 tbody tr.new td{{background-color:rgba(0,0,0,.25);animation:fade {fade}s linear forwards;color:{lt[muted]}}}
 tbody tr.new .c-item,tbody tr.new .c-project,tbody tr.new .c-note,tbody tr.new .note{{color:{lt[text]}}}
@@ -164,13 +210,13 @@ tbody tr.new .r-pass,tbody tr.new .r-ok{{color:{lt[pass]}}} tbody tr.new .r-fail
 #err{{color:#b3261e}} nav a{{margin-right:1rem}}
 @media(prefers-color-scheme:dark){{body{{color:#ddd;background:#181818}}
 th,td{{border-color:#444}} tbody tr:hover{{background:#262626}}
-.r-pass,.r-ok{{color:#5fd38a}} .r-fail,#err{{color:#ff8a80}} .r-skip,.c-kind,.c-checks,.c-agent,.c-time,.note{{color:#aaa}}
+.r-pass,.r-ok{{color:#5fd38a}} .r-fail,#err{{color:#ff8a80}} .r-skip,.c-kind,.c-checks,.c-agent,.c-took,.c-time,.note{{color:#aaa}} .c-took.slow{{color:#f0c75e}}
 tbody tr.new td{{background-color:rgba(255,255,255,.25);animation-name:fade-dark;color:{dk[muted]}}}
 tbody tr.new .c-item,tbody tr.new .c-project,tbody tr.new .c-note,tbody tr.new .note{{color:{dk[text]}}}
 tbody tr.new .r-pass,tbody tr.new .r-ok{{color:{dk[pass]}}} tbody tr.new .r-fail{{color:{dk[fail]}}} tbody tr.new .r-skip{{color:{dk[muted]}}}
 @media(prefers-reduced-motion:reduce){{tbody tr.new td{{animation:none}}}}}}
 </style></head>
-<body data-limit="{limit}">
+<body data-limit="{limit}" data-slow="{slow}">
 <h1>{title}</h1>
 <nav><a href="/">last {last}</a><a href="/all">all</a><a href="/events.json">json</a></nav>
 <p id="err">{err}</p>
@@ -179,7 +225,7 @@ tbody tr.new .r-pass,tbody tr.new .r-ok{{color:{dk[pass]}}} tbody tr.new .r-fail
 {rows}
 </tbody></table>
 <script>
-const limit = +document.body.dataset.limit;
+const limit = +document.body.dataset.limit, slow = +document.body.dataset.slow;
 const cols = {cols}, cues = {cues};
 function legs(v) {{
   return Array.isArray(v) ? v.map(l => (l && typeof l === "object") ? (l.name ?? "?") + ":" + (l.result ?? "?") : String(l)).join(" ") : "";
@@ -188,7 +234,15 @@ function str(v) {{
   if (v !== null && typeof v === "object") return JSON.stringify(v);
   return v == null ? "" : String(v);
 }}
+function took(e) {{
+  const n = e.seconds;
+  if (!Number.isInteger(n) || n < 0) return "-";
+  const p = x => String(x).padStart(2, "0");
+  return n >= 3600 ? Math.floor(n / 3600) + "h" + p(Math.floor(n % 3600 / 60)) + "m" + p(n % 60) + "s"
+    : n >= 60 ? Math.floor(n / 60) + "m" + p(n % 60) + "s" : n + "s";
+}}
 function field(c, e) {{
+  if (c === "took") return took(e);
   if (c === "result") {{ const r = str(e.result); return cues[r.toLowerCase()] || "\u2013 " + (r || "?"); }}
   if (c === "checks") return legs(e.legs);
   if (c === "note") {{
@@ -224,7 +278,7 @@ function render(events) {{
     for (const c of cols) {{
       const td = document.createElement("td");
       const v = field(c, e);
-      td.className = "c-" + c;
+      td.className = "c-" + c + (c === "took" && Number.isInteger(e.seconds) && e.seconds > slow ? " slow" : "");
       if (c === "note") {{
         if (v) {{
           const n = document.createElement("span");
@@ -282,6 +336,7 @@ setInterval(poll, 5000);
 def page(events, error, full):
     return PAGE.format(
         limit=0 if full else LAST,
+        slow=slow_after(),
         last=LAST,
         title="All events" if full else "Last %d events" % LAST,
         err=html.escape(error or ""),
@@ -316,6 +371,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?", 1)[0].split("#", 1)[0]
+        if path == "/team.json":
+            try:
+                return self.send(200, "application/json", json.dumps(load_team(self.server.repo)))
+            except RuntimeError as e:
+                return self.send(502, "application/json", json.dumps({"error": str(e)}))
         if path not in ("/", "/all", "/events.json"):
             return self.send(404, "text/plain; charset=utf-8", "not found\n")
         try:

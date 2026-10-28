@@ -1,0 +1,24 @@
+# Example roster and host files for `po team` (see README). Add these to your po.toml;
+# the names are made up. `owner_column` is what ties an agent to its items.
+
+[layout]
+# backlog, specs_dir, worktrees and branch as usual, and:
+owner_column = "Owner"                # the backlog column holding an agent's name
+
+[team]
+limits_file = "/var/lib/po/limits.json"   # optional: {"ada": "2099-01-01T15:30:00Z", "bo": null}
+usage_file = "/var/lib/po/usage.json"     # optional: {"ada": {"five_hour": 0.42, "seven_day": 0.18}}
+
+[[team.agent]]
+name = "ada"
+model = "Big Model (API)"
+role = "dev"
+
+[[team.agent]]
+name = "bo"
+model = "small-model (local GPU)"
+role = "dev"
+
+[[team.agent]]
+name = "cy"
+role = "reviewer"

@@ -22,10 +22,10 @@ every backlog status; **devs** each work one item in its own worktree.
   `--all`, `--json`), `po serve [--bind <addr>] [--port <n>]` (a read-only web
   viewer of those events, loopback by default; run it only when asked, it stays
   up until stopped; `po-dashboard --url <events url>` is the same as a desktop
-  window, also only when asked; `--team-url <feed>` or `PO_DASHBOARD_TEAM_URL` adds its Team view, `--decisions-url <feed>` or `PO_DASHBOARD_DECISIONS_URL` its read-only Decisions view; a new event fades in, 60 s), `po version` (the installed tag), `po doctor` (does
+  window, also only when asked; `--team-url <feed>` or `PO_DASHBOARD_TEAM_URL` adds its Team view, `--decisions-url <feed>` or `PO_DASHBOARD_DECISIONS_URL` its read-only Decisions view; a new event fades in, 60 s), `po dispatch --plan` (who would get which ready item), `po team [--json]` (the Team-view feed from the manifest roster, the events and the backlog owner column), `po version` (the installed tag), `po doctor` (does
   every adopter's manifest still work under the installed po, and which optional
   keys could it adopt).
-- **The PO's only:** `po open`, `po close`, `po prune` with `--commit`, and every
+- **The PO's only:** `po open`, `po close`, `po prune`, `po dispatch` with `--commit`, and every
   backlog status. Without `--commit` they print a plan and change nothing; a dev
   may run them that way to check.
 - **Exit codes:** 1 usage, 2 manifest or repo, 3 backlog disagreement, 4 a gate
@@ -39,6 +39,7 @@ every backlog status; **devs** each work one item in its own worktree.
 
 1. `cd` into the worktree the prompt names, then `pwd`.
 2. Do the item. Gate with the repo's own command (e.g. `./check.sh`).
+2a. An item that changes or replaces a behaviour updates or deletes the tests that pinned the old behaviour, in the same commit. A new test is added beside them only for what is new. Report lists the tests changed or deleted (names) or says `none pinned the old behaviour`.
 3. `po stamp` in the worktree; on exit 4, fix and run it again.
 4. Report: `po report [--note <text>]...` prints the report block (files changed,
    the newest stamp verbatim, numbered notes) from a fresh stamp; exit 4 if it
@@ -51,7 +52,12 @@ every backlog status; **devs** each work one item in its own worktree.
 `po open` → the dev's brief (`po kickoff` is its mechanical half) → verify with
 `po stamp` → rulings → commit → `po close` → `po prune`. Before `po close`,
 `po fresh` must pass; when main moved, rebase the item branch and re-stamp.
-po never pushes: pushing is the PO's own step after a close.
+po never pushes: pushing is the PO's own step after a close. Verify also checks
+that no outdated test was left behind: for a changed behaviour, search the tests
+for the old name, flag, output or exit code, and send back any that still pins it
+(or passes only because it no longer checks anything).
+
+**Slow gate trigger.** Every stamp event records the seconds it took, and `po events` and the dashboard mark a run over `[stamp] slow_after` (default 300) as `slow`. When a gate goes over about 5 minutes, the PO specs a fast per-item gate and runs the full suite nightly and before each release; those tiers are not built until then.
 
 ## Asking the owner
 

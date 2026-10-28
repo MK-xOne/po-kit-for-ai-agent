@@ -1,0 +1,6 @@
+# Example for `po dispatch` (see README). Add to a po.toml that has a roster
+# ([[team.agent]], see team.po.toml), `[layout] owner_column` and `[ready] file`.
+
+[dispatch]
+order = ["bo", "ada", "cy"]            # cheapest first; agents not named come after
+notify = "./post-prompt.sh"            # optional; run as: notify <item> <agent> <prompt path>

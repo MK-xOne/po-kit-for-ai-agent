@@ -85,6 +85,8 @@ po_cmd_open() {
 
 	po_edit_init "$mtip"
 	if [[ $mode == flip ]]; then
+		# shellcheck disable=SC2034 # read by po_edit_table
+		PO_EDIT_OWNER=$for_name
 		po_edit_status "$version" TODO DOING
 	else
 		po_edit_found "$version" "$title"

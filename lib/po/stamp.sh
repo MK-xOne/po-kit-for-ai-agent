@@ -30,6 +30,9 @@ PO_STAMP_NAME_RE='^gate-([1-9][0-9]*)\.txt$'
 PO_STAMP_ITEM=-
 PO_STAMP_NAMES=()
 PO_STAMP_RES=()
+# Wall-clock seconds: the run's start, and each leg's time (0 until it runs).
+PO_STAMP_START=0
+PO_STAMP_SECS=()
 # The run's captured output: a private temporary directory holding out-<i>
 # for leg i (the prepare leg, when there is one, is leg 0) and out-count for
 # test_count_cmd, and the list of what ran, in order, as
@@ -125,6 +128,13 @@ po_stamp_tail() {
 		LC_ALL=C awk -v w="$PO_STAMP_TAIL_WIDTH" '{ if (length($0) > w) $0 = substr($0, 1, w) "..."; print }'
 }
 
+# po_stamp_seconds: whole seconds since the run began, into PO_EVENT_SECONDS
+# for the event about to be logged.
+po_stamp_seconds() {
+	# shellcheck disable=SC2034 # read by po_event_log
+	PO_EVENT_SECONDS=$((EPOCHSECONDS - PO_STAMP_START))
+}
+
 # po_stamp_legs_json [<failing leg index>]: the legs array body for the event
 # log; the failing leg carries "tail", its output's last lines.
 po_stamp_legs_json() {
@@ -135,9 +145,9 @@ po_stamp_legs_json() {
 			tail=$(po_stamp_tail "$PO_STAMP_TMP/out-$i")
 		fi
 		if ((i == failing)); then
-			out+="${out:+,}$(po_event_leg "${PO_STAMP_NAMES[i]}" "${PO_STAMP_RES[i]}" "$tail")"
+			out+="${out:+,}$(po_event_leg "${PO_STAMP_NAMES[i]}" "${PO_STAMP_RES[i]}" "${PO_STAMP_SECS[i]:-0}" "$tail")"
 		else
-			out+="${out:+,}$(po_event_leg "${PO_STAMP_NAMES[i]}" "${PO_STAMP_RES[i]}")"
+			out+="${out:+,}$(po_event_leg "${PO_STAMP_NAMES[i]}" "${PO_STAMP_RES[i]}" "${PO_STAMP_SECS[i]:-0}")"
 		fi
 	done
 	printf '%s' "$out"
@@ -185,6 +195,7 @@ po_stamp_fail() {
 	log=$(po_stamp_write_log "$*")
 	# The reason names the leg's command, which may hold a secret.
 	detail=$(printf '%s\n' "$*" | po_redact)
+	po_stamp_seconds
 	po_event_log stamp "$PO_STAMP_ITEM" fail "$(po_stamp_legs_json "$PO_STAMP_FAILING")" "$detail" "${log:--}"
 	po_stamp_cleanup
 	printf 'po stamp: FAIL: %s\n' "$*" >&2
@@ -231,7 +242,10 @@ PO_PYTEST_RE='^(=+ )?(no tests ran|'$PO_PYTEST_ITEM'(, '$PO_PYTEST_ITEM')*) in [
 # file, to that file too, recorded with <label> in the run's list. Sets
 # PO_RUN_CODE to its exit status and PO_RUN_RESULTS to the summary lines it
 # printed: libtest's ("test result: ...") or, with [gate] test_format =
-# "pytest", pytest's final lines.
+# "pytest", pytest's final lines. The runner's own sentinel lines are kept
+# apart: PO_RUN_ENDED is the number of "RUN-END ..." lines the output had and
+# PO_RUN_ABORTED the number of "RUN-ABORTED" lines (a runner that finishes
+# prints the first; one that dies any other way prints the second).
 po_stamp_run() {
 	local out pytest=0 cap=/dev/null
 	[[ ${PO_MANIFEST[gate.test_format]:-libtest} != pytest ]] || pytest=1
@@ -244,7 +258,11 @@ po_stamp_run() {
 			while IFS= read -r line || [[ -n $line ]]; do
 				printf '%s\n' "$line" >&2
 				printf '%s\n' "$line" >&3
-				if ((pytest)); then
+				if [[ $line == 'RUN-END '* ]]; then
+					printf '\001end\n'
+				elif [[ $line == RUN-ABORTED* ]]; then
+					printf '\001aborted\n'
+				elif ((pytest)); then
 					if [[ $line =~ $PO_PYTEST_RE ]]; then printf '%s\n' "$line"; fi
 				elif [[ $line == 'test result: '* ]]; then
 					printf '%s\n' "$line"
@@ -256,6 +274,18 @@ po_stamp_run() {
 	PO_RUN_CODE=${out##*po-stamp-exit }
 	PO_RUN_RESULTS=${out%po-stamp-exit *}
 	PO_RUN_RESULTS=${PO_RUN_RESULTS%$'\n'}
+	PO_RUN_ENDED=0 PO_RUN_ABORTED=0
+	if [[ $PO_RUN_RESULTS == *$'\001'* ]]; then
+		local kept='' rl
+		while IFS= read -r rl; do
+			case $rl in
+			$'\001end') PO_RUN_ENDED=$((PO_RUN_ENDED + 1)) ;;
+			$'\001aborted') PO_RUN_ABORTED=$((PO_RUN_ABORTED + 1)) ;;
+			*) kept+=${kept:+$'\n'}$rl ;;
+			esac
+		done <<<"$PO_RUN_RESULTS"
+		PO_RUN_RESULTS=$kept
+	fi
 	if [[ $cap != /dev/null ]]; then
 		printf '%s %s %s\n' "$3" "$PO_RUN_CODE" "$4" >>"$PO_STAMP_TMP/ran"
 	fi
@@ -350,13 +380,14 @@ po_cmd_stamp() {
 	[[ -n $diffstat ]] || diffstat='no changes'
 
 	printf 'po stamp: gate in %s at %s\n' "$wt" "$head" >&2
-	local gate_sum=0 gate_lines=0 off=0
+	local gate_sum=0 gate_lines=0 off=0 leg_start
 	PO_STAMP_ITEM=$(po_unfill "$(po_get layout.branch)" "$branch" 2>/dev/null) || PO_STAMP_ITEM=-
 	PO_STAMP_NAMES=()
 	((${#prep[@]} == 0)) || PO_STAMP_NAMES=(prepare) off=1
 	PO_STAMP_NAMES+=("${names[@]}")
-	PO_STAMP_RES=()
-	for i in "${!PO_STAMP_NAMES[@]}"; do PO_STAMP_RES+=(skip); done
+	PO_STAMP_RES=() PO_STAMP_SECS=()
+	PO_STAMP_START=$EPOCHSECONDS
+	for i in "${!PO_STAMP_NAMES[@]}"; do PO_STAMP_RES+=(skip) PO_STAMP_SECS+=(0); done
 	# Outside the worktree, so it is never part of the state stamped.
 	PO_STAMP_TMP=$(mktemp -d "${TMPDIR:-/tmp}/po-stamp.XXXXXX") || PO_STAMP_TMP=''
 	# The prepare leg's output (out-0) is every line's in turn; test
@@ -364,9 +395,11 @@ po_cmd_stamp() {
 	if ((off)); then
 		PO_STAMP_RES[0]=fail
 		PO_STAMP_FAILING=0
+		leg_start=$EPOCHSECONDS
 		for i in "${!prep[@]}"; do
 			printf 'po stamp: prepare: %s\n' "${prep[i]}" >&2
 			po_stamp_run "$wt" "${prep[i]}" "out-prep-$i" "prepare: ${prep[i]}"
+			PO_STAMP_SECS[0]=$((EPOCHSECONDS - leg_start))
 			[[ -z $PO_STAMP_TMP ]] || cat -- "$PO_STAMP_TMP/out-prep-$i" >>"$PO_STAMP_TMP/out-0" 2>/dev/null
 			[[ $PO_RUN_CODE == 0 ]] ||
 				po_stamp_fail "prepare line '${prep[i]}' exited $PO_RUN_CODE"
@@ -380,11 +413,15 @@ po_cmd_stamp() {
 	state=$(po_stamp_state "$wt")
 	for i in "${!names[@]}"; do
 		printf 'po stamp: leg %s: %s\n' "${names[i]}" "${cmds[i]}" >&2
+		leg_start=$EPOCHSECONDS
 		po_stamp_run "$wt" "${cmds[i]}" "out-$((i + off))" "leg ${names[i]}: ${cmds[i]}"
+		PO_STAMP_SECS[i + off]=$((EPOCHSECONDS - leg_start))
 		PO_STAMP_RES[i + off]=fail
 		PO_STAMP_FAILING=$((i + off))
 		[[ $PO_RUN_CODE == 0 ]] ||
 			po_stamp_fail "gate leg '${names[i]}' (${cmds[i]}) exited $PO_RUN_CODE"
+		((PO_RUN_ABORTED == 0)) ||
+			po_stamp_fail "gate leg '${names[i]}' (${cmds[i]}) printed RUN-ABORTED: the runner died before its last block"
 		$sumfn "$PO_RUN_RESULTS" "gate leg '${names[i]}'"
 		PO_STAMP_FAILING=-1
 		PO_STAMP_RES[i + off]=pass
@@ -395,6 +432,10 @@ po_cmd_stamp() {
 	printf 'po stamp: test count: %s\n' "$count_cmd" >&2
 	po_stamp_run "$wt" "$count_cmd" out-count "test count: $count_cmd"
 	[[ $PO_RUN_CODE == 0 ]] || po_stamp_fail "test_count_cmd ($count_cmd) exited $PO_RUN_CODE"
+	((PO_RUN_ABORTED == 0)) ||
+		po_stamp_fail "test_count_cmd ($count_cmd) printed RUN-ABORTED: the runner died before its last block, so no count is taken"
+	[[ -z ${PO_MANIFEST[gate.run_sentinel]:-} || $PO_RUN_ENDED -gt 0 ]] ||
+		po_stamp_fail "test_count_cmd ($count_cmd) printed no RUN-END sentinel: the run did not finish, so no count is taken"
 	$sumfn "$PO_RUN_RESULTS" "test_count_cmd"
 	((PO_SUM_LINES > 0)) || po_stamp_fail "test_count_cmd ($count_cmd) printed no $summary"
 	local tests=$PO_SUM
@@ -441,6 +482,7 @@ po_cmd_stamp() {
 		po_stamp_fail "could not write ${file##*/}"
 	fi
 	po_stamp_cleanup
+	po_stamp_seconds
 	po_event_log stamp "$PO_STAMP_ITEM" pass "$(po_stamp_legs_json)" ''
 	printf '%s\n' "$block"
 	printf 'po stamp: wrote %s\n' "$file" >&2
