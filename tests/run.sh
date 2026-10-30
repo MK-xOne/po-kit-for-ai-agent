@@ -2736,6 +2736,38 @@ ex = c.toggle_expanded(set(), ka)
 check("dashboard decisions: toggling opens then closes an entry", ex == {ka} and c.toggle_expanded(ex, ka) == set())
 check("dashboard decisions: an expanded entry stays across a refresh", c.prune_expanded({ka, kb}, [{"project": "p", "item": "1"}, {"project": "q", "item": "1"}]) == {ka, kb})
 check("dashboard decisions: an entry that left the feed drops out", c.prune_expanded({ka, kb}, [{"project": "q", "item": "1"}]) == {kb})
+# v0.71: an open card stays open, with its text, cursor and focus, across feed refreshes; only its item line closes it.
+_f1 = [{"project": "p", "item": "1", "id": "a1", "kind": "unformatted", "asked_at": "2026-10-30T10:00:00Z"},
+       {"project": "q", "item": "1", "id": "b1", "kind": "choice", "asked_at": "2026-10-30T11:00:00Z"}]
+_f1b = json.loads(json.dumps([dict(reversed(list(e.items()))) for e in _f1]))  # the same feed, keys in another order
+_f2 = _f1 + [{"project": "r", "item": "2", "id": "c1", "kind": "unformatted", "asked_at": "2026-10-30T12:00:00Z"}]
+check("dashboard decisions: a refresh with the same feed is the same (no rebuild), key order aside", c.decisions_same(_f1, _f1b))
+check("dashboard decisions: a changed feed, or the first one, is not the same (rebuild)", not c.decisions_same(_f1, _f2) and not c.decisions_same(None, _f1) and not c.decisions_same(_f1, _f1[:1]))
+def _type_across_refresh(new_feed):
+    """The window state while typing into card p/1 when the feed refreshes: what redraw_decisions keeps."""
+    expanded = c.toggle_expanded(set(), ka)  # the owner clicked the item line: open
+    typed = "two words "  # trailing space: a draft is kept as typed
+    picks = {"text": typed}
+    drafts = {"a1": dict(picks)}
+    focus = ("a1", "text", len(typed))  # the box has the focus, the cursor after the last character
+    if c.decisions_same(_f1, new_feed):
+        return expanded, drafts["a1"]["text"], focus, False  # nothing rebuilt: the same widgets
+    ids = {e["id"] for e in new_feed}
+    return (c.prune_expanded(expanded, new_feed), {k: v for k, v in drafts.items() if k in ids}["a1"]["text"],
+            c.answer_focus(focus, new_feed, {}), True)
+for _name, _feed in (("the same", _f1b), ("a changed", _f2)):
+    _exp, _text, _focus, _rebuilt = _type_across_refresh(_feed)
+    check("dashboard decisions: typing across a refresh with %s feed keeps the card open, the text, the cursor and the focus" % _name,
+          ka in _exp and _text == "two words " and _focus == ("a1", "text", 10) and _rebuilt == (_name != "the same"))
+    check("dashboard decisions: after a refresh with %s feed, a click on the item line closes the card" % _name, ka not in c.toggle_expanded(_exp, ka))
+check("dashboard decisions: the focus is not given back to a card that left the feed or was answered",
+      c.answer_focus(("a1", "text", 3), _f1[1:], {}) is None and c.answer_focus(("a1", "text", 3), _f1, {"a1": {"display": "sending…"}}) is None
+      and c.answer_focus(None, _f1, {}) is None and c.answer_focus(("b1", "note", 0), _f1, {}) == ("b1", "note", 0))
+check("dashboard answers: a draft kept as typed is trimmed only on the way out",
+      c.answer_params("unformatted", {"text": " two words \n"}) == {"text": "two words"}
+      and c.answer_params("choice", {"choice": None, "note": "mine "})["text"] == "mine"
+      and c.answer_params("action", {"result": "Pass", "note": "  "})["note"] is None)
+check("dashboard answers: spaces alone are not ready", not c.answer_ready("unformatted", {"text": "   "}) and not c.answer_ready("choice", {"choice": None, "note": " \n "}))
 check("dashboard decisions: asked_at is shown relative to now", [r["asked"] for r in dr] == ["1d ago", "3h ago", "30m ago"])
 check("dashboard decisions: under a minute, or ahead of the clock, is just now",
       c.ago(now, now) == "just now" and c.ago(now - datetime.timedelta(seconds=59), now) == "just now" and c.ago(now + datetime.timedelta(hours=1), now) == "just now")

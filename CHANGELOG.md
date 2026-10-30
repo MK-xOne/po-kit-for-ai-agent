@@ -12,6 +12,15 @@ Unreleased becomes `## Release N (YYYY-MM-DD): <theme>`.
 
 ## Unreleased
 
+## Release 18 (2026-10-30): an open decision card stays open while the owner types (patch to Release 17)
+
+**Agents:** nothing new. **Adopt:** nothing to turn on; install the release on the machine that shows the dashboard.
+
+
+### An open decision card stays open while the owner types (v0.71, 2026-10-30)
+
+Fixes release 17: typing in a card's answer box closed the card after a few characters. Every 5 s refresh rebuilt every card, the box being typed in lost its focus to the first card's item line, and the next space pressed that line. A refresh that brings the same decisions now rebuilds nothing (only the "asked … ago" text moves on); a changed feed rebuilds and gives the box back its focus and cursor; a draft keeps its spaces as typed (trimmed only when sent). A card closes only on a click of its item line. **Agents:** nothing new. **Adopt:** nothing to turn on; install the release on the machine that shows the dashboard.
+
 ## Release 17 (2026-10-30): multi-line answer box, one install block per project
 
 **Agents:** rebuild the cumulative bundle before posting a look card, name the build on the card with `requires` (`ask-mk --requires`), never write an install command on a card; action cards hold only commands that run as written. **Adopt:** on the machine that shows the dashboard, set `--install-dir` or `PO_DASHBOARD_INSTALL_DIR` to the absolute directory holding the built packages; unset, the install block says `set install_dir`. Nothing else to turn on.

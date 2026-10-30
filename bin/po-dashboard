@@ -227,6 +227,8 @@ def main():
             self.answer_token = os.environ.get(core.ANSWER_TOKEN_ENV, "")
             self.answers = {}  # entry id -> {"answer_id": str, "body": dict, "display": str}
             self.drafts = {}  # entry id -> unsent answer draft (window-level, survives redraw)
+            self.answer_views = {}  # (entry id, "text" or "note") -> the TextView of that answer box now
+            self.asked_labels = []  # (label, entry): the "asked … ago" texts, moved on in place at each refresh
             self.read_only_said = False  # shows "read-only" once in the status line
             self.view = "events"
             self.events_failed = False
@@ -328,9 +330,9 @@ def main():
             self.stack.set_visible_child_name("events")  # not the first page added (Team): v0.32 showed it at start
             self.decisions_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
             self.decisions_list.add_css_class("po-list")
-            decisions_scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.AUTOMATIC)
-            decisions_scroll.set_child(self.decisions_list)
-            self.stack.add_named(decisions_scroll, "decisions")
+            self.decisions_scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.AUTOMATIC)
+            self.decisions_scroll.set_child(self.decisions_list)
+            self.stack.add_named(self.decisions_scroll, "decisions")
             self.projects_sig = None  # what the cards show now; a refresh that changes nothing touches nothing
             self.pstate = core.project_view_state(a.project)  # open project (None = overview) and per-project filter
             self.pscreen_sig = None
@@ -595,8 +597,13 @@ def main():
         def on_decisions(self, text, decisions):
             self.decisions_failed = False
             self.decisions_error.set_visible(False)
+            same = core.decisions_same(self.decisions if self.decisions_text is not None else None, decisions)
             self.decisions_text, self.decisions = text, decisions
-            self.redraw_decisions()  # every refresh: the "asked … ago" text moves on with the clock
+            if same:  # nothing changed: the cards (and the box being typed in) stay; the clock text moves on
+                for label, entry in self.asked_labels:
+                    label.set_text("asked " + core.decision_row(entry)["asked"])
+            else:
+                self.redraw_decisions()
             self.show_status()
             return False
 
@@ -936,6 +943,16 @@ def main():
             answer_ids = {str(e.get("id") or "") for e in self.decisions if e.get("id")}
             self.answers = {k: v for k, v in self.answers.items() if k in answer_ids}
             self.drafts = {k: v for k, v in self.drafts.items() if k in answer_ids}
+            focus = None  # the answer box being typed in, given back its focus and cursor once rebuilt
+            focused = self.win.get_focus()
+            for (aid, field), view in self.answer_views.items():
+                if view is focused:
+                    buf = view.get_buffer()
+                    focus = (aid, field, buf.get_iter_at_mark(buf.get_insert()).get_offset())
+            focus = core.answer_focus(focus, self.decisions, self.answers)
+            vadj = self.decisions_scroll.get_vadjustment()
+            scroll = vadj.get_value()
+            self.answer_views, self.asked_labels = {}, []
             child = self.decisions_list.get_first_child()
             while child is not None:
                 nxt = child.get_next_sibling()
@@ -961,6 +978,7 @@ def main():
                 waiting = self.label("waiting for " + r["waiting_for"], "po-muted", max_width_chars=24, ellipsize=3)
                 asked = self.label("asked " + r["asked"], "po-muted", width_chars=14, max_width_chars=20, ellipsize=3)
                 asked.set_tooltip_text(r["asked_local"] or None)
+                self.asked_labels.append((asked, entry))
                 if r.get("asked_by"):
                     asked_by = self.label(r["asked_by"], "po-muted", width_chars=8, max_width_chars=16, ellipsize=3)
                 else:
@@ -991,6 +1009,12 @@ def main():
                     url.set_tooltip_text(r["thread_url"])
                     card.append(url)
                 self.decisions_list.append(card)
+            view = self.answer_views.get(focus[:2]) if focus else None
+            if view is not None:
+                buf = view.get_buffer()
+                buf.place_cursor(buf.get_iter_at_offset(focus[2]))
+                view.grab_focus()
+            GLib.idle_add(lambda: vadj.set_value(scroll) and False)
 
         def command_row(self, command, margin=36):
             """A command in its own selectable monospace block with a Copy button."""
@@ -1088,6 +1112,7 @@ def main():
                     controls.append(btn)
                 write_in, write_in_view = self.answer_box("or write your own", draft.get("note"), send, picks)
                 write_in_view.get_buffer().connect("changed", self.on_answer_note, aid, "choice", send, picks)
+                self.answer_views[(aid, "note")] = write_in_view
                 controls.append(write_in)
             elif r["kind"] == "action":
                 group = None
@@ -1113,12 +1138,14 @@ def main():
                 controls.append(step_box)
                 note, note_view = self.answer_box("note", draft.get("note"), send, picks)
                 note_view.get_buffer().connect("changed", self.on_answer_note, aid, "action", send, picks)
+                self.answer_views[(aid, "note")] = note_view
                 controls.append(note)
                 picks["step_box"] = step_box
             else:  # unformatted
                 text, text_view = self.answer_box("Type your answer…", draft.get("text"), send, picks)
                 text.set_hexpand(True)
                 text_view.get_buffer().connect("changed", self.on_answer_text, aid, send, picks)
+                self.answer_views[(aid, "text")] = text_view
                 controls.append(text)
             if r["kind"] == "action" and picks.get("result") == "Failed" and picks.get("step_box"):
                 picks["step_box"].set_visible(True)
@@ -1218,13 +1245,13 @@ def main():
             self._draft_changed(aid, "action", send, picks)
 
         def on_answer_note(self, buf, aid, kind, send, picks):
-            """The note or write-your-own text box changed."""
-            picks["note"] = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False).strip()
+            """The note or write-your-own text box changed; kept as typed (answer_params trims it)."""
+            picks["note"] = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
             self._draft_changed(aid, kind, send, picks)
 
         def on_answer_text(self, buf, aid, send, picks):
-            """The unformatted text box changed."""
-            picks["text"] = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False).strip()
+            """The unformatted text box changed; kept as typed (answer_params trims it)."""
+            picks["text"] = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
             self._draft_changed(aid, "unformatted", send, picks)
 
         def on_send_answer(self, button, aid, r, picks):

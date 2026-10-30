@@ -187,20 +187,25 @@ def answer_ready(kind, picks):
         if len((picks.get(field) or "").strip()) > ANSWER_MAX_TEXT:
             return False
     if kind == "choice":
-        return picks.get("choice") is not None or bool(picks.get("note"))
+        return picks.get("choice") is not None or bool((picks.get("note") or "").strip())
     if kind == "action":
         return picks.get("result") == "Pass" or (picks.get("result") == "Failed" and picks.get("step") is not None)
-    return bool(picks.get("text"))
+    return bool((picks.get("text") or "").strip())
 
 
 def answer_params(kind, picks):
-    """The answer_body keyword fields for a draft: lowercase result, step only for failed, empty text null."""
+    """The answer_body keyword fields for a draft: lowercase result, step only for failed, text trimmed, empty text null.
+
+    The draft keeps the box's text as typed (spaces and all, so a rebuilt box shows it unchanged);
+    the trim happens here, on the way out.
+    """
+    note = (picks.get("note") or "").strip() or None
     if kind == "choice":
-        return {"option": picks.get("choice"), "text": picks.get("note") or None}
+        return {"option": picks.get("choice"), "text": note}
     if kind == "action":
         failed = picks.get("result") == "Failed"
-        return {"result": "failed" if failed else "pass", "step": picks.get("step") if failed else None, "note": picks.get("note") or None}
-    return {"text": picks.get("text")}
+        return {"result": "failed" if failed else "pass", "step": picks.get("step") if failed else None, "note": note}
+    return {"text": (picks.get("text") or "").strip()}
 
 
 def answer_state(status_code, reason="", host=None):
@@ -905,6 +910,32 @@ def toggle_expanded(expanded, key):
 def prune_expanded(expanded, entries):
     """The expanded decisions still in the feed; one that left the feed drops out."""
     return expanded & {decision_key(e) for e in entries}
+
+
+def decisions_same(old, new):
+    """Whether a refresh brought the same decisions (key order and spacing aside).
+
+    Then the cards are not rebuilt: an open card keeps its box, its text, its cursor and
+    its focus; only the "asked … ago" text moves on with the clock.
+    """
+    if old is None:
+        return False
+    return json.dumps(old, sort_keys=True) == json.dumps(new, sort_keys=True)
+
+
+def answer_focus(focus, entries, answers):
+    """The answer box to give the focus back to after the cards are rebuilt, or None.
+
+    focus is (entry id, field, cursor offset) for the box that had the focus before the
+    rebuild (field "text" or "note"), or None. It is kept while the entry is still in the
+    feed and not answered (an answered card has no box any more).
+    """
+    if focus is None:
+        return None
+    aid = focus[0]
+    if aid in answers or aid not in {str(e.get("id") or "") for e in entries if e.get("id")}:
+        return None
+    return focus
 
 
 def decision_check_lines(entries, now=None, tz=None):
