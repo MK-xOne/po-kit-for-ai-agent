@@ -73,6 +73,15 @@ can show it as a card. The ask carries an `id` (the ask's own message id) and it
   own `command` field, and `done_when`: what the person answering should see if it worked, e.g.
   `On the build host: 1. restart the viewer ... done when the page shows the new tag`.
 
+An action holds only commands that run as written: no placeholders such as `<package>`.
+If an input is not ready (a file not yet delivered, a package not yet built), do not post
+the card yet. Each command sits in its own copy-paste code block and names where to run it.
+
+**A look card is posted only when its item is in the current bundle:** rebuild the cumulative
+bundle first. The card names the build with `requires` and carries no install command. A card
+with a placeholder, a bare install-file name, an install step beside `requires`, or a `requires`
+that is not the current bundle is not shown, and its asker gets one `FIX?` with the reason.
+
 An ask without these fields shows as `unformatted` and may wait longer.
 
 ## When po-kit changes

@@ -487,7 +487,21 @@ the same from any worktree.
   for every kind. Each kind has a badge and colour (Choice the accent, Action the `warn`
   colour); a `kind` entry with an unknown kind, a missing `id` or a missing or malformed
   field shows as `unformatted` in the error colour, so it stays visible. An entry without
-  `kind` displays as before. Order: Choices, then Actions, then unformatted and legacy,
+  `kind` displays as before. An action may also carry `"requires": {"package": "<file name>",
+  "sha256": "<64 lowercase hex>"}`, the build the look needs: `package` is a plain file name (no
+  `/`, no `<`, no whitespace), and a malformed `requires` makes the entry `unformatted`. The card
+  shows `build: <package>`; the dashboard, not the asker, writes the install: above each project's
+  cards one `Install this build` block names the package and gives two commands, each in its own
+  copy box, built from `--install-dir` or `PO_DASHBOARD_INSTALL_DIR` (an absolute path on the
+  viewer's machine, no default; unset, the block says `set install_dir` and shows no command):
+  ```
+  cd /home/me/pkgs && sha256sum -c <<< '<sha256>  <package>'
+  sudo pacman -U /home/me/pkgs/<package>
+  ```
+  with the real values filled in. When a project's cards name different builds, the block shows
+  the newest asked card's build and each card on another build is marked
+  `needs <package>: install it first`; a project never gets two blocks. **When `requires` is set,
+  the action's steps must not hold install commands**: they hold only the look steps. Order: Choices, then Actions, then unformatted and legacy,
   each group oldest first. An `Actions` toggle and a `Decisions` toggle in the second button row
   (both on by default): `Actions` hides the Action entries, `Decisions` hides the Choice
   entries; unformatted and legacy entries stay visible under both. The status line says
@@ -502,7 +516,8 @@ read-only and the status line says `read-only` once when the view opens. The bea
 for the POST is read only from `PO_DASHBOARD_ANSWER_TOKEN` (never a flag). Esc closes the
 window. `--check` prints the rows the window would show, without a
   display (`--all` for every event, then the team lines when a team feed is set, then the
-  decisions lines (the kind first, `legacy` for no kind; the Actions filter is ignored) when a decisions feed is set, then one line per project when a
+  decisions lines (the kind first, `legacy` for no kind; the Actions filter is ignored) when a decisions feed is set, followed by
+  `install | <project> | ...` lines (the package, each command or `set install_dir`, then each mismatch mark), then one line per project when a
   projects feed is set; exit 2 when a URL is unreachable);
   `--projects-url` or `PO_DASHBOARD_PROJECTS_URL` (no default; `--projects-url`
   wins; an http(s) URL or a file, like the team feed) reads the projects feed, refreshed
@@ -540,7 +555,11 @@ window. `--check` prints the rows the window would show, without a
     step numbers) and a one-line note box; Send is enabled once a step is chosen
     (for Pass, immediately).
   - **Unformatted** — a free-text box; Send is enabled once it is non-empty.
-  No Enter-to-send, no confirmation dialog. The POST runs in a worker thread (20 s
+  The write-in, note and free-text boxes are multi-line: they grow to about 8 lines and
+  then scroll, Enter inserts a newline and Ctrl+Enter presses Send when it is enabled. A
+  counter under each box reads `n / 2000` (characters of the stripped text) and turns the
+  error colour above 2000, where Send stays disabled; nothing is truncated. Line breaks
+  are kept in the posted body. No confirmation dialog. The POST runs in a worker thread (20 s
   timeout) and never blocks the UI; the answer state is kept in the window state keyed by
     `id`, re-applied on rebuild, pruned when the entry leaves the feed. The card
     shows the result:

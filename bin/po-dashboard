@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """po-dashboard: a desktop window showing the gate events of a po serve.
 
-    po-dashboard [--url <url>] [--team-url <url>] [--decisions-url <url>] [--answer-url <url>] [--view events|team|decisions|reports] [--theme auto|light|dark] [--all] [--size WxH] [--check] [--screenshot <png>] [--screenshot-delay <s>]
+    po-dashboard [--url <url>] [--team-url <url>] [--decisions-url <url>] [--answer-url <url>] [--install-dir <dir>] [--view events|team|decisions|reports] [--theme auto|light|dark] [--all] [--size WxH] [--check] [--screenshot <png>] [--screenshot-delay <s>]
 
 The URL is the events JSON (a JSON array or one object per line, e.g. the
 /events.json of `po serve`); --url or PO_DASHBOARD_URL, no default. GTK 4 and
@@ -26,7 +26,11 @@ shows the result: `answered · sent` (muted, controls disabled; 200/201), `alrea
 re-posts the same body. The POST runs in a worker thread and never blocks the UI; the answer
 state is kept in the window state keyed by id, re-applied on rebuild, pruned when the entry
 leaves the feed. Without the sink the view stays read-only (`read-only` shown once in the
-status line). No Enter-to-send, no confirmation dialog. Exit codes: 1 usage, 2 GTK or PyGObject missing
+status line). An action may carry `requires` {package, sha256}: the card shows the package name, and above
+each project's cards one `Install this build` block (the newest card's build) gives the sha256 check and the
+`sudo pacman -U` command, each with a Copy button, built from --install-dir or PO_DASHBOARD_INSTALL_DIR (an
+absolute path, no default; unset, the block says `set install_dir`); a card needing another build is marked
+`needs <package>: install it first`. No Enter-to-send, no confirmation dialog. Exit codes: 1 usage, 2 GTK or PyGObject missing
 (or, with --check, the feed unreachable).
 """
 import argparse
@@ -75,6 +79,7 @@ def main():
     ap.add_argument("--decisions-url", help="decisions feed JSON URL or file (default: $%s; none = no Decisions view)" % core.DECISIONS_URL_ENV)
     ap.add_argument("--projects-url", help="projects feed JSON URL or file (default: $%s; none = no Projects view)" % core.PROJECTS_URL_ENV)
     ap.add_argument("--answer-url", help="where to POST answers (default: $%s; none = read-only Decisions)" % core.ANSWER_URL_ENV)
+    ap.add_argument("--install-dir", help="absolute dir holding the builds that cards name with requires (default: $%s; none = no install command)" % core.INSTALL_DIR_ENV)
     ap.add_argument("--view", choices=("events", "team", "decisions", "projects", "reports"), default="events", help="the view to start in (team, decisions and projects need their feed)")
     ap.add_argument("--project", metavar="NAME", help="with --view projects: open straight on this project's screen")
     ap.add_argument("--theme", choices=("auto", "light", "dark"), default="auto")
@@ -96,6 +101,7 @@ def main():
         decisions_url = core.resolve_decisions_url(a.decisions_url)
         projects_url = core.resolve_projects_url(a.projects_url)
         answer_url = core.resolve_answer_url(a.answer_url)
+        install_dir = core.resolve_install_dir(a.install_dir)
     except core.DashboardError as e:
         die(str(e))
     if a.view == "team" and not team_url:
@@ -115,7 +121,8 @@ def main():
                 print("\n".join(core.team_check_lines(core.apply_team_order(core.parse_team(core.fetch(team_url)), order))))
             if decisions_url:
                 print("decisions:")
-                print("\n".join(core.decision_check_lines(core.parse_decisions(core.fetch(decisions_url)))))
+                decisions = core.parse_decisions(core.fetch(decisions_url))
+                print("\n".join(core.decision_check_lines(decisions) + core.install_check_lines(decisions, install_dir)))
             if projects_url:
                 print("projects:")
                 print("\n".join(core.project_check_lines(core.parse_projects(core.fetch(projects_url)))))
@@ -216,6 +223,7 @@ def main():
             self.decisions_shown = core.load_decisions_shown(self.filter_path)  # the viewer's own Decisions filter
             self.decisions_text = None
             self.answer_url = answer_url
+            self.install_dir = install_dir
             self.answer_token = os.environ.get(core.ANSWER_TOKEN_ENV, "")
             self.answers = {}  # entry id -> {"answer_id": str, "body": dict, "display": str}
             self.drafts = {}  # entry id -> unsent answer draft (window-level, survives redraw)
@@ -935,9 +943,14 @@ def main():
                 child = nxt
             groups = [Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL) for _ in range(4)]
             shown, _ah, _dh = core.filter_decisions(self.decisions, self.actions_shown, self.decisions_shown)
+            plan = core.install_plan(shown, self.install_dir)
+            marks = {k: m for b in plan.values() for k, m in b["mismatched"].items()}
             for entry in core.sort_decisions(shown):
                 r = core.decision_row(entry)
                 key = core.decision_key(entry)
+                block = plan.pop(r["project"], None)  # once per project, above its first card
+                if block is not None:
+                    self.decisions_list.append(self.install_block(r["project"], block))
                 card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
                 card.add_css_class("po-card")
                 top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
@@ -970,12 +983,39 @@ def main():
                 header.set_child(top)
                 header.connect("clicked", self.on_decision_toggle, expanded, key)
                 card.append(header)
+                if key in marks:
+                    card.append(self.label(marks[key], "po-warn", wrap=True))
                 card.append(expanded)
                 if r["thread_url"]:
                     url = self.label(r["thread_url"], "po-muted", selectable=True, ellipsize=2)
                     url.set_tooltip_text(r["thread_url"])
                     card.append(url)
                 self.decisions_list.append(card)
+
+        def command_row(self, command, margin=36):
+            """A command in its own selectable monospace block with a Copy button."""
+            cmd = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, margin_start=margin)
+            lab = Gtk.Label(label=command, xalign=0, wrap=True, selectable=True, hexpand=True, css_classes=["monospace"])
+            lab.add_css_class("po-muted")
+            cmd.append(lab)
+            copy = Gtk.Button(label="Copy")
+            copy.add_css_class("po-small")
+            copy.connect("clicked", self.on_copy, command)
+            cmd.append(copy)
+            return cmd
+
+        def install_block(self, project, block):
+            """One project's `Install this build` card: the package, then the sha256 check and the install, or the note."""
+            card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            card.add_css_class("po-card")
+            card.append(self.label("Install this build \u00b7 %s" % project, "po-kind", "po-kind-action"))
+            card.append(self.label(block["package"], "po-text", selectable=True, wrap=True))
+            if block["commands"]:
+                for command in block["commands"]:
+                    card.append(self.command_row(command, margin=12))
+            else:
+                card.append(self.label(block["note"], "po-warn"))
+            return card
 
         def fill_decision(self, box, r):
             """The expanded part of a card: the full waiting_for, then the question and options or the steps."""
@@ -998,16 +1038,12 @@ def main():
                         box.append(text(o["description"], "po-muted", margin_start=36))
             elif r["kind"] == "action":
                 box.append(text("on " + r["machine"], "po-text"))
+                if r["requires"]:
+                    box.append(text("build: " + r["requires"]["package"], "po-muted"))
                 for st in r["steps"]:
                     box.append(text("%d. %s" % (st["n"], st["text"]), "po-text", margin_start=12))
                     if st["command"]:
-                        cmd = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, margin_start=36)
-                        cmd.append(text(st["command"], "po-muted", hexpand=True, css_classes=["monospace"]))
-                        copy = Gtk.Button(label="Copy")
-                        copy.add_css_class("po-small")
-                        copy.connect("clicked", self.on_copy, st["command"])
-                        cmd.append(copy)
-                        box.append(cmd)
+                        box.append(self.command_row(st["command"]))
                 box.append(text("done when: " + r["done_when"], "po-muted"))
 
         def on_copy(self, button, command):
@@ -1050,11 +1086,8 @@ def main():
                         btn.set_active(True)
                     btn.connect("toggled", self.on_choice_pick, aid, o["label"], send, picks)
                     controls.append(btn)
-                write_in = Gtk.Entry()
-                write_in.set_placeholder_text("or write your own")
-                if draft.get("note"):
-                    write_in.set_text(draft["note"])
-                write_in.connect("changed", self.on_answer_note, aid, "choice", send, picks)
+                write_in, write_in_view = self.answer_box("or write your own", draft.get("note"), send, picks)
+                write_in_view.get_buffer().connect("changed", self.on_answer_note, aid, "choice", send, picks)
                 controls.append(write_in)
             elif r["kind"] == "action":
                 group = None
@@ -1078,20 +1111,14 @@ def main():
                     btn.connect("toggled", self.on_action_step, aid, n, send, picks)
                     step_box.append(btn)
                 controls.append(step_box)
-                note = Gtk.Entry()
-                note.set_placeholder_text("note")
-                if draft.get("note"):
-                    note.set_text(draft["note"])
-                note.connect("changed", self.on_answer_note, aid, "action", send, picks)
+                note, note_view = self.answer_box("note", draft.get("note"), send, picks)
+                note_view.get_buffer().connect("changed", self.on_answer_note, aid, "action", send, picks)
                 controls.append(note)
                 picks["step_box"] = step_box
             else:  # unformatted
-                text = Gtk.Entry()
-                text.set_placeholder_text("Type your answer…")
+                text, text_view = self.answer_box("Type your answer…", draft.get("text"), send, picks)
                 text.set_hexpand(True)
-                if draft.get("text"):
-                    text.set_text(draft["text"])
-                text.connect("changed", self.on_answer_text, aid, send, picks)
+                text_view.get_buffer().connect("changed", self.on_answer_text, aid, send, picks)
                 controls.append(text)
             if r["kind"] == "action" and picks.get("result") == "Failed" and picks.get("step_box"):
                 picks["step_box"].set_visible(True)
@@ -1099,6 +1126,67 @@ def main():
             send.connect("clicked", self.on_send_answer, aid, r, picks)
             controls.append(send)
             box.append(controls)
+
+        def answer_box(self, placeholder, initial, send, picks):
+            """A multi-line answer box: (widget, TextView). Grows to about 8 lines, then scrolls.
+
+            The widget holds the scrolled TextView (placeholder drawn as an overlay label,
+            hidden once the buffer has text) and the n / 2000 counter. Enter inserts a newline;
+            Ctrl+Enter presses Send when it is sensitive.
+            """
+            view = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR, accepts_tab=False)
+            view.set_top_margin(4)
+            view.set_bottom_margin(4)
+            view.set_left_margin(6)
+            view.set_right_margin(6)
+            line = max(view.create_pango_layout("Mg").get_pixel_size()[1], 16) + 8
+            scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, vscrollbar_policy=Gtk.PolicyType.AUTOMATIC)
+            scroller.set_propagate_natural_height(True)
+            scroller.set_min_content_height(line)
+            scroller.set_max_content_height(line * 8)
+            scroller.set_child(view)
+            scroller.set_hexpand(True)
+            hint = Gtk.Label(label=placeholder, xalign=0, halign=Gtk.Align.START, valign=Gtk.Align.START, margin_start=7, margin_top=4)
+            hint.add_css_class("po-muted")
+            hint.set_can_target(False)
+            overlay = Gtk.Overlay()
+            overlay.set_child(scroller)
+            overlay.add_overlay(hint)
+            counter = Gtk.Label(label="", xalign=1)
+            counter.add_css_class("po-muted")
+            buf = view.get_buffer()
+
+            def refresh(_buf=None):
+                text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+                hint.set_visible(not text)
+                label, over = core.answer_counter(text)
+                counter.set_text(label)
+                if over:
+                    counter.remove_css_class("po-muted")
+                    counter.add_css_class("po-error")
+                else:
+                    counter.remove_css_class("po-error")
+                    counter.add_css_class("po-muted")
+
+            if initial:
+                buf.set_text(initial)
+            buf.connect("changed", refresh)
+            refresh()
+            keys = Gtk.EventControllerKey()
+
+            def on_key(_ctl, keyval, _code, state):
+                if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter) and state & Gdk.ModifierType.CONTROL_MASK:
+                    if send.get_sensitive():
+                        send.emit("clicked")
+                    return True
+                return False
+
+            keys.connect("key-pressed", on_key)
+            view.add_controller(keys)
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
+            box.append(overlay)
+            box.append(counter)
+            return box, view
 
         def _draft_changed(self, aid, kind, send, picks):
             """Store the draft and set Send from the one readiness rule."""
@@ -1129,14 +1217,14 @@ def main():
             picks["step"] = step
             self._draft_changed(aid, "action", send, picks)
 
-        def on_answer_note(self, entry, aid, kind, send, picks):
+        def on_answer_note(self, buf, aid, kind, send, picks):
             """The note or write-your-own text box changed."""
-            picks["note"] = entry.get_text().strip()
+            picks["note"] = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False).strip()
             self._draft_changed(aid, kind, send, picks)
 
-        def on_answer_text(self, entry, aid, send, picks):
+        def on_answer_text(self, buf, aid, send, picks):
             """The unformatted text box changed."""
-            picks["text"] = entry.get_text().strip()
+            picks["text"] = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False).strip()
             self._draft_changed(aid, "unformatted", send, picks)
 
         def on_send_answer(self, button, aid, r, picks):

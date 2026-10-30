@@ -31,6 +31,7 @@ PROJECTS_URL_ENV = "PO_DASHBOARD_PROJECTS_URL"
 DECISIONS_FILTER_ENV = "PO_DASHBOARD_DECISIONS_FILTER"  # the saved Actions filter's file, instead of the default under the config dir
 ANSWER_URL_ENV = "PO_DASHBOARD_ANSWER_URL"  # where to POST answers (v0.49); none = read-only Decisions
 ANSWER_TOKEN_ENV = "PO_DASHBOARD_ANSWER_TOKEN"  # bearer token for the answer POST (v0.49), env only
+INSTALL_DIR_ENV = "PO_DASHBOARD_INSTALL_DIR"  # where the builds named by `requires` sit on the viewer's machine (v0.69)
 CLIENT = "po-dashboard"
 TEAM_ORDER_ENV = "PO_DASHBOARD_TEAM_ORDER"  # the saved order's file, instead of the default under the config dir
 FADE_SECONDS = 60
@@ -121,6 +122,20 @@ def resolve_answer_url(arg, env=None):
     return url
 
 
+def resolve_install_dir(arg, env=None):
+    """--install-dir wins over the environment; neither is None (no Install command, no default guess).
+
+    The directory must be an absolute path that a shell reads as written: no `<`, `>`, quote or whitespace.
+    """
+    env = os.environ if env is None else env
+    path = (arg or env.get(INSTALL_DIR_ENV) or "").strip()
+    if not path:
+        return None
+    if not _install_dir_ok(path):
+        raise DashboardError("install_dir is not an absolute plain path: %s" % path)
+    return path.rstrip("/") or "/"
+
+
 def answer_id():
     """A lowercase dashed uuid4 (8-4-4-4-12 hex) for a new answer (made once per Send, kept with the draft)."""
     return str(uuid.uuid4())
@@ -151,12 +166,26 @@ def answer_body(entry, answer_id, option=None, text=None, result=None, step=None
     }
 
 
+# Mirrors the receiver's MAX_TEXT: characters of the stripped text per answer field.
+ANSWER_MAX_TEXT = 2000
+
+
+def answer_counter(text):
+    """The counter under an answer box: ("12 / 2000", over_limit), counting the stripped text."""
+    n = len((text or "").strip())
+    return ("%d / %d" % (n, ANSWER_MAX_TEXT), n > ANSWER_MAX_TEXT)
+
+
 def answer_ready(kind, picks):
     """Whether the draft in picks may be sent: the rule Send's sensitivity follows.
 
     choice: an option, or a write-in alone; action: Pass, or Failed with a step;
-    unformatted: non-empty text.
+    unformatted: non-empty text. Text, note or write-in over ANSWER_MAX_TEXT is never ready
+    (the box is not truncated, so nothing typed is lost).
     """
+    for field in ("note", "text"):
+        if len((picks.get(field) or "").strip()) > ANSWER_MAX_TEXT:
+            return False
     if kind == "choice":
         return picks.get("choice") is not None or bool(picks.get("note"))
     if kind == "action":
@@ -720,6 +749,8 @@ def decision_shape(entry):
     for st in steps:
         if not isinstance(st, dict) or not _text(st.get("text")) or not _optional_text(st.get("command")):
             return "unformatted"
+    if "requires" in entry and requires_of(entry) is None:
+        return "unformatted"
     return "action"
 
 
@@ -775,11 +806,90 @@ def decision_row(entry, now=None, tz=None):
         row["steps"] = [{"n": i + 1, "text": st["text"].strip(), "command": (st.get("command") or "").strip()}
                         for i, st in enumerate(entry["steps"])]
         row["done_when"] = entry["done_when"].strip()
+        row["requires"] = requires_of(entry)
     return row
 
 
 def decision_rows(entries, now=None, tz=None):
     return [decision_row(e, now, tz) for e in sort_decisions(entries)]
+
+
+# ---- the build an action card needs, and the Install block (v0.69) -----------
+# An action card names its build with `requires`; the dashboard, never the agent, writes the
+# install command from the viewer's install_dir. One Install block per project.
+
+_PACKAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+:@=,-]*")  # a plain file name a shell reads as written
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_INSTALL_DIR = re.compile(r"/[A-Za-z0-9._+:@=,/-]*")
+INSTALL_UNSET = "set install_dir"
+
+
+def _install_dir_ok(path):
+    return isinstance(path, str) and _INSTALL_DIR.fullmatch(path) is not None
+
+
+def requires_of(entry):
+    """The entry's `requires` as {package, sha256}, or None when it is absent or malformed: `package` a plain
+    file name (no `/`, no `<`, no whitespace or shell character), `sha256` 64 lowercase hex."""
+    req = entry.get("requires")
+    if not isinstance(req, dict):
+        return None
+    package, sha = req.get("package"), req.get("sha256")
+    if not isinstance(package, str) or _PACKAGE.fullmatch(package) is None:
+        return None
+    if not isinstance(sha, str) or _SHA256.fullmatch(sha) is None:
+        return None
+    return {"package": package, "sha256": sha}
+
+
+def install_commands(install_dir, requires):
+    """(sha256 check, install) for a build, every path full and nothing to fill in; None when install_dir is not an
+    absolute plain path or requires is malformed. The check feeds `<sha256>  <package>` on stdin with a here-string."""
+    req = requires_of({"requires": requires})
+    if req is None or not _install_dir_ok(install_dir):
+        return None
+    d = install_dir.rstrip("/") or "/"
+    check = "cd %s && sha256sum -c <<< '%s  %s'" % (d, req["sha256"], req["package"])
+    return check, "sudo pacman -U %s/%s" % (d.rstrip("/"), req["package"])
+
+
+def install_mismatch(requires):
+    """The mark on a card whose build is not the one in its project's Install block."""
+    return "needs %s: install it first" % requires["package"]
+
+
+def install_plan(entries, install_dir):
+    """{project: block} for the action entries that carry `requires`; block = {package, sha256, commands, note,
+    mismatched}. The newest asked card's build is the block; commands are None (note `set install_dir`) when
+    install_dir is unset; mismatched maps the decision_key of each card whose build differs to its mark, so one
+    project never gets two blocks."""
+    far = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+    cards = [(e, requires_of(e)) for e in entries if decision_shape(e) == "action" and requires_of(e)]
+    newest = {}
+    for e, req in cards:
+        project, when = str(e.get("project") or ""), parse_time(e.get("asked_at")) or far
+        if project not in newest or when >= newest[project][0]:
+            newest[project] = (when, req)
+    plan = {}
+    for project, (_when, req) in newest.items():
+        commands = install_commands(install_dir, req) if install_dir else None
+        plan[project] = dict(req, commands=commands, note="" if commands else INSTALL_UNSET, mismatched={})
+    for e, req in cards:
+        block = plan[str(e.get("project") or "")]
+        if req != {"package": block["package"], "sha256": block["sha256"]}:
+            block["mismatched"][decision_key(e)] = install_mismatch(req)
+    return plan
+
+
+def install_check_lines(entries, install_dir):
+    """What the Install blocks would show, for --check: per project the package, then each command or the note,
+    then one line per card whose build differs."""
+    out = []
+    for project, b in install_plan(entries, install_dir).items():
+        out.append("install | %s | %s" % (project, b["package"]))
+        out.extend("install | %s | %s" % (project, cmd) for cmd in b["commands"] or (b["note"],))
+        out.extend("install | %s | %s | %s" % (project, item, mark) for (_p, item), mark in b["mismatched"].items())
+    return out
 
 
 def decision_key(entry):

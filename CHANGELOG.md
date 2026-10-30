@@ -12,6 +12,27 @@ Unreleased becomes `## Release N (YYYY-MM-DD): <theme>`.
 
 ## Unreleased
 
+## Release 17 (2026-10-30): multi-line answer box, one install block per project
+
+**Agents:** rebuild the cumulative bundle before posting a look card, name the build on the card with `requires` (`ask-mk --requires`), never write an install command on a card; action cards hold only commands that run as written. **Adopt:** on the machine that shows the dashboard, set `--install-dir` or `PO_DASHBOARD_INSTALL_DIR` to the absolute directory holding the built packages; unset, the install block says `set install_dir`. Nothing else to turn on.
+
+
+### Bundle record, `requires` from the record, cards validated (v0.70, 2026-10-30)
+
+A project keeps one bundle record naming the build and every item waiting for the owner's look; a look card is posted only for an item in the current bundle and names the build with `requires`, and a card that breaks that rule is not shown. **Agents:** rebuild the cumulative bundle before posting a look card, name the build with `requires`, never write an install command on a card.
+
+### Cards name the build, the dashboard writes the install command (v0.69, 2026-10-30)
+
+An action ask may carry `"requires": {"package": "<file name>", "sha256": "<64 hex>"}` (a malformed one makes the ask `unformatted`). `po-dashboard` shows one `Install this build` block per project above its cards: the sha256 check and the `sudo pacman -U` command, each with a Copy button, all paths full, built by `install_commands()` in `dashboard_core` from `--install-dir` / `PO_DASHBOARD_INSTALL_DIR` (absolute, no default; unset, the block says `set install_dir`). Cards on another build than the project's newest are marked `needs <package>: install it first`. **Agents:** name the build with `requires`; never write an install command in an action's steps. **Adopt:** `--install-dir` or `PO_DASHBOARD_INSTALL_DIR` on the viewer's machine.
+
+### Action asks hold runnable commands only (admin, 2026-10-30)
+
+`AGENTS.md` "Asking the owner": an action card may hold only commands that run as written, with no placeholders; if an input is not ready the card is not posted yet. **Agents:** write each command in its own code block and say where to run it. **Adopt:** nothing.
+
+### Dashboard answer box is multi-line, with a counter (v0.68, 2026-10-30)
+
+The write-in, note and free-text fields on a decision card are now growing, scrolling text boxes with an `n / 2000` counter (`ANSWER_MAX_TEXT` in `dashboard_core`); over the limit Send is disabled and nothing is truncated. Ctrl+Enter sends. **Agents:** nothing to do. **Adopt:** nothing.
+
 ## Release 16 (2026-10-30): dashboard answer_id fix (patch to Release 15)
 
 Item v0.67. The dashboard's Send on a decision card was refused with 400 because the client sent a 32-hex `answer_id`; it now sends a dashed uuid4.

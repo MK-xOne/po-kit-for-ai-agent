@@ -2795,6 +2795,73 @@ check("dashboard decisions: unformatted and legacy stay under both", c.filter_de
 check("dashboard decisions: status line with both hidden", c.decisions_status(3, 1, 2) == "3 waiting \u00b7 1 action hidden \u00b7 2 decisions hidden")
 check("dashboard decisions: status line omits zero parts", c.decisions_status(3, 0, 0) == "3 waiting" and c.decisions_status(3, 1, 0) == "3 waiting \u00b7 1 action hidden")
 check("dashboard decisions: check lines ignore the filters", len(c.decision_check_lines([AC, CH], now, utc)) == 2)
+# v0.69: cards name the build with `requires`, the dashboard writes the install command.
+SHA, SHB = "0123456789abcdef" * 4, "fedcba9876543210" * 4
+RQ = {"package": "orchard-1.9.39.r1-1-x86_64.pkg.tar.zst", "sha256": SHA}
+check("dashboard install: --install-dir wins over the environment, the environment is used without it, neither is None",
+      c.resolve_install_dir("/a/pkgs", {"PO_DASHBOARD_INSTALL_DIR": "/b"}) == "/a/pkgs" and c.resolve_install_dir(None, {"PO_DASHBOARD_INSTALL_DIR": "/b/"}) == "/b"
+      and c.resolve_install_dir(None, {}) is None and c.resolve_install_dir(" ", {"PO_DASHBOARD_INSTALL_DIR": " "}) is None)
+for bad_dir in ("pkgs", "~/pkgs", "/a b", "/<dir>", "/a;rm"):
+    try:
+        c.resolve_install_dir(bad_dir, {})
+        check("dashboard install: install_dir %r is refused" % bad_dir, False)
+    except c.DashboardError:
+        check("dashboard install: install_dir %r is refused" % bad_dir, True)
+check("dashboard install: install_commands happy path, exact strings",
+      c.install_commands("/home/me/pkgs", RQ) == ("cd /home/me/pkgs && sha256sum -c <<< '%s  orchard-1.9.39.r1-1-x86_64.pkg.tar.zst'" % SHA,
+                                                  "sudo pacman -U /home/me/pkgs/orchard-1.9.39.r1-1-x86_64.pkg.tar.zst"))
+check("dashboard install: a trailing slash on install_dir gives the same commands", c.install_commands("/home/me/pkgs/", RQ) == c.install_commands("/home/me/pkgs", RQ))
+for name, d, rq in (("a relative dir", "pkgs", RQ), ("a home-relative dir", "~/pkgs", RQ), ("an unset dir", None, RQ), ("an empty dir", "", RQ),
+                    ("a placeholder dir", "/<install dir>", RQ), ("a dir with a space", "/a b", RQ),
+                    ("a package with a path", "/p", dict(RQ, package="sub/orchard.pkg.tar.zst")), ("a package that is an absolute path", "/p", dict(RQ, package="/p/orchard.pkg.tar.zst")),
+                    ("a placeholder package", "/p", dict(RQ, package="<orchard-1.9.39.r1 package>")), ("a package with angle brackets", "/p", dict(RQ, package="orchard-<v>.pkg.tar.zst")),
+                    ("a package with whitespace", "/p", dict(RQ, package="orchard 1.pkg.tar.zst")), ("a package with a quote", "/p", dict(RQ, package="a'b.pkg")),
+                    ("an empty package", "/p", dict(RQ, package="")), ("a package that is not text", "/p", dict(RQ, package=4)),
+                    ("a short sha", "/p", dict(RQ, sha256=SHA[:63])), ("an uppercase sha", "/p", dict(RQ, sha256=SHA.upper())), ("a non-hex sha", "/p", dict(RQ, sha256="g" * 64)),
+                    ("a missing sha", "/p", {"package": RQ["package"]}), ("no requires", "/p", None), ("requires not an object", "/p", "orchard.pkg")):
+    check("dashboard install: install_commands refuses %s" % name, c.install_commands(d, rq) is None)
+check("dashboard install: an action with a good requires is an action, the row passes it through",
+      c.decision_shape(dict(AC, requires=RQ)) == "action" and c.decision_row(dict(AC, requires=RQ), now)["requires"] == RQ)
+check("dashboard install: an action without requires has requires None", c.decision_row(AC, now)["requires"] is None)
+check("dashboard install: an action with a bad requires is unformatted, as other bad fields",
+      all(c.decision_shape(dict(AC, requires=bad)) == "unformatted" for bad in (dict(RQ, package="<pkg>"), dict(RQ, package="a/b"), dict(RQ, sha256="x"), {}, "pkg", None)))
+def card(item, req, at, project="orchard"):
+    return dict(AC, id="id-" + item, project=project, item=item, asked_at=at, steps=[{"text": "look at the sidebar"}], **({"requires": req} if req else {}))
+agree = [card("1.9.39", RQ, "2026-10-29T10:00:00Z"), card("1.9.49", RQ, "2026-10-29T11:00:00Z"), card("1.10.7", RQ, "2026-10-29T12:00:00Z")]
+pl = c.install_plan(agree, "/home/me/pkgs")
+check("dashboard install: cards agreeing give one block with both commands and no mark",
+      list(pl) == ["orchard"] and pl["orchard"]["package"] == RQ["package"] and pl["orchard"]["commands"] == c.install_commands("/home/me/pkgs", RQ)
+      and pl["orchard"]["note"] == "" and pl["orchard"]["mismatched"] == {})
+RQB = {"package": "orchard-1.10.7.r1-1-x86_64.pkg.tar.zst", "sha256": SHB}
+differ = [card("1.9.39", RQ, "2026-10-29T10:00:00Z"), card("1.10.7", RQB, "2026-10-29T12:00:00Z"), card("1.9.49", RQ, "2026-10-29T11:00:00Z")]
+pl = c.install_plan(differ, "/home/me/pkgs")
+check("dashboard install: cards disagreeing give one block, the newest asked build",
+      list(pl) == ["orchard"] and pl["orchard"]["package"] == RQB["package"] and pl["orchard"]["commands"] == c.install_commands("/home/me/pkgs", RQB))
+check("dashboard install: each card on another build is marked needs <package>: install it first",
+      pl["orchard"]["mismatched"] == {("orchard", "1.9.39"): "needs %s: install it first" % RQ["package"], ("orchard", "1.9.49"): "needs %s: install it first" % RQ["package"]})
+check("dashboard install: the same package with another sha256 is another build",
+      c.install_plan([card("a", RQ, "2026-10-29T10:00:00Z"), card("b", dict(RQ, sha256=SHB), "2026-10-29T11:00:00Z")], "/p")["orchard"]["mismatched"] == {("orchard", "a"): "needs %s: install it first" % RQ["package"]})
+pl = c.install_plan(agree, None)
+check("dashboard install: unset install_dir keeps the block with no command and says set install_dir",
+      pl["orchard"]["commands"] is None and pl["orchard"]["note"] == "set install_dir" and pl["orchard"]["package"] == RQ["package"])
+check("dashboard install: one block per project", sorted(c.install_plan(agree + [card("2.0", RQB, "2026-10-29T09:00:00Z", project="harbor")], "/p")) == ["harbor", "orchard"])
+check("dashboard install: cards without requires, choices and unformatted entries make no block",
+      c.install_plan([card("x", None, "2026-10-29T10:00:00Z"), dict(CH, project="orchard", requires=RQ), dict(AC, project="orchard", requires={"package": "<p>", "sha256": SHA})], "/p") == {})
+check("dashboard install: check lines give the package, each command, then the marks",
+      c.install_check_lines(differ, "/p") == ["install | orchard | " + RQB["package"]] + ["install | orchard | " + x for x in c.install_commands("/p", RQB)]
+      + ["install | orchard | 1.9.39 | needs %s: install it first" % RQ["package"], "install | orchard | 1.9.49 | needs %s: install it first" % RQ["package"]]
+      and c.install_check_lines(agree, None) == ["install | orchard | " + RQ["package"], "install | orchard | set install_dir"])
+# No produced command holds a placeholder (<, > beyond the here-string's <<<) or names the package by a bare file name.
+produced = [cmd for d in ("/home/me/pkgs", "/", "/a/b/") for rq in (RQ, RQB) for cmd in c.install_commands(d, rq)]
+def bare(cmd, d, pkg):
+    rest = cmd.replace(d.rstrip("/") + "/" + pkg, "")
+    if cmd.startswith("cd %s && sha256sum -c <<< '" % (d.rstrip("/") or "/")):
+        rest = rest.split("<<<", 1)[0]  # the here-string's line is read inside install_dir
+    return pkg in rest
+check("dashboard install: no produced command holds < or > besides the here-string", produced and all("<" not in x.replace("<<<", "", 1) and ">" not in x for x in produced))
+check("dashboard install: no produced command names the package by a bare file name",
+      all(not bare(cmd, d, rq["package"]) for d in ("/home/me/pkgs", "/", "/a/b/") for rq in (RQ, RQB) for cmd in c.install_commands(d, rq)))
+check("dashboard install: no produced command holds a pipe", all("|" not in x for x in produced))
 check("dashboard decisions: the filter file is under the config dir, or named by the environment",
       c.decisions_filter_path({"XDG_CONFIG_HOME": "/x/cfg"}) == "/x/cfg/po-dashboard/decisions.json" and c.decisions_filter_path({"PO_DASHBOARD_DECISIONS_FILTER": "/y/f.json", "XDG_CONFIG_HOME": "/x"}) == "/y/f.json")
 import tempfile, json
@@ -2989,6 +3056,23 @@ check("dashboard answers: choice with a write-in alone is ready", ar("choice", {
 check("dashboard answers: action Pass with a note is ready", ar("action", {"result": "Pass", "note": "fine"}) and ar("action", {"result": "Pass", "note": ""}))
 check("dashboard answers: action Failed needs a step", not ar("action", {"result": "Failed", "step": None}) and ar("action", {"result": "Failed", "step": 2}) and not ar("action", {"result": None}))
 check("dashboard answers: unformatted needs text", ar("unformatted", {"text": "x"}) and not ar("unformatted", {"text": ""}))
+# v0.68: the 2000-character limit, the counter and multi-line text kept verbatim.
+M = c.ANSWER_MAX_TEXT
+check("dashboard answers: the limit is 2000", M == 2000)
+check("dashboard answers: choice write-in ready at 2000, not at 2001", ar("choice", {"choice": None, "note": "x" * M}) and not ar("choice", {"choice": None, "note": "x" * (M + 1)}))
+check("dashboard answers: a picked option with an over-limit write-in is not ready", not ar("choice", {"choice": "Yes", "note": "x" * (M + 1)}))
+check("dashboard answers: action note ready at 2000, not at 2001", ar("action", {"result": "Pass", "note": "x" * M}) and not ar("action", {"result": "Pass", "note": "x" * (M + 1)}))
+check("dashboard answers: unformatted text ready at 2000, not at 2001", ar("unformatted", {"text": "x" * M}) and not ar("unformatted", {"text": "x" * (M + 1)}))
+check("dashboard answers: the limit counts the stripped text", ar("unformatted", {"text": "  " + "x" * M + "\n "}))
+check("dashboard answers: counter reads n / 2000 and flags over the limit",
+      c.answer_counter("") == ("0 / 2000", False) and c.answer_counter("hello world!") == ("12 / 2000", False)
+      and c.answer_counter("x" * M) == ("2000 / 2000", False) and c.answer_counter("x" * (M + 1)) == ("2001 / 2000", True)
+      and c.answer_counter("  ab \n") == ("2 / 2000", False))
+ml = "line one\n\nline three\n  indented"
+check("dashboard answers: multi-line text is kept verbatim (choice, action, unformatted)",
+      c.answer_params("choice", {"choice": None, "note": ml})["text"] == ml
+      and c.answer_params("action", {"result": "Failed", "step": 1, "note": ml})["note"] == ml
+      and c.answer_params("unformatted", {"text": ml})["text"] == ml)
 ap = c.answer_params
 check("dashboard answers: a write-in alone sends option null and the text", ap("choice", {"choice": None, "note": "mine"}) == {"option": None, "text": "mine"})
 check("dashboard answers: Pass sends lowercase pass, step null even after a Failed step", ap("action", {"result": "Pass", "step": 2, "note": ""}) == {"result": "pass", "step": None, "note": None})
@@ -3265,6 +3349,20 @@ out=$(XDG_CONFIG_HOME="$TMP/cfg" python3 -B "$DB" --url "$CHK_URL" --decisions-u
 mkdir -p "$TMP/cfg/po-dashboard" && echo '{"actions": false}' >"$TMP/cfg/po-dashboard/decisions.json"
 out2=$(XDG_CONFIG_HOME="$TMP/cfg" python3 -B "$DB" --url "$CHK_URL" --decisions-url "$(dirname "$PO")/../examples/decisions-feed.json" --check 2>&1)
 [[ $out2 == "$out" ]] && ok "po-dashboard --check ignores the Actions filter" || bad "dashboard check filter" "$out2"
+# v0.69: --install-dir / PO_DASHBOARD_INSTALL_DIR; --check prints the Install block after the decisions.
+sha=$(printf '%064d' 0)
+printf '[{"project":"orchard","item":"1.9.39","title":"Look","waiting_for":"a look","asked_at":"2026-10-29T10:00:00Z","kind":"action","id":"i1","machine":"laptop","steps":[{"text":"open it"}],"done_when":"seen","requires":{"package":"a-1-x86_64.pkg.tar.zst","sha256":"%s"}}]\n' "$sha" >"$TMP/install.json"
+out=$(env -u PO_DASHBOARD_INSTALL_DIR python3 -B "$DB" --url "$CHK_URL" --decisions-url "$TMP/install.json" --install-dir /x/pkgs --check 2>&1)
+[[ $(tail -3 <<<"$out") == "install | orchard | a-1-x86_64.pkg.tar.zst
+install | orchard | cd /x/pkgs && sha256sum -c <<< '$sha  a-1-x86_64.pkg.tar.zst'
+install | orchard | sudo pacman -U /x/pkgs/a-1-x86_64.pkg.tar.zst" ]] &&
+	ok "po-dashboard --check prints the Install block from --install-dir after the decisions" || bad "dashboard check install" "$out"
+out=$(PO_DASHBOARD_INSTALL_DIR=/y python3 -B "$DB" --url "$CHK_URL" --decisions-url "$TMP/install.json" --check 2>&1)
+[[ $(tail -1 <<<"$out") == "install | orchard | sudo pacman -U /y/a-1-x86_64.pkg.tar.zst" ]] && ok "po-dashboard reads PO_DASHBOARD_INSTALL_DIR" || bad "dashboard install env" "$out"
+out=$(env -u PO_DASHBOARD_INSTALL_DIR python3 -B "$DB" --url "$CHK_URL" --decisions-url "$TMP/install.json" --check 2>&1)
+[[ $(tail -1 <<<"$out") == "install | orchard | set install_dir" ]] && ok "po-dashboard without install_dir shows set install_dir and no command" || bad "dashboard install unset" "$out"
+out=$(python3 -B "$DB" --url http://h/x --install-dir pkgs --check 2>&1)
+[[ $? == 1 && $out == *'install_dir is not an absolute plain path'* ]] && ok "po-dashboard refuses a relative --install-dir" || bad "dashboard install relative" "$out"
 out=$(PO_DASHBOARD_DECISIONS_URL="$TMP/none.json" python3 -B "$DB" --url "$CHK_URL" --decisions-url "$TMP/decisions.json" --check 2>&1)
 [[ $out == *'decisions:'* ]] && ok "po-dashboard --decisions-url wins over PO_DASHBOARD_DECISIONS_URL" || bad "dashboard decisions precedence" "$out"
 out=$(env -u PO_DASHBOARD_DECISIONS_URL python3 -B "$DB" --url "$CHK_URL" --check 2>&1)
@@ -3400,7 +3498,7 @@ def cards(win):
     while c:
         nodes = list(walk(c))
         labels = {n.get_label() for n in nodes if isinstance(n, (Gtk.ToggleButton, Gtk.Button))}
-        ents = [n for n in nodes if isinstance(n, Gtk.Entry)]
+        ents = [n for n in nodes if isinstance(n, Gtk.TextView)]
         if "Pass" in labels:
             out["action"] = nodes
         elif "Yes" in labels:
@@ -3411,8 +3509,14 @@ def cards(win):
     return out
 def btn(nodes, label, cls=Gtk.Button):
     return next(n for n in nodes if isinstance(n, cls) and n.get_label() == label)
+class Box:
+    def __init__(self, v): self.v = v; self.b = v.get_buffer()
+    def set_text(self, t): self.b.set_text(t)
+    def get_text(self): return self.b.get_text(self.b.get_start_iter(), self.b.get_end_iter(), False)
 def entry(nodes):
-    return next(n for n in nodes if isinstance(n, Gtk.Entry))
+    return Box(next(n for n in nodes if isinstance(n, Gtk.TextView)))
+def counter(nodes):
+    return next(n.get_text() for n in nodes if isinstance(n, Gtk.Label) and " / 2000" in n.get_text())
 def state(cs):
     c, t, a = cs["choice"], cs["text"], cs["action"]
     steps = {n.get_label(): n.get_active() for n in a if isinstance(n, Gtk.ToggleButton) and n.get_label() in ("1", "2")}
@@ -3459,6 +3563,17 @@ def run(win):
         print("PASS choice" if after["choice"] == before["choice"] == (True, "because", True) else "FAIL choice %r %r" % (before["choice"], after["choice"]))
         print("PASS text" if after["text"] == before["text"] == ("my answer", True) else "FAIL text %r %r" % (before["text"], after["text"]))
         print("PASS action" if after["action"] == before["action"] == (True, {"1": False, "2": True}, "it broke", True) else "FAIL action %r %r" % (before["action"], after["action"]))
+        # v0.68: multi-line text keeps its breaks over a redraw, the counter reads right, 2001 characters turn Send off.
+        entry(cs["text"]).set_text("l1\nl2\n" + "\n".join("x" * 5 for _ in range(30)))
+        win.redraw_decisions()
+        t2 = cards(win)["text"]
+        print("PASS multiline" if entry(t2).get_text().startswith("l1\nl2\nxxxxx\n") and entry(t2).get_text().count("\n") == 31 else "FAIL multiline")
+        print("PASS counter" if counter(t2) == "%d / 2000" % len(entry(t2).get_text().strip()) else "FAIL counter %r" % counter(t2))
+        entry(t2).set_text("y" * 2000)
+        print("PASS at2000" if btn(t2, "Send").get_sensitive() and counter(t2) == "2000 / 2000" else "FAIL at2000")
+        entry(t2).set_text("y" * 2001)
+        print("PASS over2001" if not btn(t2, "Send").get_sensitive() and counter(t2) == "2001 / 2000" and entry(t2).get_text() == "y" * 2001 else "FAIL over2001")
+        entry(t2).set_text("my answer")
         win.decisions = [e for e in win.decisions if e["id"] != "d-text"]
         win.redraw_decisions()
         print("PASS dropped" if set(win.drafts) == {"d-choice", "d-action"} else "FAIL dropped %r" % sorted(win.drafts))
@@ -3471,7 +3586,7 @@ GLib.timeout_add(100, tick)
 mod.main()
 PY
 		)
-		for t in writein writein-empty passnote failednostep choice text action dropped sent; do
+		for t in writein writein-empty passnote failednostep choice text action multiline counter at2000 over2001 dropped sent; do
 			case $t in
 			writein) m="a write-in alone enables Send" ;;
 			writein-empty) m="an empty write-in with no option leaves Send off" ;;
@@ -3480,6 +3595,10 @@ PY
 			choice) m="a choice pick and its write-in text survive the redraw, Send still enabled" ;;
 			text) m="typed answer text survives the redraw, Send still enabled" ;;
 			action) m="Failed + step + note survive the redraw, the step shows picked, Send still enabled" ;;
+			multiline) m="a pasted multi-line text keeps its line breaks over a redraw" ;;
+			counter) m="the counter reads the stripped length as n / 2000" ;;
+			at2000) m="2000 characters leave Send on" ;;
+			over2001) m="2001 characters turn Send off and the box keeps every character" ;;
 			dropped) m="a decision that leaves the feed drops its draft" ;;
 			sent) m="pressing Send clears that decision's draft" ;;
 			esac
