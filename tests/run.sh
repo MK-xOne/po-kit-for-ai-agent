@@ -2855,21 +2855,53 @@ for bad_url in ("ftp://h/x", "file:///etc/passwd", "notaurl"):
         check("dashboard answers: %s is refused" % bad_url, True)
 _check_entry_choice = {"id": "ask-0707", "project": "harbor", "item": "0.7", "kind": "choice", "question": "?", "options": [{"label": "Yes", "description": "", "recommended": True}, {"label": "No", "description": ""}]}
 _check_entry_action = {"id": "ask-0205", "project": "orchard", "item": "2.5", "kind": "action", "machine": "m", "done_when": "d", "steps": [{"text": "s", "command": ""}]}
-_b = c.answer_body(_check_entry_choice, "uuid-1", option="Yes", text="")
+_b = c.answer_body(_check_entry_choice, "0b7e3c1a-5d2f-4a8e-9c61-3f0d2b8a7e41", option="Yes", text="")
 check("dashboard answers: answer_body for a choice without text",
-      _b["answer_id"] == "uuid-1" and _b["id"] == "ask-0707" and _b["project"] == "harbor" and _b["item"] == "0.7"
+      _b["answer_id"] == "0b7e3c1a-5d2f-4a8e-9c61-3f0d2b8a7e41" and _b["id"] == "ask-0707" and _b["project"] == "harbor" and _b["item"] == "0.7"
       and _b["kind"] == "choice" and _b["option"] == "Yes" and _b["text"] == ""
       and _b["result"] is None and _b["step"] is None and _b["note"] is None
       and "answered_at" in _b and _b["client"] == c.CLIENT)
-_bv = c.answer_body(_check_entry_choice, "uuid-2", option="Yes", text="good idea")
+_bv = c.answer_body(_check_entry_choice, "1c8f4d2b-6e3a-4b9f-8d72-4a1e3c9b8f52", option="Yes", text="good idea")
 check("dashboard answers: answer_body for a choice with text", _bv["option"] == "Yes" and _bv["text"] == "good idea")
-_bp = c.answer_body(_check_entry_action, "uuid-3", result="pass")
+_bp = c.answer_body(_check_entry_action, "2d9a5e3c-7f4b-4cae-ae83-5b2f4dac9a63", result="pass")
 check("dashboard answers: answer_body for an action pass", _bp["result"] == "pass" and _bp["step"] is None and _bp["note"] is None and _bp["option"] is None and _bp["text"] is None)
-_bf = c.answer_body(_check_entry_action, "uuid-4", result="failed", step=1, note="the key was missing")
+_bf = c.answer_body(_check_entry_action, "3eab6f4d-8a5c-4dbf-bf94-6c3a5ebdab74", result="failed", step=1, note="the key was missing")
 check("dashboard answers: answer_body for an action failed with step and note", _bf["result"] == "failed" and _bf["step"] == 1 and _bf["note"] == "the key was missing" and _bf["option"] is None and _bf["text"] is None)
-_bu = c.answer_body({"id": "ask-0808", "project": "harbor", "item": "0.8", "kind": "unformatted"}, "uuid-5", text="custom answer")
+_bu = c.answer_body({"id": "ask-0808", "project": "harbor", "item": "0.8", "kind": "unformatted"}, "4fbc7a5e-9b6d-4ec0-80a5-7d4b6fcebc85", text="custom answer")
 check("dashboard answers: answer_body for unformatted text", _bu["text"] == "custom answer" and _bu["kind"] == "unformatted" and _bu["option"] is None and _bu["result"] is None and _bu["step"] is None)
-check("dashboard answers: answer_id is a uuid4 hex string", len(c.answer_id()) == 32 and c.answer_id() != c.answer_id())
+import glob, importlib.machinery, importlib.util, re
+UUID4_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+_ids = [c.answer_id() for _ in range(50)]
+check("dashboard answers: answer_id is a lowercase dashed uuid4, unique per call", all(UUID4_RE.match(i) for i in _ids) and len(set(_ids)) == 50, repr(_ids[0]))
+# v0.67: the client's real body as posted (README format), then through the receiver's check_body.
+_eid = "9f3c" * 16  # a 64-hex entry id, as in the feed
+_real = [("choice", c.answer_body(dict(_check_entry_choice, id=_eid), c.answer_id(), option="Yes", text="")),
+         ("action", c.answer_body(dict(_check_entry_action, id=_eid), c.answer_id(), result="failed", step=1, note="n"))]
+_FIELDS = {"answer_id", "id", "project", "item", "kind", "option", "text", "result", "step", "note", "answered_at", "client"}
+for _k, _rb in _real:
+    _rb = json.loads(json.dumps(_rb).encode("utf-8"))
+    check("dashboard answers: the real %s body has the README fields and formats" % _k,
+          set(_rb) == _FIELDS and UUID4_RE.match(_rb["answer_id"]) is not None and HEX64_RE.match(_rb["id"]) is not None
+          and _rb["kind"] == _k and _rb["client"] == "po-dashboard", repr(_rb))
+_recv = sorted(glob.glob(os.path.join(sys.argv[1], "..", "..", "private", "*", "bin", "answer-receiver")))
+if _recv:
+    _spec = importlib.util.spec_from_loader("answer_receiver", importlib.machinery.SourceFileLoader("answer_receiver", _recv[0]))
+    _rm = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_rm)
+    def _accepts(body):
+        try:
+            _rm.check_body(json.dumps(body).encode("utf-8"))
+            return "ok"
+        except _rm.Reply as e:
+            return "%d %s" % (e.code, e.why)
+    for _k, _rb in _real:
+        _got = _accepts(_rb)
+        check("dashboard answers: the receiver's check_body accepts the client's real %s body" % _k, _got == "ok", "%s %s" % (_got, json.dumps(_rb)))
+    _got = _accepts(dict(_real[0][1], answer_id=_real[0][1]["answer_id"].replace("-", "")))
+    check("dashboard answers: the receiver's check_body refuses a 32-hex answer_id", _got == "400 answer_id", _got)
+else:
+    check("dashboard answers: receiver check_body cross-check skipped (receiver absent)", True)
 check("dashboard answers: answer_state maps 200/201 to answered · sent", c.answer_state(200) == "answered \u00b7 sent" and c.answer_state(201) == "answered \u00b7 sent")
 check("dashboard answers: answer_state maps 409 to already answered", c.answer_state(409) == "already answered")
 check("dashboard answers: answer_state maps 404 to no longer waiting", c.answer_state(404) == "no longer waiting")
@@ -2902,7 +2934,7 @@ class AnswerH(http.server.BaseHTTPRequestHandler):
 asrv = http.server.HTTPServer(("127.0.0.1", 0), AnswerH)
 threading.Thread(target=asrv.serve_forever, daemon=True).start()
 abase = "http://127.0.0.1:%d" % asrv.server_address[1]
-ab = c.answer_body(_check_entry_choice, "answer-uuid", option="Yes", text="")
+ab = c.answer_body(_check_entry_choice, "5acd8b6f-ac7e-4fd1-91b6-8e5c7adfcd96", option="Yes", text="")
 check("dashboard answers: 201 is answered · sent", c.post_answer(abase + "/201", ab) == "answered \u00b7 sent")
 check("dashboard answers: 200 is answered · sent", c.post_answer(abase + "/200", ab) == "answered \u00b7 sent")
 check("dashboard answers: 409 is already answered", c.post_answer(abase + "/409", ab) == "already answered")
@@ -2935,7 +2967,7 @@ class RedirH(http.server.BaseHTTPRequestHandler):
         pass
 redir = http.server.HTTPServer(("127.0.0.1", 0), RedirH)
 threading.Thread(target=redir.serve_forever, daemon=True).start()
-shown = c.post_answer("http://127.0.0.1:%d/" % redir.server_address[1], c.answer_body(_check_entry_choice, "u", option="Yes"), token="secret")
+shown = c.post_answer("http://127.0.0.1:%d/" % redir.server_address[1], c.answer_body(_check_entry_choice, c.answer_id(), option="Yes"), token="secret")
 check("dashboard answers: a redirect is not sent, never answered", shown.startswith("not sent"))
 check("dashboard answers: a redirect never forwards the bearer token (nothing reaches the target)", seen_auth == [])
 redir.shutdown(); redir.server_close(); sink.shutdown(); sink.server_close()
@@ -2961,7 +2993,7 @@ ap = c.answer_params
 check("dashboard answers: a write-in alone sends option null and the text", ap("choice", {"choice": None, "note": "mine"}) == {"option": None, "text": "mine"})
 check("dashboard answers: Pass sends lowercase pass, step null even after a Failed step", ap("action", {"result": "Pass", "step": 2, "note": ""}) == {"result": "pass", "step": None, "note": None})
 check("dashboard answers: Failed sends lowercase failed with its step and note", ap("action", {"result": "Failed", "step": 2, "note": "n"}) == {"result": "failed", "step": 2, "note": "n"})
-check("dashboard answers: the body client is exactly po-dashboard", c.answer_body(_check_entry_choice, "u")["client"] == "po-dashboard")
+check("dashboard answers: the body client is exactly po-dashboard", c.answer_body(_check_entry_choice, c.answer_id())["client"] == "po-dashboard")
 # v0.61 (f): the slow mark reads digits only, as the manifest schema does.
 for raw, want in (("45", 45), ("-5", 300), ("1_0", 300), ("x", 300), ("", 300)):
     os.environ["PO_SLOW_AFTER"] = raw
@@ -3564,7 +3596,7 @@ def post(body, token=None):
     c.request("POST", "/answers", json.dumps(body).encode(), h)
     r = c.getresponse(); r.read(); c.close()
     return r.status
-b = {"project": "harbor", "id": "ask-0808", "answer_id": "demo-uuid", "kind": "choice", "option": "Yes", "text": ""}
+b = {"project": "harbor", "id": "ask-0808", "answer_id": "6bde9c7a-bd8f-4ae2-a2c7-9f6d8beade07", "kind": "choice", "option": "Yes", "text": ""}
 assert post(b) == 401, "no token should be 401"
 assert post(b, "secret") == 201, "first answer should be 201"
 assert post(b, "secret") == 200, "repeat answer_id should be 200"

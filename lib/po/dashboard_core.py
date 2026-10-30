@@ -122,8 +122,8 @@ def resolve_answer_url(arg, env=None):
 
 
 def answer_id():
-    """A uuid4 hex string for a new answer (made once per Send, kept with the draft)."""
-    return uuid.uuid4().hex
+    """A lowercase dashed uuid4 (8-4-4-4-12 hex) for a new answer (made once per Send, kept with the draft)."""
+    return str(uuid.uuid4())
 
 
 def answer_body(entry, answer_id, option=None, text=None, result=None, step=None, note=None):

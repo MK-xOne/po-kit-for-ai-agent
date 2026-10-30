@@ -531,8 +531,9 @@ window. `--check` prints the rows the window would show, without a
    "result": "pass"|"failed"|null, "step": <n>|null, "note": "<str>"|null,
    "answered_at": "<utc iso8601>", "client": "po-dashboard"}
   ```
-  `answer_id` is a uuid4 made once per Send and kept with the draft, so Retry
-  re-posts the same body. The card controls differ by kind:
+  `answer_id` is a lowercase dashed uuid4 (8-4-4-4-12 hex, version nibble 4, e.g.
+  `0b7e3c1a-5d2f-4a8e-9c61-3f0d2b8a7e41`), made once per Send and kept with the draft,
+  so Retry re-posts the same body; `id` is the entry's 64-hex id from the feed. The card controls differ by kind:
   - **Choice** — one radio row per option plus an `or write your own` text box;
     Send is enabled once an option is chosen (the text, if any, travels along).
   - **Action** — `Pass` and `Failed` buttons; Failed opens a step chooser (the

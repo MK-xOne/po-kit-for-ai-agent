@@ -12,6 +12,16 @@ Unreleased becomes `## Release N (YYYY-MM-DD): <theme>`.
 
 ## Unreleased
 
+## Release 16 (2026-10-30): dashboard answer_id fix (patch to Release 15)
+
+Item v0.67. The dashboard's Send on a decision card was refused with 400 because the client sent a 32-hex `answer_id`; it now sends a dashed uuid4.
+
+**Agents, in short:** nothing new to do. Update po-kit; a card that failed with 400 is re-sent from the dashboard.
+
+### Dashboard answer_id is a dashed uuid4 (v0.67, 2026-10-29)
+
+`po-dashboard` answers: `answer_id()` now returns a lowercase dashed uuid4 (`str(uuid.uuid4())`); the 32-hex id it sent before was refused by a receiver checking the README format, with 400 "bad request". The tests use real uuids and check the client's real body against the README format. **Agents:** `answer_id` in dashboard answers is now a dashed uuid4; a 32-hex id was refused by the receiver with 400. **Adopt:** nothing.
+
 ## Release 15 (2026-10-30): structured asks, Decisions toggle, answer receiver
 
 Items v0.57 to v0.66 (v0.57, v0.59, v0.60, v0.62, v0.64 and v0.65 change nothing in the kit (test-only or private-only, host-side) and have no entry below. The dashboard's answer POST now waits up to 20 s (v0.64).).
