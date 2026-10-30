@@ -168,6 +168,8 @@ po_manifest_load() {
 		po_die "$file: [hooks] on_close needs a non-empty \"command\""
 	[[ -z ${PO_MANIFEST[layout.owner_column]+x} || -n ${PO_MANIFEST[layout.owner_column]} ]] ||
 		po_die "$file: [layout] owner_column needs a non-empty \"column name\""
+	[[ -z ${PO_MANIFEST[stamp.slow_after]+x} || ${PO_MANIFEST[stamp.slow_after]} =~ ^[0-9]+$ ]] ||
+		po_die "$file: [stamp] slow_after must be an integer (seconds): ${PO_MANIFEST[stamp.slow_after]}"
 	[[ -z ${PO_MANIFEST[versioning.tag_style]+x} || ${PO_MANIFEST[versioning.tag_style]} == light || ${PO_MANIFEST[versioning.tag_style]} == annotated ]] ||
 		po_die "$file: [versioning] tag_style must be \"light\" or \"annotated\": ${PO_MANIFEST[versioning.tag_style]}"
 	[[ -z ${PO_MANIFEST[gate.test_format]+x} || ${PO_MANIFEST[gate.test_format]} == libtest || ${PO_MANIFEST[gate.test_format]} == pytest ]] ||

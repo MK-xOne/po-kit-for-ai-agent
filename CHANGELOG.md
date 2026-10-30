@@ -12,6 +12,30 @@ Unreleased becomes `## Release N (YYYY-MM-DD): <theme>`.
 
 ## Unreleased
 
+## Release 15 (2026-10-30): structured asks, Decisions toggle, answer receiver
+
+Items v0.57 to v0.66 (v0.57, v0.59, v0.60, v0.62, v0.64 and v0.65 change nothing in the kit (test-only or private-only, host-side) and have no entry below. The dashboard's answer POST now waits up to 20 s (v0.64).).
+
+**Agents, in short:** nothing new to do. The Decisions view keeps an unsent answer draft across refreshes, a `Decisions` toggle sits beside `Actions`, and the answer POST waits up to 20 s.
+
+**Adopt, in short:** nothing new. Correction to Release 14's notes: v0.49 (dashboard answering) is listed under Release 13 but shipped in the span of Release 14; its Adopt line is `--answer-url` / `PO_DASHBOARD_ANSWER_URL` with `PO_DASHBOARD_ANSWER_TOKEN` (env only) to point the dashboard at an answer sink; and v0.53 (a read-only test review, no change to the kit) belongs in Release 14's "change nothing" list. The release-14 tag is not moved.
+
+### Two redundant test re-checks dropped (v0.66, 2026-10-29)
+
+Tests only: two checks in `tests/run.sh` that an exact-match just above them already covered are deleted (1266 to 1264 checks). **Agents:** nothing. **Adopt:** nothing.
+
+### Dashboard Decisions toggle (v0.63, 2026-10-28)
+
+`po-dashboard` Decisions view: a `Decisions` toggle beside `Actions` hides the choice entries (unformatted and legacy entries stay under both). The viewer's choice is saved with the Actions one as `{"actions": bool, "decisions": bool}` (a missing key is on, writing one key keeps the other, a broken file means both on); the status line adds `2 decisions hidden`. `--check` still ignores the filters. **Agents:** nothing. **Adopt:** nothing.
+
+### Should-fix batch from the release 14 review (v0.61, 2026-10-28)
+
+Dashboard answers: `post_answer` never forwards the bearer token on a redirect (a redirect is "not sent") and catches a bad status line; one rule decides when Send is allowed (a write-in alone, Pass plus a note, Pass then Failed without a step turns Send off); the payload sends lowercase `result` and `client` `po-dashboard`. `stamp.sh` no longer uses `EPOCHSECONDS` (bash 4.4 works); a non-integer `[stamp] slow_after` is refused (exit 2). `po team` without `[layout] owner_column` exits 2 (`po dispatch` keeps working without it). `po ready` checks `needs_note` as a file on main and refuses `..`, absolute paths and a leading `-`. `po dispatch` always writes the prompt file. **Agents:** run GUI tests on your own `Xvfb :NN`, never a shared display. **Adopt:** nothing.
+
+### Dashboard keeps an unsent answer draft (v0.58, 2026-10-28)
+
+`po-dashboard` Decisions view: an unsent answer (choice pick, write-in text, typed text, Pass/Failed, step, note) now survives the 5 s refresh; it is kept per entry, dropped when the entry leaves the feed and cleared on Send. The Failed step buttons became a toggle group so the picked step shows. **Agents:** nothing. **Adopt:** nothing.
+
 ## Release 14 (2026-10-27): gate time, ready list and dispatch, test discipline
 
 Items v0.40 to v0.56 (v0.40, v0.41, v0.43, v0.47, v0.55 and v0.56 change nothing in the kit (private-only or test-only) and have no entry below).

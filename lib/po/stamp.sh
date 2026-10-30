@@ -132,7 +132,7 @@ po_stamp_tail() {
 # for the event about to be logged.
 po_stamp_seconds() {
 	# shellcheck disable=SC2034 # read by po_event_log
-	PO_EVENT_SECONDS=$((EPOCHSECONDS - PO_STAMP_START))
+	PO_EVENT_SECONDS=$(($(date +%s) - PO_STAMP_START))
 }
 
 # po_stamp_legs_json [<failing leg index>]: the legs array body for the event
@@ -386,7 +386,7 @@ po_cmd_stamp() {
 	((${#prep[@]} == 0)) || PO_STAMP_NAMES=(prepare) off=1
 	PO_STAMP_NAMES+=("${names[@]}")
 	PO_STAMP_RES=() PO_STAMP_SECS=()
-	PO_STAMP_START=$EPOCHSECONDS
+	PO_STAMP_START=$(date +%s)
 	for i in "${!PO_STAMP_NAMES[@]}"; do PO_STAMP_RES+=(skip) PO_STAMP_SECS+=(0); done
 	# Outside the worktree, so it is never part of the state stamped.
 	PO_STAMP_TMP=$(mktemp -d "${TMPDIR:-/tmp}/po-stamp.XXXXXX") || PO_STAMP_TMP=''
@@ -395,11 +395,11 @@ po_cmd_stamp() {
 	if ((off)); then
 		PO_STAMP_RES[0]=fail
 		PO_STAMP_FAILING=0
-		leg_start=$EPOCHSECONDS
+		leg_start=$(date +%s)
 		for i in "${!prep[@]}"; do
 			printf 'po stamp: prepare: %s\n' "${prep[i]}" >&2
 			po_stamp_run "$wt" "${prep[i]}" "out-prep-$i" "prepare: ${prep[i]}"
-			PO_STAMP_SECS[0]=$((EPOCHSECONDS - leg_start))
+			PO_STAMP_SECS[0]=$(($(date +%s) - leg_start))
 			[[ -z $PO_STAMP_TMP ]] || cat -- "$PO_STAMP_TMP/out-prep-$i" >>"$PO_STAMP_TMP/out-0" 2>/dev/null
 			[[ $PO_RUN_CODE == 0 ]] ||
 				po_stamp_fail "prepare line '${prep[i]}' exited $PO_RUN_CODE"
@@ -413,9 +413,9 @@ po_cmd_stamp() {
 	state=$(po_stamp_state "$wt")
 	for i in "${!names[@]}"; do
 		printf 'po stamp: leg %s: %s\n' "${names[i]}" "${cmds[i]}" >&2
-		leg_start=$EPOCHSECONDS
+		leg_start=$(date +%s)
 		po_stamp_run "$wt" "${cmds[i]}" "out-$((i + off))" "leg ${names[i]}: ${cmds[i]}"
-		PO_STAMP_SECS[i + off]=$((EPOCHSECONDS - leg_start))
+		PO_STAMP_SECS[i + off]=$(($(date +%s) - leg_start))
 		PO_STAMP_RES[i + off]=fail
 		PO_STAMP_FAILING=$((i + off))
 		[[ $PO_RUN_CODE == 0 ]] ||

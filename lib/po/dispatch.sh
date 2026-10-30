@@ -67,7 +67,7 @@ po_cmd_dispatch() {
 
 	local ready team order=''
 	ready=$("$PO_SELF" --manifest "$PO_MANIFEST_FILE" ready --json) || exit $?
-	team=$("$PO_SELF" --manifest "$PO_MANIFEST_FILE" team --json) || exit $?
+	team=$(PO_TEAM_NO_OWNER_OK=1 "$PO_SELF" --manifest "$PO_MANIFEST_FILE" team --json) || exit $?
 	local name sep=''
 	while IFS= read -r name; do
 		[[ -n $name ]] || continue
@@ -104,17 +104,17 @@ po_cmd_dispatch() {
 		fi
 		printf 'opened    %s  for %s\n' "$item" "$agent"
 		n_ok=$((n_ok + 1))
-		[[ -n $notify ]] || continue
 		dir=$(dirname -- "$(po_events_file)")/po-dispatch
 		prompt=$dir/$item.md
 		if mkdir -p "$dir" && {
 			printf '%s → %s · PROMPT\n' "$item" "$agent"
 			"$PO_SELF" --manifest "$PO_MANIFEST_FILE" kickoff "$item" 2>/dev/null || true
 		} >"$prompt"; then
+			[[ -n $notify ]] || continue
 			sh -c "$notify \"\$@\"" po-dispatch "$item" "$agent" "$prompt" </dev/null >&2 ||
 				printf 'po: warning: dispatch notify exited non-zero for %s\n' "$item" >&2
 		else
-			printf 'po: warning: no prompt written for %s; notify not run\n' "$item" >&2
+			printf 'po: warning: no prompt written for %s%s\n' "$item" "${notify:+; notify not run}" >&2
 		fi
 	done <<<"$plan"
 	printf 'dispatch: %d %s, %d skipped, %d failed\n' "$n_ok" "$([[ $mode == --plan ]] && echo planned || echo opened)" "$n_skip" "$n_fail"

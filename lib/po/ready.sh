@@ -32,9 +32,9 @@ po_cmd_ready() {
 	local project_filter=""
 	project_filter="${PO_MANIFEST[project.name]:-}"
 
-	PO_STATUS_MAP="$sm" python3 - "$file" "$project_filter" "$json" "$explain" <<'PYEOF'
-import json, sys, os
-file, project_filter, json_flag, explain_flag = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+	PO_STATUS_MAP="$sm" python3 -I - "$file" "$project_filter" "$json" "$explain" "$(po_get layout.main)" <<'PYEOF'
+import json, posixpath, subprocess, sys, os
+file, project_filter, json_flag, explain_flag, main = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 json_flag = json_flag == "1"
 explain_flag = explain_flag == "1"
 
@@ -82,8 +82,13 @@ for ln, obj in candidates:
         if status_map.get(d) != "DONE":
             ok = False; reasons.append(f"depends {d} not DONE ({status_map.get(d,'absent')})")
     if needs_note:
-        if not os.path.exists(needs_note):
-            ok = False; reasons.append(f"needs_note missing: {needs_note}")
+        # a repo path, relative, inside the tree, that is a file on main
+        if (not isinstance(needs_note, str) or posixpath.isabs(needs_note)
+                or ".." in needs_note.split("/") or needs_note.startswith("-")):
+            ok = False; reasons.append(f"needs_note is not a path inside the repo: {needs_note}")
+        elif subprocess.run(["git", "cat-file", "-e", f"refs/heads/{main}:{needs_note}"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
+            ok = False; reasons.append(f"needs_note missing on {main}: {needs_note}")
     if ok:
         results.append((item, title, agents))
     else:

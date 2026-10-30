@@ -123,10 +123,8 @@ def text(value):
 
 
 def slow_after():
-    try:
-        return int(os.environ.get(SLOW_ENV, SLOW_DEFAULT))
-    except ValueError:
-        return SLOW_DEFAULT
+    raw = os.environ.get(SLOW_ENV, "")
+    return int(raw) if raw.isascii() and raw.isdigit() else SLOW_DEFAULT  # digits only, as the manifest schema
 
 
 def seconds(e):

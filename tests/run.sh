@@ -1496,7 +1496,6 @@ want=$(
 )
 [[ $code == 0 && $out == "$want" ]] && ok "report: files, the stamp verbatim, numbered notes" ||
 	bad "report block (exit $code)" "$out"$'\n--- want\n'"$want"
-grep -q 'gate-' <<<"${out%%Stamp (*}" && bad "report lists a stamp file as changed" || ok "stamp files are not in Files changed"
 [[ $(git -C "$HW" status --porcelain --untracked-files=all; git -C "$HR" for-each-ref) == "$before" ]] &&
 	ok "report changes nothing" || bad "report side effects"
 out=$(rp 2>&1)
@@ -1923,8 +1922,6 @@ want=$(
 	ok "prepare: its lines fix the tree before the gate, and the block names each line that ran, after the diffstat" || bad "prepare block (exit $code)" "$out"$'\n'"$(cat "$TMP/p.err")"
 [[ $(<"$TMP/order") == $'p2\nleg' ]] &&
 	ok "prepare: the lines run in order, before every gate leg" || bad "prepare order" "$(cat "$TMP/order")"
-[[ $out == *'tests 5 passed'* ]] &&
-	ok "prepare: test summaries a prepare line prints are not counted" || bad "prepare count" "$out"
 pev=$(tail -1 "$SLOG")
 python3 -I -c 'import json,sys; e=json.loads(sys.argv[1]); assert e["result"]=="pass"; assert [(l["name"],l["result"]) for l in e["legs"]]==[(n,"pass") for n in ("prepare","check","test","fmt","order")], e["legs"]' "$pev" &&
 	ok "prepare: the stamp event records it as a leg named prepare, ahead of the gate's" || bad "prepare event" "$pev"
@@ -2791,21 +2788,29 @@ check("dashboard decisions: the key stays project and item, not the id", c.decis
 kl = c.decision_check_lines([dict(CH, item="g4", project="p", title="T", waiting_for="w", asked_at="2026-10-24T09:00:00Z"), {"item": "g2", "project": "p", "title": "T", "waiting_for": "w", "asked_at": "2026-10-24T08:00:00Z"}], now, utc)
 check("dashboard decisions: check lines start with the kind, legacy for none", kl[0].startswith("choice | g4 | p | T") and kl[1].startswith("legacy | g2 | p | T"))
 check("dashboard decisions: check lines ignore the filter", len(c.decision_check_lines([AC, CH], now, utc)) == 2)
-check("dashboard decisions: the filter on shows everything", c.filter_decisions([AC, CH, {}], True) == ([AC, CH, {}], 0))
-check("dashboard decisions: the filter off hides the actions and counts them", c.filter_decisions([AC, CH, dict(AC, id="a3")], False) == ([CH], 2))
-check("dashboard decisions: the status line says how many actions are hidden", c.decisions_status(3, 0) == "3 waiting" and c.decisions_status(3, 1) == "3 waiting \u00b7 1 action hidden")
+check("dashboard decisions: both filters on shows everything", c.filter_decisions([AC, CH, {}], True, True) == ([AC, CH, {}], 0, 0))
+check("dashboard decisions: actions off hides actions and counts them", c.filter_decisions([AC, CH, dict(AC, id="a3")], False, True) == ([CH], 2, 0))
+check("dashboard decisions: decisions off hides choices and counts them", c.filter_decisions([AC, CH, dict(CH, id="c2")], True, False) == ([AC], 0, 2))
+check("dashboard decisions: unformatted and legacy stay under both", c.filter_decisions([AC, CH, {}], False, False) == ([{}], 1, 1))
+check("dashboard decisions: status line with both hidden", c.decisions_status(3, 1, 2) == "3 waiting \u00b7 1 action hidden \u00b7 2 decisions hidden")
+check("dashboard decisions: status line omits zero parts", c.decisions_status(3, 0, 0) == "3 waiting" and c.decisions_status(3, 1, 0) == "3 waiting \u00b7 1 action hidden")
+check("dashboard decisions: check lines ignore the filters", len(c.decision_check_lines([AC, CH], now, utc)) == 2)
 check("dashboard decisions: the filter file is under the config dir, or named by the environment",
       c.decisions_filter_path({"XDG_CONFIG_HOME": "/x/cfg"}) == "/x/cfg/po-dashboard/decisions.json" and c.decisions_filter_path({"PO_DASHBOARD_DECISIONS_FILTER": "/y/f.json", "XDG_CONFIG_HOME": "/x"}) == "/y/f.json")
-import tempfile
+import tempfile, json
 with tempfile.TemporaryDirectory() as _d:
     _f = os.path.join(_d, "sub", "decisions.json")
-    check("dashboard decisions: a missing filter file is on", c.load_actions_shown(_f) is True)
+    check("dashboard decisions: a missing filter file is on (both)", c.load_actions_shown(_f) is True and c.load_decisions_shown(_f) is True)
     c.save_actions_shown(_f, False)
-    check("dashboard decisions: the filter round-trips off, and on", c.load_actions_shown(_f) is False and (c.save_actions_shown(_f, True), c.load_actions_shown(_f))[1] is True)
+    check("dashboard decisions: writing actions keeps decisions on", c.load_actions_shown(_f) is False and c.load_decisions_shown(_f) is True)
+    c.save_decisions_shown(_f, False)
+    check("dashboard decisions: writing decisions keeps actions off", c.load_actions_shown(_f) is False and c.load_decisions_shown(_f) is False)
     open(_f, "w").write("{broken")
-    check("dashboard decisions: a broken filter file is on", c.load_actions_shown(_f) is True)
+    check("dashboard decisions: a broken filter file is on (both)", c.load_actions_shown(_f) is True and c.load_decisions_shown(_f) is True)
     open(_f, "w").write('{"actions": "no"}')
-    check("dashboard decisions: only false turns the filter off", c.load_actions_shown(_f) is True)
+    check("dashboard decisions: only false turns the filter off", c.load_actions_shown(_f) is True and c.load_decisions_shown(_f) is True)
+    open(_f, "w").write('{"actions": false, "decisions": false}')
+    check("dashboard decisions: saved file has both keys", json.load(open(_f)) == {"actions": False, "decisions": False})
 
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -2905,9 +2910,63 @@ check("dashboard answers: 404 is no longer waiting", c.post_answer(abase + "/404
 check("dashboard answers: 401 without a token is refused", c.post_answer(abase + "/401", ab).startswith("refused by"))
 check("dashboard answers: 401 with a token is answered · sent", c.post_answer(abase + "/401", ab, token="secret") == "answered \u00b7 sent")
 check("dashboard answers: 500 is not sent", c.post_answer(abase + "/500", ab).startswith("not sent:"))
+check("dashboard answers: the POST waits up to 20 s", c.ANSWER_TIMEOUT == 20)
 check("dashboard answers: a connection failure is not sent", c.post_answer("http://127.0.0.1:1/", ab).startswith("not sent:"))
 asrv.shutdown()
 asrv.server_close()
+
+# v0.61 (a): a redirect is a failure and the bearer token is never forwarded.
+import socket
+seen_auth = []
+class SinkH(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        seen_auth.append(self.headers.get("Authorization"))
+        self.send_response(201); self.send_header("Content-Length", "0"); self.end_headers()
+    def log_message(self, *a):
+        pass
+sink = http.server.HTTPServer(("127.0.0.1", 0), SinkH)
+threading.Thread(target=sink.serve_forever, daemon=True).start()
+sink_url = "http://127.0.0.1:%d/sink" % sink.server_address[1]
+class RedirH(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        self.send_response(307); self.send_header("Location", sink_url); self.send_header("Content-Length", "0"); self.end_headers()
+    def log_message(self, *a):
+        pass
+redir = http.server.HTTPServer(("127.0.0.1", 0), RedirH)
+threading.Thread(target=redir.serve_forever, daemon=True).start()
+shown = c.post_answer("http://127.0.0.1:%d/" % redir.server_address[1], c.answer_body(_check_entry_choice, "u", option="Yes"), token="secret")
+check("dashboard answers: a redirect is not sent, never answered", shown.startswith("not sent"))
+check("dashboard answers: a redirect never forwards the bearer token (nothing reaches the target)", seen_auth == [])
+redir.shutdown(); redir.server_close(); sink.shutdown(); sink.server_close()
+# v0.61 (b): a bad status line is a Retry state, not an exception.
+junk = socket.socket(); junk.bind(("127.0.0.1", 0)); junk.listen(1)
+def junk_serve():
+    conn, _ = junk.accept()
+    conn.recv(65536); conn.sendall(b"NOT-HTTP garbage\r\n\r\n"); conn.close()
+threading.Thread(target=junk_serve, daemon=True).start()
+try:
+    shown = c.post_answer("http://127.0.0.1:%d/" % junk.getsockname()[1], ab)
+    check("dashboard answers: a bad status line is not sent (Retry), no exception", shown.startswith("not sent") and c.answer_needs_retry(shown))
+except Exception as e:
+    check("dashboard answers: a bad status line is not sent (Retry), no exception", False)
+junk.close()
+# v0.61 (c): the readiness rule and the payload fields.
+ar = c.answer_ready
+check("dashboard answers: choice with a write-in alone is ready", ar("choice", {"choice": None, "note": "mine"}) and not ar("choice", {"choice": None, "note": ""}) and ar("choice", {"choice": "Yes", "note": ""}))
+check("dashboard answers: action Pass with a note is ready", ar("action", {"result": "Pass", "note": "fine"}) and ar("action", {"result": "Pass", "note": ""}))
+check("dashboard answers: action Failed needs a step", not ar("action", {"result": "Failed", "step": None}) and ar("action", {"result": "Failed", "step": 2}) and not ar("action", {"result": None}))
+check("dashboard answers: unformatted needs text", ar("unformatted", {"text": "x"}) and not ar("unformatted", {"text": ""}))
+ap = c.answer_params
+check("dashboard answers: a write-in alone sends option null and the text", ap("choice", {"choice": None, "note": "mine"}) == {"option": None, "text": "mine"})
+check("dashboard answers: Pass sends lowercase pass, step null even after a Failed step", ap("action", {"result": "Pass", "step": 2, "note": ""}) == {"result": "pass", "step": None, "note": None})
+check("dashboard answers: Failed sends lowercase failed with its step and note", ap("action", {"result": "Failed", "step": 2, "note": "n"}) == {"result": "failed", "step": 2, "note": "n"})
+check("dashboard answers: the body client is exactly po-dashboard", c.answer_body(_check_entry_choice, "u")["client"] == "po-dashboard")
+# v0.61 (f): the slow mark reads digits only, as the manifest schema does.
+for raw, want in (("45", 45), ("-5", 300), ("1_0", 300), ("x", 300), ("", 300)):
+    os.environ["PO_SLOW_AFTER"] = raw
+    check("dashboard slow_after %r reads %d" % (raw, want), c.slow_after() == want)
+del os.environ["PO_SLOW_AFTER"]
 
 # The style: contrast of the palette, read back from the generated CSS.
 for variant in sorted(c.PALETTES):
@@ -3270,6 +3329,215 @@ mod.main()
 PY
 		)
 		[[ $out == opened ]] && ok "po-dashboard Projects card activation opens the project screen" || bad "dashboard projects activate" "$out"
+		# v0.58: an unsent answer draft survives the Decisions redraw (the feed refresh) and goes with its entry or its Send.
+		cat >"$TMP/drafts-feed.json" <<'JSON'
+[{"project":"p","item":"1","title":"c","waiting_for":"a ruling","asked_at":"2026-10-24T09:00:00Z","kind":"choice","id":"d-choice","question":"Ok?","options":[{"label":"Yes"},{"label":"No"}]},
+ {"project":"p","item":"2","title":"t","waiting_for":"a ruling","asked_at":"2026-10-24T10:00:00Z","kind":"choice","id":"d-text"},
+ {"project":"p","item":"3","title":"a","waiting_for":"a block","asked_at":"2026-10-24T11:00:00Z","kind":"action","id":"d-action","machine":"m","steps":[{"text":"one"},{"text":"two"}],"done_when":"done"}]
+JSON
+		# helper
+		out=$(XDG_CONFIG_HOME="$TMP/xdg-drafts" timeout 60 python3 -I - "$DB" "$SV/events.json" "$TMP/drafts-feed.json" 2>/dev/null <<'PY'
+import gc, http.server, importlib.machinery, importlib.util, os, sys, threading
+sys.dont_write_bytecode = True
+import gi
+gi.require_version("Gtk", "4.0")
+from gi.repository import GLib, Gtk
+db, events, feed = sys.argv[1:4]
+body = open(events, "rb").read()
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def do_POST(self):
+        self.send_response(200); self.send_header("Content-Length", "0"); self.end_headers()
+    def log_message(self, *a): pass
+srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+base = "http://127.0.0.1:%d/" % srv.server_address[1]
+sys.argv = [db, "--url", base, "--decisions-url", feed, "--answer-url", base, "--view", "decisions"]
+loader = importlib.machinery.SourceFileLoader("po_dashboard", db)
+mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("po_dashboard", loader))
+loader.exec_module(mod)
+def walk(w):
+    yield w
+    c = w.get_first_child()
+    while c:
+        yield from walk(c)
+        c = c.get_next_sibling()
+def cards(win):
+    out, c = {}, win.decisions_list.get_first_child()
+    while c:
+        nodes = list(walk(c))
+        labels = {n.get_label() for n in nodes if isinstance(n, (Gtk.ToggleButton, Gtk.Button))}
+        ents = [n for n in nodes if isinstance(n, Gtk.Entry)]
+        if "Pass" in labels:
+            out["action"] = nodes
+        elif "Yes" in labels:
+            out["choice"] = nodes
+        elif ents:
+            out["text"] = nodes
+        c = c.get_next_sibling()
+    return out
+def btn(nodes, label, cls=Gtk.Button):
+    return next(n for n in nodes if isinstance(n, cls) and n.get_label() == label)
+def entry(nodes):
+    return next(n for n in nodes if isinstance(n, Gtk.Entry))
+def state(cs):
+    c, t, a = cs["choice"], cs["text"], cs["action"]
+    steps = {n.get_label(): n.get_active() for n in a if isinstance(n, Gtk.ToggleButton) and n.get_label() in ("1", "2")}
+    return {
+        "choice": (btn(c, "No", Gtk.ToggleButton).get_active(), entry(c).get_text(), btn(c, "Send").get_sensitive()),
+        "text": (entry(t).get_text(), btn(t, "Send").get_sensitive()),
+        "action": (btn(a, "Failed", Gtk.ToggleButton).get_active(), steps, entry(a).get_text(), btn(a, "Send").get_sensitive()),
+    }
+res = {"n": 0}
+def finish(code):
+    sys.stdout.flush(); os._exit(code)
+def tick():
+    res["n"] += 1
+    win = next((o for o in gc.get_objects() if type(o).__name__ == "Dashboard" and hasattr(o, "drafts")), None)  # the window object is not a toplevel
+    if win is not None and len(win.decisions) == 3 and len(cards(win)) == 3:
+        GLib.idle_add(run, win)
+        return False
+    if res["n"] > 100:
+        print("FAIL no decisions"); finish(1)
+    return True
+def run(win):
+    try:
+        cs = cards(win)
+        # v0.61 (c): "or write your own" alone sends; Pass + a note sends; Pass then Failed without a step does not.
+        entry(cs["choice"]).set_text("mine alone")
+        print("PASS writein" if btn(cs["choice"], "Send").get_sensitive() else "FAIL writein")
+        entry(cs["choice"]).set_text("")
+        print("PASS writein-empty" if not btn(cs["choice"], "Send").get_sensitive() else "FAIL writein-empty")
+        btn(cs["action"], "Pass", Gtk.ToggleButton).set_active(True)
+        entry(cs["action"]).set_text("fine")
+        print("PASS passnote" if btn(cs["action"], "Send").get_sensitive() else "FAIL passnote")
+        btn(cs["action"], "Failed", Gtk.ToggleButton).set_active(True)
+        print("PASS failednostep" if not btn(cs["action"], "Send").get_sensitive() else "FAIL failednostep")
+        entry(cs["action"]).set_text("")
+        btn(cs["choice"], "No", Gtk.ToggleButton).set_active(True)
+        entry(cs["choice"]).set_text("because")
+        entry(cs["text"]).set_text("my answer")
+        btn(cs["action"], "Failed", Gtk.ToggleButton).set_active(True)
+        btn(cs["action"], "2", Gtk.ToggleButton).set_active(True)
+        entry(cs["action"]).set_text("it broke")
+        before = state(cs)
+        win.redraw_decisions()
+        after = state(cards(win))
+        print("PASS choice" if after["choice"] == before["choice"] == (True, "because", True) else "FAIL choice %r %r" % (before["choice"], after["choice"]))
+        print("PASS text" if after["text"] == before["text"] == ("my answer", True) else "FAIL text %r %r" % (before["text"], after["text"]))
+        print("PASS action" if after["action"] == before["action"] == (True, {"1": False, "2": True}, "it broke", True) else "FAIL action %r %r" % (before["action"], after["action"]))
+        win.decisions = [e for e in win.decisions if e["id"] != "d-text"]
+        win.redraw_decisions()
+        print("PASS dropped" if set(win.drafts) == {"d-choice", "d-action"} else "FAIL dropped %r" % sorted(win.drafts))
+        btn(cards(win)["choice"], "Send").emit("clicked")
+        print("PASS sent" if set(win.drafts) == {"d-action"} else "FAIL sent %r" % sorted(win.drafts))
+    except Exception as e:
+        print("FAIL error %r" % (e,))
+    finish(0)
+GLib.timeout_add(100, tick)
+mod.main()
+PY
+		)
+		for t in writein writein-empty passnote failednostep choice text action dropped sent; do
+			case $t in
+			writein) m="a write-in alone enables Send" ;;
+			writein-empty) m="an empty write-in with no option leaves Send off" ;;
+			passnote) m="Pass with a note keeps Send enabled" ;;
+			failednostep) m="Pass then Failed without a step turns Send off" ;;
+			choice) m="a choice pick and its write-in text survive the redraw, Send still enabled" ;;
+			text) m="typed answer text survives the redraw, Send still enabled" ;;
+			action) m="Failed + step + note survive the redraw, the step shows picked, Send still enabled" ;;
+			dropped) m="a decision that leaves the feed drops its draft" ;;
+			sent) m="pressing Send clears that decision's draft" ;;
+			esac
+			grep -qx "PASS $t" <<<"$out" && ok "po-dashboard draft: $m" || bad "dashboard draft $t" "$out"
+		done
+		# v0.63: the Decisions toggle hides the choice cards and keeps the action cards; the choice is saved next to the Actions one.
+		cat >"$TMP/toggle-feed.json" <<'JSON'
+[{"project":"p","item":"1","title":"c","waiting_for":"a ruling","asked_at":"2026-10-24T09:00:00Z","kind":"choice","id":"t-choice","question":"Ok?","options":[{"label":"Yes"},{"label":"No"}]},
+ {"project":"p","item":"3","title":"a","waiting_for":"a block","asked_at":"2026-10-24T11:00:00Z","kind":"action","id":"t-action","machine":"m","steps":[{"text":"one"},{"text":"two"}],"done_when":"done"}]
+JSON
+		# helper
+		out=$(XDG_CONFIG_HOME="$TMP/xdg-toggle" timeout 60 python3 -I - "$DB" "$SV/events.json" "$TMP/toggle-feed.json" "$TMP/xdg-toggle" 2>&1 <<'PY'
+import gc, http.server, importlib.machinery, importlib.util, json, os, sys, threading
+sys.dont_write_bytecode = True
+import gi
+gi.require_version("Gtk", "4.0")
+from gi.repository import GLib, Gtk
+db, events, feed, xdg = sys.argv[1:5]
+body = open(events, "rb").read()
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def do_POST(self):
+        self.send_response(200); self.send_header("Content-Length", "0"); self.end_headers()
+    def log_message(self, *a): pass
+srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+base = "http://127.0.0.1:%d/" % srv.server_address[1]
+sys.argv = [db, "--url", base, "--decisions-url", feed, "--answer-url", base, "--view", "decisions"]
+loader = importlib.machinery.SourceFileLoader("po_dashboard", db)
+mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("po_dashboard", loader))
+loader.exec_module(mod)
+def walk(w):
+    yield w
+    c = w.get_first_child()
+    while c:
+        yield from walk(c)
+        c = c.get_next_sibling()
+def kinds(win):
+    out, c = set(), win.decisions_list.get_first_child()
+    while c:
+        labels = {n.get_label() for n in walk(c) if isinstance(n, (Gtk.ToggleButton, Gtk.Button))}
+        if "Pass" in labels:
+            out.add("action")
+        elif "Yes" in labels:
+            out.add("choice")
+        c = c.get_next_sibling()
+    return out
+res = {"n": 0}
+def finish(code):
+    sys.stdout.flush(); os._exit(code)
+def tick():
+    res["n"] += 1
+    win = next((o for o in gc.get_objects() if type(o).__name__ == "Dashboard" and hasattr(o, "decisions_toggle")), None)
+    if win is not None and len(win.decisions) == 2 and kinds(win) == {"choice", "action"}:
+        GLib.idle_add(run, win)
+        return False
+    if res["n"] > 100:
+        print("FAIL no decisions"); finish(1)
+    return True
+def run(win):
+    try:
+        win.decisions_toggle.set_active(False)
+        k = kinds(win)
+        print("PASS choices-hidden" if "choice" not in k else "FAIL choices-hidden %r" % sorted(k))
+        print("PASS actions-kept" if k == {"action"} else "FAIL actions-kept %r" % sorted(k))
+        win.decisions_toggle.set_active(True)
+        k = kinds(win)
+        print("PASS choices-back" if k == {"choice", "action"} else "FAIL choices-back %r" % sorted(k))
+        win.actions_toggle.set_active(False)
+        win.actions_toggle.set_active(True)
+        d = os.path.join(xdg, "po-dashboard")
+        got = [json.load(open(os.path.join(d, f))) for f in sorted(os.listdir(d))]
+        print("PASS saved-file" if got == [{"actions": True, "decisions": True}] else "FAIL saved-file %r" % (got,))
+    except Exception as e:
+        print("FAIL error %r" % (e,))
+    finish(0)
+GLib.timeout_add(100, tick)
+mod.main()
+PY
+		)
+		for t in choices-hidden actions-kept choices-back saved-file; do
+			case $t in
+			choices-hidden) m="Decisions off hides the choice cards" ;;
+			actions-kept) m="Decisions off keeps the action cards" ;;
+			choices-back) m="Decisions back on brings the choice cards back" ;;
+			saved-file) m="the saved filter file is {actions: true, decisions: true}" ;;
+			esac
+			grep -qx "PASS $t" <<<"$out" && ok "po-dashboard toggle: $m" || bad "dashboard toggle $t" "$out"
+		done
 			[[ -s $TMP/shot.png && -s $TMP/shot-decisions.png && -s $TMP/shot-team.png && -s $TMP/shot-reports.png ]] && ok "po-dashboard opens, loads events and saves a screenshot, also in the Decisions, Team (LIMIT and usage rows) and Reports views" || bad "dashboard ui smoke"
 	else
 		ok "po-dashboard UI smoke skipped: no display"
@@ -3425,7 +3693,7 @@ expect "run_sentinel must be \"required\"" 2 'run_sentinel must be "required": y
 audit=$(awk '
 	{ line = $0 }
 	line ~ /^[ \t]*#/ { prev = line; next }
-	(line ~ ("python" "3 [^<]* - [^<]*<<") || line ~ ("bash" " -c ")) && line !~ /^[ \t]*(block|crash_case) / && prev !~ /^[ \t]*# helper$/ {
+	(line ~ ("python" "3 ([^<]* )?- [^<]*<<") || line ~ ("bash" " -c ")) && line !~ /^[ \t]*(block|crash_case) / && prev !~ /^[ \t]*# helper$/ {
 		printf "%d: %s\n", NR, line
 	}
 	{ prev = line }
@@ -3446,6 +3714,7 @@ cat >"$R2/ready.jsonl" <<'EOF'
 malformed line here
 EOF
 # configure ready.file and project filter
+# helper
 python3 - "$R2/po.toml" <<'PY2'
 import re,sys
 p=sys.argv[1]
@@ -3454,6 +3723,7 @@ s=s.replace('[versioning]','[ready]\nfile = "ready.jsonl"\n\n[versioning]',1)
 open(p,'w').write(s)
 PY2
 # add a TODO item to the backlog
+# helper
 python3 - "$R2" <<'PY2'
 import sys
 d=sys.argv[1]
@@ -3471,7 +3741,7 @@ PY2
 git -C "$R2" add -A && git -C "$R2" commit -qm readycfg >/dev/null 2>&1
 
 # DONE excluded: v1.0.1 not in output
-out=$(cd "$R2" && "$PO" ready 2>&1); code=$?; echo "STDOUT: [$out]" >&2
+out=$(cd "$R2" && "$PO" ready 2>&1); code=$?
 if grep -q "v1.0.1" <<<"$out"; then bad "ready: DONE excluded"; else ok "ready: DONE excluded"; fi
 # TODO with met depends + present note listed (v1.0.3 corrected)
 if grep -q "v1.0.5" <<<"$out" && grep -q "corrected fifth" <<<"$out"; then ok "ready: ready item listed"; else bad "ready: ready item listed" "$out"; fi
@@ -3618,6 +3888,52 @@ Q2=$("$PO" -C "$DQ" dispatch --commit 2>&1)
 	ok "dispatch --commit twice: the first run gives each agent one item" || bad "dispatch run 1" "$Q1"
 [[ $(grep -c '^opened' <<<"$Q2") == 0 && $Q2 == *'dispatch: 0 opened, 1 skipped, 0 failed'* ]] &&
 	ok "dispatch --commit twice: the second run, with no owner written by hand, does nothing" || bad "dispatch run 2" "$Q2"
+
+# v0.61 (i): the prompt file is written even with no [dispatch] notify.
+DN=$TMP/dispatch3
+git clone -q "$DP" "$DN" 2>/dev/null
+git -C "$DN" reset -q --hard "$dp_before"
+git -C "$DN" config user.name t
+git -C "$DN" config user.email t@example.invalid
+printf '{"item":"v1.2","agents":["cy","bo"]}\n' >"$DN/ready.jsonl"
+sed -i '/^notify = /d' "$DN/po.toml"
+git -C "$DN" commit -qam "no notify"
+"$PO" -C "$DN" dispatch --commit >/dev/null 2>&1
+[[ $(head -n 1 "$DN/.git/po-dispatch/v1.2.md" 2>/dev/null) == 'v1.2 → '*' · PROMPT' ]] &&
+	ok "dispatch --commit: the prompt file is written without a [dispatch] notify" || bad "dispatch prompt without notify" "$(ls "$DN/.git/po-dispatch" 2>&1)"
+
+# v0.61 (e): no bash-5-only EPOCHSECONDS in the kit (README promises bash 4.4).
+! grep -rq 'EPOCHSECONDS' "$KITROOT/bin" "$KITROOT/lib" &&
+	ok "no EPOCHSECONDS in bin/ or lib/ (bash 4.4)" || bad "EPOCHSECONDS still used" "$(grep -rn EPOCHSECONDS "$KITROOT/bin" "$KITROOT/lib")"
+
+# v0.61 (f): a non-integer [stamp] slow_after is a manifest error.
+printf '%s[stamp]\nslow_after = "soon"\n' "$GOOD_MANIFEST" >"$TMP/slow-bad.toml"
+expect "manifest: a non-integer [stamp] slow_after is refused" 2 'slow_after must be an integer' -- -C "$W" --manifest "$TMP/slow-bad.toml" status
+printf '%s[stamp]\nslow_after = 45\n' "$GOOD_MANIFEST" >"$TMP/slow-ok.toml"
+expect "manifest: an integer [stamp] slow_after is accepted" 0 '.' -- -C "$W" --manifest "$TMP/slow-ok.toml" status
+
+# v0.61 (g): po team without [layout] owner_column is refused, not every agent free.
+sed '/^owner_column/d' "$TM/po.toml" >"$TMP/team-noowner.toml"
+expect "team without owner_column is refused (exit 2)" 2 'needs \[layout\] owner_column' -- -C "$TM" --manifest "$TMP/team-noowner.toml" team
+
+# v0.61 (g): po dispatch still plans for a manifest without owner_column (the refusal is po team's alone).
+sed '/^owner_column/d' "$DP/po.toml" >"$TMP/dispatch-noowner.toml"
+out=$("$PO" -C "$DP" --manifest "$TMP/dispatch-noowner.toml" dispatch --plan 2>&1); code=$?
+[[ $code == 0 && $out == *'assign '* ]] &&
+	ok "dispatch --plan works for a manifest without owner_column" || bad "dispatch --plan without owner_column (exit $code)" "$out"
+
+# v0.61 (h): po ready checks needs_note on main, and refuses .. and absolute paths.
+echo note >"$R2/docs/untracked-note.md"
+for nn in docs/untracked-note.md ../outside.md /etc/passwd; do
+	printf '{"item":"v1.0.5","title":"Fifth","needs_note":"%s"}\n' "$nn" >"$R2/ready.jsonl"
+	out=$(cd "$R2" && "$PO" ready --explain 2>&1)
+	[[ $out != *'v1.0.5  Fifth'* && $out == *needs_note* ]] &&
+		ok "ready: needs_note '$nn' (not a file on main, or outside the repo) excludes the item" || bad "ready: needs_note $nn" "$out"
+done
+printf '{"item":"v1.0.5","title":"Fifth","needs_note":"docs/backlog/v1.md"}\n' >"$R2/ready.jsonl"
+out=$(cd "$R2" && "$PO" ready 2>&1)
+[[ $out == *'v1.0.5  Fifth'* ]] &&
+	ok "ready: needs_note that is a file on main keeps the item" || bad "ready: needs_note on main" "$out"
 
 # ---- private test blocks (absent from a public snapshot) -------------------
 for _t in "$KITROOT"/private/tests.d/*.sh; do

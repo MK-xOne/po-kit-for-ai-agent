@@ -42,7 +42,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..
 import dashboard_core as core  # noqa: E402
 import dashboard_reports as reports  # noqa: E402
 
-
 def die(msg, code=1):
     sys.stderr.write("po-dashboard: %s\n" % msg)
     sys.exit(code)
@@ -214,10 +213,12 @@ def main():
             self.decisions_expanded = set()  # (project, item) of the cards the user opened
             self.filter_path = core.decisions_filter_path()
             self.actions_shown = core.load_actions_shown(self.filter_path)  # the viewer's own Actions filter
+            self.decisions_shown = core.load_decisions_shown(self.filter_path)  # the viewer's own Decisions filter
             self.decisions_text = None
             self.answer_url = answer_url
             self.answer_token = os.environ.get(core.ANSWER_TOKEN_ENV, "")
             self.answers = {}  # entry id -> {"answer_id": str, "body": dict, "display": str}
+            self.drafts = {}  # entry id -> unsent answer draft (window-level, survives redraw)
             self.read_only_said = False  # shows "read-only" once in the status line
             self.view = "events"
             self.events_failed = False
@@ -279,9 +280,13 @@ def main():
             self.actions_toggle = Gtk.ToggleButton(label="Actions", active=self.actions_shown)
             self.actions_toggle.add_css_class("po-small")
             self.actions_toggle.connect("toggled", self.on_actions)
+            self.decisions_toggle = Gtk.ToggleButton(label="Decisions", active=self.decisions_shown)
+            self.decisions_toggle.add_css_class("po-small")
+            self.decisions_toggle.connect("toggled", self.on_decisions_toggle)
             self.subrow.append(self.toggle)
             self.subrow.append(self.reports_button)
             self.subrow.append(self.actions_toggle)
+            self.subrow.append(self.decisions_toggle)
             self.subrow_show(a.view)
 
             self.error = Gtk.Label(label="", xalign=0, wrap=True, margin_start=36, margin_end=36)
@@ -645,16 +650,27 @@ def main():
             self.toggle.set_visible(name == "events")
             self.reports_button.set_visible(name == "events")
             self.actions_toggle.set_visible(name == "decisions")
+            self.decisions_toggle.set_visible(name == "decisions")
 
         def decisions_counts(self):
-            """(entries shown, Action entries hidden by the filter)."""
-            kept, hidden = core.filter_decisions(self.decisions, self.actions_shown)
-            return len(kept), hidden
+            """(entries shown, Action entries hidden, Choice entries hidden)."""
+            kept, ah, dh = core.filter_decisions(self.decisions, self.actions_shown, self.decisions_shown)
+            return len(kept), ah, dh
 
         def on_actions(self, button):
             self.actions_shown = button.get_active()
             try:
                 core.save_actions_shown(self.filter_path, self.actions_shown)
+            except core.DashboardError as e:
+                self.decisions_error.set_text(str(e))
+                self.decisions_error.set_visible(self.view == "decisions")
+            self.redraw_decisions()
+            self.show_status()
+
+        def on_decisions_toggle(self, button):
+            self.decisions_shown = button.get_active()
+            try:
+                core.save_decisions_shown(self.filter_path, self.decisions_shown)
             except core.DashboardError as e:
                 self.decisions_error.set_text(str(e))
                 self.decisions_error.set_visible(self.view == "decisions")
@@ -911,13 +927,14 @@ def main():
             self.decisions_expanded = core.prune_expanded(self.decisions_expanded, self.decisions)
             answer_ids = {str(e.get("id") or "") for e in self.decisions if e.get("id")}
             self.answers = {k: v for k, v in self.answers.items() if k in answer_ids}
+            self.drafts = {k: v for k, v in self.drafts.items() if k in answer_ids}
             child = self.decisions_list.get_first_child()
             while child is not None:
                 nxt = child.get_next_sibling()
                 self.decisions_list.remove(child)
                 child = nxt
             groups = [Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL) for _ in range(4)]
-            shown, _hidden = core.filter_decisions(self.decisions, self.actions_shown)
+            shown, _ah, _dh = core.filter_decisions(self.decisions, self.actions_shown, self.decisions_shown)
             for entry in core.sort_decisions(shown):
                 r = core.decision_row(entry)
                 key = core.decision_key(entry)
@@ -1017,7 +1034,8 @@ def main():
                 box.append(self.label("read-only", "po-muted", margin_top=6))
                 return
             # read-write: controls based on kind. picks holds the draft in a closure dict.
-            picks = {"choice": None, "text": "", "result": None, "step": None, "note": ""}
+            draft = self.drafts.get(aid, {})
+            picks = {"choice": draft.get("choice"), "text": draft.get("text", ""), "result": draft.get("result"), "step": draft.get("step"), "note": draft.get("note", "")}
             controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, margin_top=6)
             send = Gtk.Button(label="Send")
             send.add_css_class("po-small")
@@ -1028,11 +1046,15 @@ def main():
                     btn = Gtk.ToggleButton(label=o["label"], group=group)
                     if group is None:
                         group = btn
+                    if draft.get("choice") == o["label"]:
+                        btn.set_active(True)
                     btn.connect("toggled", self.on_choice_pick, aid, o["label"], send, picks)
                     controls.append(btn)
                 write_in = Gtk.Entry()
                 write_in.set_placeholder_text("or write your own")
-                write_in.connect("changed", self.on_answer_note, aid, send, picks)
+                if draft.get("note"):
+                    write_in.set_text(draft["note"])
+                write_in.connect("changed", self.on_answer_note, aid, "choice", send, picks)
                 controls.append(write_in)
             elif r["kind"] == "action":
                 group = None
@@ -1040,82 +1062,90 @@ def main():
                     btn = Gtk.ToggleButton(label=label, group=group)
                     if group is None:
                         group = btn
+                    if draft.get("result") == label:
+                        btn.set_active(True)
                     btn.connect("toggled", self.on_action_result, aid, label, send, picks)
                     controls.append(btn)
                 step_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, visible=False)
+                step_group = None
                 for n in range(1, len(r["steps"]) + 1):
-                    btn = Gtk.Button(label=str(n))
+                    btn = Gtk.ToggleButton(label=str(n), group=step_group)
+                    if step_group is None:
+                        step_group = btn
                     btn.set_size_request(32, -1)
-                    btn.connect("clicked", self.on_action_step, aid, n, send, picks)
+                    if draft.get("step") == n:
+                        btn.set_active(True)
+                    btn.connect("toggled", self.on_action_step, aid, n, send, picks)
                     step_box.append(btn)
                 controls.append(step_box)
                 note = Gtk.Entry()
                 note.set_placeholder_text("note")
-                note.connect("changed", self.on_answer_note, aid, send, picks)
+                if draft.get("note"):
+                    note.set_text(draft["note"])
+                note.connect("changed", self.on_answer_note, aid, "action", send, picks)
                 controls.append(note)
                 picks["step_box"] = step_box
             else:  # unformatted
                 text = Gtk.Entry()
                 text.set_placeholder_text("Type your answer…")
                 text.set_hexpand(True)
+                if draft.get("text"):
+                    text.set_text(draft["text"])
                 text.connect("changed", self.on_answer_text, aid, send, picks)
                 controls.append(text)
+            if r["kind"] == "action" and picks.get("result") == "Failed" and picks.get("step_box"):
+                picks["step_box"].set_visible(True)
+            send.set_sensitive(core.answer_ready(r["kind"], picks))
             send.connect("clicked", self.on_send_answer, aid, r, picks)
             controls.append(send)
             box.append(controls)
 
+        def _draft_changed(self, aid, kind, send, picks):
+            """Store the draft and set Send from the one readiness rule."""
+            send.set_sensitive(core.answer_ready(kind, picks))
+            self.drafts[aid] = {k: v for k, v in picks.items() if k != "step_box"}
+
         def on_choice_pick(self, button, aid, label, send, picks):
-            """A choice radio was toggled; store the option and enable Send."""
+            """A choice radio was toggled; store the option."""
             if button.get_active():
                 picks["choice"] = label
-                send.set_sensitive(True)
-            else:
+            elif picks.get("choice") == label:
                 picks["choice"] = None
-                send.set_sensitive(False)
+            self._draft_changed(aid, "choice", send, picks)
 
         def on_action_result(self, button, aid, label, send, picks):
-            """Pass/Failed was toggled; Failed shows the step chooser and enables Send only after a step."""
+            """Pass/Failed was toggled; Failed shows the step chooser."""
             if not button.get_active():
                 return
             if label == "Failed" and picks.get("step_box"):
                 picks["step_box"].set_visible(True)
             picks["result"] = label
-            if label == "Pass":
-                send.set_sensitive(True)
+            self._draft_changed(aid, "action", send, picks)
 
         def on_action_step(self, button, aid, step, send, picks):
-            """A step number was chosen for Failed; enable Send."""
+            """A step number was chosen for Failed."""
+            if not button.get_active():
+                return
             picks["step"] = step
-            send.set_sensitive(True)
+            self._draft_changed(aid, "action", send, picks)
 
-        def on_answer_note(self, entry, aid, send, picks):
+        def on_answer_note(self, entry, aid, kind, send, picks):
             """The note or write-your-own text box changed."""
             picks["note"] = entry.get_text().strip()
-            # Send stays enabled only when a choice option is picked, or for Failed with a step
-            ready = picks["choice"] is not None or (picks["result"] == "Failed" and picks.get("step") is not None)
-            send.set_sensitive(ready)
+            self._draft_changed(aid, kind, send, picks)
 
         def on_answer_text(self, entry, aid, send, picks):
-            """The unformatted text box changed; enable Send when non-empty."""
-            text = entry.get_text().strip()
-            picks["text"] = text
-            send.set_sensitive(bool(text))
+            """The unformatted text box changed."""
+            picks["text"] = entry.get_text().strip()
+            self._draft_changed(aid, "unformatted", send, picks)
 
         def on_send_answer(self, button, aid, r, picks):
             """Build the body, stash the draft, POST in a worker thread."""
             kind = r["kind"]
-            params = {}
-            if kind == "choice":
-                params["option"] = picks["choice"]
-                params["text"] = picks["note"]
-            elif kind == "action":
-                params["result"] = picks["result"]
-                params["step"] = picks.get("step")
-                params["note"] = picks["note"]
-            else:  # unformatted
-                params["text"] = picks["text"]
+            params = core.answer_params(kind, picks)
             body = core.answer_body(r, core.answer_id(), **params)
             self.answers[aid] = {"answer_id": body["answer_id"], "body": body, "display": "sending…"}
+            self.drafts.pop(aid, None)
             button.set_sensitive(False)
             threading.Thread(target=self._send_answer, args=(aid, body), daemon=True).start()
 

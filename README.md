@@ -488,12 +488,15 @@ the same from any worktree.
   colour); a `kind` entry with an unknown kind, a missing `id` or a missing or malformed
   field shows as `unformatted` in the error colour, so it stays visible. An entry without
   `kind` displays as before. Order: Choices, then Actions, then unformatted and legacy,
-  each group oldest first. An `Actions` toggle in the second button row (on by default)
-  hides the Action entries and the status line says `3 waiting · 1 action hidden`; its
-  state is saved on the viewer's machine in `$XDG_CONFIG_HOME/po-dashboard/decisions.json`
-  (`{"actions": false}`; `PO_DASHBOARD_DECISIONS_FILTER` names another file; a missing or
-  broken file means on). `--answer-url` or `PO_DASHBOARD_ANSWER_URL` (no default; the flag
-wins over the environment) sets an http(s) answer sink: when it is set, expanded decision
+  each group oldest first. An `Actions` toggle and a `Decisions` toggle in the second button row
+  (both on by default): `Actions` hides the Action entries, `Decisions` hides the Choice
+  entries; unformatted and legacy entries stay visible under both. The status line says
+  `3 waiting · 1 action hidden · 2 decisions hidden` (each part only when non-zero); state is
+  saved on the viewer's machine in `$XDG_CONFIG_HOME/po-dashboard/decisions.json`
+  (`{"actions": false, "decisions": false}`; writing one key keeps the other; a missing or
+  broken file means both on). `PO_DASHBOARD_DECISIONS_FILTER` names another file; `--answer-url`
+  or `PO_DASHBOARD_ANSWER_URL` (no default; the flag
+  wins over the environment) sets an http(s) answer sink: when it is set, expanded decision
 cards gain pick controls and a Send button (see below). Without it the view stays
 read-only and the status line says `read-only` once when the view opens. The bearer token
 for the POST is read only from `PO_DASHBOARD_ANSWER_TOKEN` (never a flag). Esc closes the
@@ -536,8 +539,8 @@ window. `--check` prints the rows the window would show, without a
     step numbers) and a one-line note box; Send is enabled once a step is chosen
     (for Pass, immediately).
   - **Unformatted** — a free-text box; Send is enabled once it is non-empty.
-  No Enter-to-send, no confirmation dialog. The POST runs in a worker thread and
-  never blocks the UI; the answer state is kept in the window state keyed by
+  No Enter-to-send, no confirmation dialog. The POST runs in a worker thread (20 s
+  timeout) and never blocks the UI; the answer state is kept in the window state keyed by
     `id`, re-applied on rebuild, pruned when the entry leaves the feed. The card
     shows the result:
   | HTTP | state |
@@ -577,7 +580,7 @@ window. `--check` prints the rows the window would show, without a
   and `--screenshot` saves the window to a PNG once it has data (after
   `--screenshot-delay` seconds, 0.6 by default), then quits.
   In the Events view a second, thinner row of buttons sits under the header: "Show all"
-  and "Reports". The row is hidden in Team; in Decisions it holds only the "Actions" toggle; the view buttons never move.
+  and "Reports". The row is hidden in Team; in Decisions it holds the "Actions" and "Decisions" toggles; the view buttons never move.
   "Reports" swaps the list for a report pane (a title, a time-range choice 24 h / 7 d / 30 d,
   7 d by default, and five charts; "no events in this range" when the range holds none);
   "Reports" again returns to the list. The charts (the numbers come from `lib/po/dashboard_reports.py`,

@@ -41,6 +41,9 @@ po_cmd_team() {
 		shift
 	done
 	((${#PO_TEAM_NAME[@]} > 0)) || po_die "no [[team.agent]] in $PO_MANIFEST_FILE: the roster is empty"
+	# po dispatch reads this feed itself and sets PO_TEAM_NO_OWNER_OK: a project without the column dispatches as before.
+	[[ -n ${PO_MANIFEST[layout.owner_column]+x} || -n ${PO_TEAM_NO_OWNER_OK:-} ]] ||
+		po_die "team: needs [layout] owner_column in $PO_MANIFEST_FILE: without it no agent owns anything and every agent would show free"
 	po_backlog_load
 
 	# The newest event time per agent (the log is in time order).

@@ -5,6 +5,7 @@ here so tests can run them anywhere; bin/po-dashboard only draws the window.
 Standard library only.
 """
 import datetime
+import http.client
 import json
 import math
 import os
@@ -30,7 +31,7 @@ PROJECTS_URL_ENV = "PO_DASHBOARD_PROJECTS_URL"
 DECISIONS_FILTER_ENV = "PO_DASHBOARD_DECISIONS_FILTER"  # the saved Actions filter's file, instead of the default under the config dir
 ANSWER_URL_ENV = "PO_DASHBOARD_ANSWER_URL"  # where to POST answers (v0.49); none = read-only Decisions
 ANSWER_TOKEN_ENV = "PO_DASHBOARD_ANSWER_TOKEN"  # bearer token for the answer POST (v0.49), env only
-CLIENT = "po-dashboard v0.49"
+CLIENT = "po-dashboard"
 TEAM_ORDER_ENV = "PO_DASHBOARD_TEAM_ORDER"  # the saved order's file, instead of the default under the config dir
 FADE_SECONDS = 60
 FADE_STEPS = 60  # one CSS class per step, po-fade-<n>: n steps of highlight left
@@ -150,6 +151,29 @@ def answer_body(entry, answer_id, option=None, text=None, result=None, step=None
     }
 
 
+def answer_ready(kind, picks):
+    """Whether the draft in picks may be sent: the rule Send's sensitivity follows.
+
+    choice: an option, or a write-in alone; action: Pass, or Failed with a step;
+    unformatted: non-empty text.
+    """
+    if kind == "choice":
+        return picks.get("choice") is not None or bool(picks.get("note"))
+    if kind == "action":
+        return picks.get("result") == "Pass" or (picks.get("result") == "Failed" and picks.get("step") is not None)
+    return bool(picks.get("text"))
+
+
+def answer_params(kind, picks):
+    """The answer_body keyword fields for a draft: lowercase result, step only for failed, empty text null."""
+    if kind == "choice":
+        return {"option": picks.get("choice"), "text": picks.get("note") or None}
+    if kind == "action":
+        failed = picks.get("result") == "Failed"
+        return {"result": "failed" if failed else "pass", "step": picks.get("step") if failed else None, "note": picks.get("note") or None}
+    return {"text": picks.get("text")}
+
+
 def answer_state(status_code, reason="", host=None):
     """The display string for an answer POST response code.
 
@@ -184,6 +208,16 @@ def answer_state_class(state):
     return "po-fail"
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+# The receiver reads the ask back from the relay and posts the ruling before it answers: two
+# round trips, so a slow relay needs more than a few seconds (the POST runs in a worker thread).
+ANSWER_TIMEOUT = 20
+
+
 def post_answer(url, body, token=None):
     """POST the answer body as JSON to url. Returns the answer display string."""
     data = json.dumps(body).encode("utf-8")
@@ -193,11 +227,12 @@ def post_answer(url, body, token=None):
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     host = urllib.parse.urlsplit(url).netloc
     try:
-        with urllib.request.urlopen(req, timeout=5) as r:
+        # no redirect handler: the bearer token is never forwarded, a redirect is an HTTPError (a failure)
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=ANSWER_TIMEOUT) as r:
             return answer_state(r.status, host=host)
     except urllib.error.HTTPError as e:
         return answer_state(e.code, e.reason, host=host)
-    except (urllib.error.URLError, OSError, ValueError) as e:
+    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as e:
         return answer_state(0, str(getattr(e, "reason", e)))
 
 
@@ -264,10 +299,8 @@ SLOW_DEFAULT = 300
 
 
 def slow_after():
-    try:
-        return int(os.environ.get(SLOW_ENV, SLOW_DEFAULT))
-    except ValueError:
-        return SLOW_DEFAULT
+    raw = os.environ.get(SLOW_ENV, "")
+    return int(raw) if raw.isascii() and raw.isdigit() else SLOW_DEFAULT  # digits only, as the manifest schema
 
 
 def event_seconds(event):
@@ -789,40 +822,86 @@ def decisions_filter_path(env=None):
     return os.path.join(base, "po-dashboard", "decisions.json")
 
 
-def load_actions_shown(path):
-    """Whether Action entries show; on unless the file says {"actions": false} (missing or broken is on)."""
+def _load_filter(path):
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def load_actions_shown(path):
+    """Whether Action entries show; on unless the file says {"actions": false} (missing or broken is on)."""
+    data = _load_filter(path)
+    if data is None:
         return True
-    return not (isinstance(data, dict) and data.get("actions") is False)
+    return not (data.get("actions") is False)
 
 
-def save_actions_shown(path, shown):
-    """Write the filter atomically, creating the directory. Raises DashboardError."""
+def load_decisions_shown(path):
+    """Whether Choice entries show; on unless the file says {"decisions": false} (missing or broken is on)."""
+    data = _load_filter(path)
+    if data is None:
+        return True
+    return not (data.get("decisions") is False)
+
+
+def _read_filter(path):
+    data = _load_filter(path)
+    return data if isinstance(data, dict) else {}
+
+
+def _write_filter(path, key, shown):
+    """Write one key, keeping the other. Raises DashboardError."""
     try:
+        data = _read_filter(path)
+        data[key] = bool(shown)
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"actions": bool(shown)}, f, indent=1)
+            json.dump(data, f, indent=1)
             f.write("\n")
         os.replace(tmp, path)
     except OSError as e:
         raise DashboardError("cannot save the decisions filter: %s" % e)
 
 
-def filter_decisions(entries, actions_shown):
-    """(entries to show, number of Action entries hidden); the feed's list is not changed."""
-    if actions_shown:
-        return list(entries), 0
-    kept = [e for e in entries if decision_shape(e) != "action"]
-    return kept, len(entries) - len(kept)
+def save_actions_shown(path, shown):
+    """Write the actions filter atomically, keeping the decisions key. Raises DashboardError."""
+    _write_filter(path, "actions", shown)
 
 
-def decisions_status(shown, hidden):
-    """The status line: '3 waiting', or '3 waiting · 1 action hidden'."""
-    return "%d waiting" % shown + (" \u00b7 %d action hidden" % hidden if hidden else "")
+def save_decisions_shown(path, shown):
+    """Write the decisions filter atomically, keeping the actions key. Raises DashboardError."""
+    _write_filter(path, "decisions", shown)
+
+
+def filter_decisions(entries, actions_shown, decisions_shown=True):
+    """(entries to show, number of Action entries hidden, number of Choice entries hidden)."""
+    actions_hidden = 0
+    decisions_hidden = 0
+    kept = []
+    for e in entries:
+        shape = decision_shape(e)
+        if shape == "action" and not actions_shown:
+            actions_hidden += 1
+            continue
+        if shape == "choice" and not decisions_shown:
+            decisions_hidden += 1
+            continue
+        kept.append(e)
+    return kept, actions_hidden, decisions_hidden
+
+
+def decisions_status(shown, actions_hidden, decisions_hidden=0):
+    """The status line: '3 waiting', with '· 1 action hidden' and '· 2 decisions hidden' parts when non-zero."""
+    parts = ["%d waiting" % shown]
+    if actions_hidden:
+        parts.append("%d action hidden" % actions_hidden)
+    if decisions_hidden:
+        parts.append("%d decisions hidden" % decisions_hidden)
+    return " \u00b7 ".join(parts)
 
 
 # ---- the Team view's order, saved on the viewer's machine -------------------
