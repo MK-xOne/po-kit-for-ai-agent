@@ -1071,8 +1071,20 @@ def main():
                 box.append(text("done when: " + r["done_when"], "po-muted"))
 
         def on_copy(self, button, command):
-            """Puts the command on the clipboard and nothing else; the dashboard never runs it."""
-            button.get_clipboard().set(command)
+            """Puts the command on the clipboard and nothing else; the dashboard never runs it.
+
+            The text goes out as explicit text/plain providers beside the string one: Wayland
+            compositors and clipboard managers ask for a mime type, and the button says Copied
+            (or Copy failed) so a miss shows."""
+            data = GLib.Bytes.new(command.encode("utf-8"))
+            provider = Gdk.ContentProvider.new_union([
+                Gdk.ContentProvider.new_for_bytes("text/plain;charset=utf-8", data),
+                Gdk.ContentProvider.new_for_bytes("text/plain", data),
+                Gdk.ContentProvider.new_for_value(command),
+            ])
+            ok = button.get_clipboard().set_content(provider)
+            button.set_label("Copied" if ok else "Copy failed")
+            GLib.timeout_add_seconds(2, lambda: button.set_label("Copy") and False)
 
         def on_decision_toggle(self, _button, box, key):
             self.decisions_expanded = core.toggle_expanded(self.decisions_expanded, key)

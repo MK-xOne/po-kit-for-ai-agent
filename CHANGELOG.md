@@ -12,6 +12,14 @@ Unreleased becomes `## Release N (YYYY-MM-DD): <theme>`.
 
 ## Unreleased
 
+## Release 20 (2026-10-30): Copy sets explicit text and says Copied (patch to Release 19)
+
+**Agents:** nothing new. **Adopt:** nothing to turn on; install the release on the machine that shows the dashboard.
+
+### Copy sets explicit text and says Copied (v0.73, 2026-10-30)
+
+Fixes the Copy button next to an install command, which copied nothing on a native Wayland desktop. It now offers the text as `text/plain;charset=utf-8` and `text/plain` as well as a string, and the button reads Copied (or Copy failed) for two seconds, so a miss shows. The cause on Wayland was not reproduced on a headless host; if Copy still fails, the label says so. **Agents:** nothing new. **Adopt:** nothing to turn on; install the release on the machine that shows the dashboard.
+
 ## Release 19 (2026-10-30): an action card answers as an action (patch to Release 18)
 
 **Agents:** nothing new. **Adopt:** nothing to turn on; install the release on the machine that shows the dashboard. A receiver may send `X-Reason: <class>` on a refusal.
