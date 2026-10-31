@@ -1258,7 +1258,7 @@ def main():
             """Build the body, stash the draft, POST in a worker thread."""
             kind = r["kind"]
             params = core.answer_params(kind, picks)
-            body = core.answer_body(r, core.answer_id(), **params)
+            body = core.answer_body(r, core.answer_id(), kind=kind, **params)
             self.answers[aid] = {"answer_id": body["answer_id"], "body": body, "display": "sending…"}
             self.drafts.pop(aid, None)
             button.set_sensitive(False)

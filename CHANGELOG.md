@@ -12,6 +12,14 @@ Unreleased becomes `## Release N (YYYY-MM-DD): <theme>`.
 
 ## Unreleased
 
+## Release 19 (2026-10-30): an action card answers as an action (patch to Release 18)
+
+**Agents:** nothing new. **Adopt:** nothing to turn on; install the release on the machine that shows the dashboard. A receiver may send `X-Reason: <class>` on a refusal.
+
+### An action card answers as an action; the refusal reason shows (v0.72, 2026-10-30)
+
+Fixes release 18 (and v0.69): Send built the answer from the display row, and an action card with no `requires` was read as malformed, so the answer went out as kind `unformatted` and the receiver refused it ("Bad Request"). The body now keeps the card's real kind. A refused answer also shows the receiver's reason class when it sends one in an `X-Reason` header (`not sent: bad request (kind)`; a short lowercase word or two, nothing else is shown). **Agents:** nothing new. **Adopt:** nothing to turn on; install the release on the machine that shows the dashboard. A receiver may send `X-Reason: <class>` on a refusal; never content or tokens.
+
 ## Release 18 (2026-10-30): an open decision card stays open while the owner types (patch to Release 17)
 
 **Agents:** nothing new. **Adopt:** nothing to turn on; install the release on the machine that shows the dashboard.

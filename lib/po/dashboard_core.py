@@ -141,13 +141,14 @@ def answer_id():
     return str(uuid.uuid4())
 
 
-def answer_body(entry, answer_id, option=None, text=None, result=None, step=None, note=None):
+def answer_body(entry, answer_id, option=None, text=None, result=None, step=None, note=None, kind=None):
     """The POST body for answering a decision entry.
 
     One JSON object per answer, flat, null for fields the kind does not use:
     {answer_id, id, project, item, kind, option, text, result, step, note,
      answered_at, client}. answer_id is made once per Send and kept with the
-     draft, so Retry re-posts the same body.
+     draft, so Retry re-posts the same body. kind is given when entry is a display row (its
+    shape is already decided; decision_shape of a row reads its requires=None as malformed).
     """
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     return {
@@ -155,7 +156,7 @@ def answer_body(entry, answer_id, option=None, text=None, result=None, step=None
         "id": str(entry.get("id") or ""),
         "project": str(entry.get("project") or ""),
         "item": str(entry.get("item") or ""),
-        "kind": decision_shape(entry),
+        "kind": kind or decision_shape(entry),
         "option": option,
         "text": text,
         "result": result,
@@ -252,6 +253,19 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 ANSWER_TIMEOUT = 20
 
 
+_REASON = re.compile(r"[a-z0-9][a-z0-9/ _-]{0,39}")
+
+
+def answer_reason(err):
+    """The text after 'not sent:' for an HTTP error: 'bad request (kind)' when the receiver names its reason class
+    in an X-Reason header (a short lowercase word or two, nothing else is shown), else the status line's reason."""
+    why = (err.headers.get("X-Reason") if err.headers else None) or ""
+    why = why.strip()
+    if _REASON.fullmatch(why):
+        return "%s (%s)" % (str(err.reason).lower(), why)
+    return err.reason
+
+
 def post_answer(url, body, token=None):
     """POST the answer body as JSON to url. Returns the answer display string."""
     data = json.dumps(body).encode("utf-8")
@@ -265,7 +279,7 @@ def post_answer(url, body, token=None):
         with urllib.request.build_opener(_NoRedirect).open(req, timeout=ANSWER_TIMEOUT) as r:
             return answer_state(r.status, host=host)
     except urllib.error.HTTPError as e:
-        return answer_state(e.code, e.reason, host=host)
+        return answer_state(e.code, answer_reason(e), host=host)
     except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as e:
         return answer_state(0, str(getattr(e, "reason", e)))
 

@@ -3026,6 +3026,8 @@ class AnswerH(http.server.BaseHTTPRequestHandler):
             self.send_response(201)  # a bearer token is accepted
         else:
             self.send_response(code)
+        if code == 400:
+            self.send_header("X-Reason", "kind")
         self.send_header("Content-Length", "0")
         self.end_headers()
     def log_message(self, *a):
@@ -3033,6 +3035,10 @@ class AnswerH(http.server.BaseHTTPRequestHandler):
 asrv = http.server.HTTPServer(("127.0.0.1", 0), AnswerH)
 threading.Thread(target=asrv.serve_forever, daemon=True).start()
 abase = "http://127.0.0.1:%d" % asrv.server_address[1]
+# v0.72: Send builds the body from the display row; an action card without requires must still be kind action.
+_row_action = c.decision_row(_check_entry_action)
+check("dashboard answers: a row of an action card without requires keeps kind action in the body",
+      c.answer_body(_row_action, "6bde9c70-bd8f-4ae0-a2c7-9f6d8bebde07", kind=_row_action["kind"], result="pass")["kind"] == "action")
 ab = c.answer_body(_check_entry_choice, "5acd8b6f-ac7e-4fd1-91b6-8e5c7adfcd96", option="Yes", text="")
 check("dashboard answers: 201 is answered · sent", c.post_answer(abase + "/201", ab) == "answered \u00b7 sent")
 check("dashboard answers: 200 is answered · sent", c.post_answer(abase + "/200", ab) == "answered \u00b7 sent")
@@ -3041,6 +3047,7 @@ check("dashboard answers: 404 is no longer waiting", c.post_answer(abase + "/404
 check("dashboard answers: 401 without a token is refused", c.post_answer(abase + "/401", ab).startswith("refused by"))
 check("dashboard answers: 401 with a token is answered · sent", c.post_answer(abase + "/401", ab, token="secret") == "answered \u00b7 sent")
 check("dashboard answers: 500 is not sent", c.post_answer(abase + "/500", ab).startswith("not sent:"))
+check("dashboard answers: an X-Reason header is shown next to the reason", c.post_answer(abase + "/400", ab) == "not sent: bad request (kind)")
 check("dashboard answers: the POST waits up to 20 s", c.ANSWER_TIMEOUT == 20)
 check("dashboard answers: a connection failure is not sent", c.post_answer("http://127.0.0.1:1/", ab).startswith("not sent:"))
 asrv.shutdown()
