@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """po-dashboard: a desktop window showing the gate events of a po serve.
 
-    po-dashboard [--url <url>] [--team-url <url>] [--decisions-url <url>] [--answer-url <url>] [--install-dir <dir>] [--view events|team|decisions|reports] [--theme auto|light|dark] [--all] [--size WxH] [--check] [--screenshot <png>] [--screenshot-delay <s>]
+    po-dashboard [--url <url>] [--archive-url <url>] [--team-url <url>] [--decisions-url <url>] [--answer-url <url>] [--install-dir <dir>] [--view events|team|decisions|reports] [--theme auto|light|dark] [--all] [--size WxH] [--check] [--screenshot <png>] [--screenshot-delay <s>]
 
 The URL is the events JSON (a JSON array or one object per line, e.g. the
 /events.json of `po serve`); --url or PO_DASHBOARD_URL, no default. GTK 4 and
@@ -78,6 +78,7 @@ def main():
     ap.add_argument("--team-url", help="team feed JSON URL or file (default: $%s; none = no Team view)" % core.TEAM_URL_ENV)
     ap.add_argument("--decisions-url", help="decisions feed JSON URL or file (default: $%s; none = no Decisions view)" % core.DECISIONS_URL_ENV)
     ap.add_argument("--projects-url", help="projects feed JSON URL or file (default: $%s; none = no Projects view)" % core.PROJECTS_URL_ENV)
+    ap.add_argument("--archive-url", help="archive JSON URL or file (default: $%s; none = no Archive button)" % core.ARCHIVE_URL_ENV)
     ap.add_argument("--answer-url", help="where to POST answers (default: $%s; none = read-only Decisions)" % core.ANSWER_URL_ENV)
     ap.add_argument("--install-dir", help="absolute dir holding the builds that cards name with requires (default: $%s; none = no install command)" % core.INSTALL_DIR_ENV)
     ap.add_argument("--view", choices=("events", "team", "decisions", "projects", "reports"), default="events", help="the view to start in (team, decisions and projects need their feed)")
@@ -88,6 +89,7 @@ def main():
     ap.add_argument("--check", action="store_true", help="print the rows the window would show, without a display")
     ap.add_argument("--screenshot", metavar="PNG", help="save the window once it has data, then quit")
     ap.add_argument("--screenshot-delay", metavar="SECONDS", type=float, default=0.6, help="wait this long after the first data before the screenshot (default 0.6)")
+    ap.add_argument("--no-memory-log", action="store_true", help="disable the memory log")
     a = ap.parse_args()
     try:
         width, height = (int(n) for n in a.size.lower().split("x"))
@@ -100,6 +102,7 @@ def main():
         team_url = core.resolve_team_url(a.team_url)
         decisions_url = core.resolve_decisions_url(a.decisions_url)
         projects_url = core.resolve_projects_url(a.projects_url)
+        archive_url = core.resolve_archive_url(a.archive_url)
         answer_url = core.resolve_answer_url(a.answer_url)
         install_dir = core.resolve_install_dir(a.install_dir)
     except core.DashboardError as e:
@@ -121,7 +124,7 @@ def main():
                 print("\n".join(core.team_check_lines(core.apply_team_order(core.parse_team(core.fetch(team_url)), order))))
             if decisions_url:
                 print("decisions:")
-                decisions = core.parse_decisions(core.fetch(decisions_url))
+                decisions, _held = core.hold_looks(core.parse_decisions(core.fetch(decisions_url)))
                 print("\n".join(core.decision_check_lines(decisions) + core.install_check_lines(decisions, install_dir)))
             if projects_url:
                 print("projects:")
@@ -202,10 +205,21 @@ def main():
     class Dashboard:
         def __init__(self, app):
             self.show_all = a.all
+            self.note_group = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)
             self.events = []
+            # one Feed per feed: a tick skips a feed whose fetch is still in flight; fetches are conditional (v0.87)
+            self.feeds = {name: core.Feed(u) for name, u in
+                          (("events", url), ("team", team_url), ("decisions", decisions_url), ("projects", projects_url)) if u}
             self.seen = None  # event keys already shown; None until the first fetch, so nothing is new then
             self.born = {}  # event key -> time.monotonic() when it appeared while the window was open
-            self.cards = []  # (card, event key, highlight step now) of the Events view
+            self.card_index = core.CardIndex()  # event key -> (card, highlight step now) of the Events view
+            self.shown_count = self.held_count = None  # the list's N and M, set by redraw
+            self.page = core.PAGE  # events Show all holds now; Load more adds a page, Show all off resets it
+            self.archive = None  # the archived events while the Archive button is on, else None (the data is dropped)
+            self.archive_busy = False
+            self.archived_keys = set()  # keys of shown events that come from the archive (the muted marker)
+            self.report_archive = None  # the archive the 30 d Reports range reads, fetched when that range is chosen
+            self.report_archive_note = ""  # why it is not there: loading, or the failure
             self.team = []
             self.team_text = None
             self.order_path = core.team_order_path()
@@ -295,6 +309,10 @@ def main():
             self.decisions_toggle.connect("toggled", self.on_decisions_toggle)
             self.subrow.append(self.toggle)
             self.subrow.append(self.reports_button)
+            self.archive_button = Gtk.ToggleButton(label="Archive")
+            self.archive_button.add_css_class("po-small")
+            self.archive_button.connect("toggled", self.on_archive)
+            self.subrow.append(self.archive_button)
             self.subrow.append(self.actions_toggle)
             self.subrow.append(self.decisions_toggle)
             self.subrow_show(a.view)
@@ -304,8 +322,19 @@ def main():
             self.error.set_visible(False)
             self.list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
             self.list.add_css_class("po-list")
-            scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.AUTOMATIC)
-            scroll.set_child(self.list)
+            self.foot = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10, margin_start=36, margin_end=36, margin_top=6, margin_bottom=8)
+            self.more = Gtk.Button(label="Load more")
+            self.more.add_css_class("po-small")
+            self.more.connect("clicked", self.on_more)
+            self.count = self.label("", "po-muted")
+            self.foot.append(self.more)
+            self.foot.append(self.count)
+            self.foot.set_visible(False)
+            body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            body.append(self.list)
+            body.append(self.foot)
+            scroll = self.event_scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.AUTOMATIC)
+            scroll.set_child(body)
             self.team_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
             self.team_list.add_css_class("po-list")
             team_scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.AUTOMATIC)
@@ -381,6 +410,8 @@ def main():
             self.refresh()
             GLib.timeout_add(core.INTERVAL_MS, self.tick)
             GLib.timeout_add(500, self.fade_tick)
+            if not getattr(a, "no_memory_log", False):
+                GLib.timeout_add_seconds(60, self.log_memory)
 
         # -- style --
         def dark(self):
@@ -416,15 +447,28 @@ def main():
             reduced = not self.settings.get_property("gtk-enable-animations")
             return core.fade_step(time.monotonic() - born, reduced)
 
+        def log_memory(self):
+            try:
+                path = core.memory_log_path()
+                seen = self.seen if self.seen is not None else set()
+                line = core.memory_log_line(
+                    datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    core.process_rss_mb(), len(self.events), len(self.card_index.cards), len(seen), len(self.born))
+                core.memory_log_append(path, line)
+            except Exception:
+                pass
+            return True
+
         def fade_tick(self):
-            for i, (card, key, step) in enumerate(self.cards):
+            cards = self.card_index.cards
+            for key, (card, step) in list(cards.items()):
                 n = self.step_of(key)
                 if n != step:
                     if step:
                         card.remove_css_class("po-fade-%d" % step)
                     if n:
                         card.add_css_class("po-fade-%d" % n)
-                    self.cards[i] = (card, key, n)
+                    cards[key] = (card, n)
             return True
 
         # -- data --
@@ -433,16 +477,18 @@ def main():
             return True
 
         def refresh(self):
-            threading.Thread(target=self.fetch_worker, daemon=True).start()
+            """Start a fetch of each feed, skipping one whose last fetch is still in flight."""
+            feeds = self.feeds
+            feeds["events"].start(self.fetch_worker, feeds["events"].since_for(self.events))
             if team_url:
-                threading.Thread(target=self.team_worker, daemon=True).start()
+                feeds["team"].start(self.team_worker)
             if decisions_url:
-                threading.Thread(target=self.decisions_worker, daemon=True).start()
+                feeds["decisions"].start(self.decisions_worker)
             if projects_url:
-                threading.Thread(target=self.projects_worker, daemon=True).start()
+                feeds["projects"].start(self.projects_worker)
 
         def projects_worker(self):
-            projects, note = core.load_projects(projects_url, self.projects)
+            projects, note = core.load_projects(projects_url, self.projects, self.feeds["projects"])
             GLib.idle_add(self.on_projects, projects, note)
 
         def on_projects(self, projects, note):
@@ -484,7 +530,7 @@ def main():
                 return
             screen = core.project_screen(pr, core.project_state_filter(self.pstate, name))
             sig = (screen["text"], [(f["key"], f["count"]) for f in screen["filters"]], core.project_state_filter(self.pstate, name),
-                   [(r["item"], r["title"], r["status"], tuple(r["agents"])) for r in screen["rows"]])
+                   [(r["item"], r["title"], r["full"], tuple(r["agents"]), r["setup"]) for r in screen["rows"]], screen["lost"])
             self.projects_stack.set_visible_child_name("screen")
             if sig == self.pscreen_sig:
                 return
@@ -498,6 +544,7 @@ def main():
             head.append(self.label("\u25cf", "po-light-%s" % screen["light"]))
             head.append(self.label(screen["name"], "po-title", hexpand=True, ellipsize=3))
             head.append(self.label(screen["light"], "po-muted"))
+            head.append(self.release_widget(screen["release"]))
             head.set_tooltip_text(screen["text"])
             self.pscreen.append(head)
             bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -509,13 +556,22 @@ def main():
                 b.connect("toggled", lambda btn, k=f["key"]: btn.get_active() and self.set_project_filter(k))
                 bar.append(b)
             self.pscreen.append(bar)
+            if screen["lost"]:
+                self.pscreen.append(self.label(screen["lost"], "po-muted"))
             rows = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
             for r in screen["rows"]:
                 line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
                 line.add_css_class("po-card")
                 line.append(self.label(r["item"], "po-text", width_chars=6))
                 line.append(self.label(r["title"], "po-text", hexpand=True, ellipsize=3))
-                line.append(self.label(r["status"], "po-muted", width_chars=7))
+                badge = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+                badge.append(self.label(r["status"], "po-muted", width_chars=7))
+                if r["note"]:
+                    badge.append(self.label(r["note"], "po-muted", ellipsize=3, max_width_chars=28))
+                if r["setup"]:
+                    badge.append(self.label(r["setup"], "po-muted"))
+                badge.set_tooltip_text(r["full"] + (" (%s)" % r["setup"] if r["setup"] else ""))
+                line.append(badge)
                 agents = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
                 if r["dash"]:
                     agents.append(self.label("\u2013", "po-muted"))
@@ -531,9 +587,15 @@ def main():
             scroll.set_child(rows)
             self.pscreen.append(scroll)
 
+        def release_widget(self, release):
+            """The release name (or a grey `no release`), flush right after the project name."""
+            w = self.label(release["text"], "po-muted" if release["muted"] else "po-text", halign=Gtk.Align.END)
+            w.set_xalign(1)
+            return w
+
         def redraw_projects(self):
             cards = [core.project_card(pr) for pr in self.projects or []]
-            sig = [(c["name"], c["text"]) for c in cards]
+            sig = [(c["name"], c["text"], c["lost"]) for c in cards]
             self.redraw_project_screen()
             if sig == self.projects_sig:
                 return
@@ -564,11 +626,16 @@ def main():
                 top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
                 top.append(self.label("●", "po-light-%s" % c["light"]))
                 top.append(self.label(c["name"], "po-text", hexpand=True, ellipsize=3))
+                top.append(self.release_widget(c["release"]))
                 card.append(top)
                 row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-                for lab, key in (("TODO", "todo"), ("DOING", "doing"), ("DONE", "done")):
+                for lab, key in (("TODO", "todo"), ("DOING", "doing"), ("DONE", "done"), ("RELEASED", "released")):
                     row.append(self.label("%s %d" % (lab, c["counts"][key]), "po-muted"))
                 card.append(row)
+                if c["setup"]:
+                    card.append(self.label(c["setup"], "po-muted"))
+                if c["lost"]:
+                    card.append(self.label(c["lost"], "po-muted", ellipsize=3, max_width_chars=30))
                 child.set_child(card)
                 child.add_css_class("po-pcard")
                 flow.append(child)
@@ -582,8 +649,11 @@ def main():
 
         def decisions_worker(self):
             try:
-                text = core.fetch(decisions_url)
-                GLib.idle_add(self.on_decisions, text, core.parse_decisions(text))
+                changed, data, _ = self.feeds["decisions"].load(lambda t: (t, core.parse_decisions(t)))
+                if changed:
+                    GLib.idle_add(self.on_decisions, *data)
+                else:  # 304: the cards stay as they are (read on the main loop, after the fetch that set them)
+                    GLib.idle_add(lambda: self.on_decisions(self.decisions_text, self.decisions))
             except core.DashboardError as e:
                 GLib.idle_add(self.on_decisions_error, str(e))
 
@@ -595,6 +665,7 @@ def main():
             return False
 
         def on_decisions(self, text, decisions):
+            decisions, _held = core.hold_looks(decisions)  # a look card not ready is never shown (v0.81)
             self.decisions_failed = False
             self.decisions_error.set_visible(False)
             same = core.decisions_same(self.decisions if self.decisions_text is not None else None, decisions)
@@ -609,8 +680,11 @@ def main():
 
         def team_worker(self):
             try:
-                text = core.fetch(team_url)
-                GLib.idle_add(self.on_team, text, core.parse_team(text))
+                changed, data, _ = self.feeds["team"].load(lambda t: (t, core.parse_team(t)))
+                if changed:
+                    GLib.idle_add(self.on_team, *data)
+                else:  # 304: the rows stay as they are
+                    GLib.idle_add(lambda: self.on_team(self.team_text, self.team))
             except core.DashboardError as e:
                 GLib.idle_add(self.on_team_error, str(e))
 
@@ -657,13 +731,14 @@ def main():
             elif self.events_failed:
                 self.status.set_text("not updated")
             else:
-                self.status.set_text("%d events · %s" % (len(self.events), "all" if self.show_all else "last %d" % core.LAST))
+                self.status.set_text(core.events_status(self.shown_count, self.held_count, self.show_all) if self.shown_count is not None else "%d events" % len(self.events))
 
         def subrow_show(self, name):
             """The second button row: Show all and Reports in Events, only Actions in Decisions, hidden elsewhere."""
             self.subrow.set_visible(name in ("events", "decisions"))
             self.toggle.set_visible(name == "events")
             self.reports_button.set_visible(name == "events")
+            self.archive_button.set_visible(name == "events" and archive_url is not None)
             self.actions_toggle.set_visible(name == "decisions")
             self.decisions_toggle.set_visible(name == "decisions")
 
@@ -708,11 +783,13 @@ def main():
             self.projects_error.set_visible(name == "projects" and self.projects_failed)
             self.show_status()
 
-        def fetch_worker(self):
+        def fetch_worker(self, since):
             try:
-                text = core.fetch(url)
-                events = core.parse_events(text)
-                GLib.idle_add(self.on_data, text, events)
+                changed, data, partial = self.feeds["events"].load(lambda t: (t, core.parse_events(t)), since)
+                if changed:
+                    GLib.idle_add(self.on_data, data[0], data[1], partial)
+                else:  # 304: the events held stay as they are
+                    GLib.idle_add(self.on_data, None, None)
             except core.DashboardError as e:
                 GLib.idle_add(self.on_error, str(e))
 
@@ -723,14 +800,24 @@ def main():
             self.show_status()
             return False
 
-        def on_data(self, text, events):
+        def on_data(self, text, events, partial=False):
+            """A fetch's events: a whole feed (text and events), a ?since= answer (partial, merged into the
+            events held) or a 304 (events None, nothing changes)."""
             self.events_failed = False
             self.error.set_visible(False)
-            if text != self.last_text:
+            if events is None:
+                changed = False
+            elif partial:
+                events = core.merge_since(self.events, events)
+                changed = len(events) != len(self.events)
+                text = None if changed else self.last_text  # after a merge the next whole fetch always redraws
+            else:
+                changed = text != self.last_text
+            if changed:
                 now = time.monotonic()
                 for k in core.new_keys(self.seen, events):
                     self.born[k] = now
-                self.seen = {core.event_key(e) for e in events} | (self.seen or set())
+                self.seen, self.born = core.prune_records(self.seen, self.born, events, now)
                 self.last_text, self.events = text, events
                 self.redraw()
             self.redraw_reports()  # the range holds more or fewer events as the clock moves
@@ -747,6 +834,45 @@ def main():
                     return True
                 self.win.close()
                 return True
+            return False
+
+        # -- archive --
+        def on_archive(self, button):
+            """Archive on: fetch once and append the archived events below the live ones; off: drop them."""
+            if button.get_active():
+                if not self.archive_busy:
+                    self.archive_busy = True
+                    threading.Thread(target=self.archive_worker, args=(self.on_archive_data, self.on_archive_error), daemon=True).start()
+                return
+            self.archive = None
+            self.redraw()
+            self.show_status()
+
+        def archive_worker(self, ok, fail):
+            try:
+                events = core.parse_events(core.fetch(archive_url))
+                GLib.idle_add(ok, events)
+            except core.DashboardError as e:
+                GLib.idle_add(fail, str(e))
+
+        def on_archive_data(self, events):
+            self.archive_busy = False
+            if not self.archive_button.get_active():  # pressed off while the fetch ran
+                return False
+            self.archive = events
+            if not self.show_all:
+                self.toggle.set_active(True)  # the archive pages sit under Show all
+            self.error.set_visible(False)
+            self.redraw()
+            self.show_status()
+            return False
+
+        def on_archive_error(self, msg):
+            self.archive_busy = False
+            self.archive = None
+            self.archive_button.set_active(False)
+            self.error.set_text("archive not loaded: %s (showing the live events)" % msg)
+            self.error.set_visible(self.view == "events")
             return False
 
         # -- reports --
@@ -780,12 +906,17 @@ def main():
                 self.chart_box.remove(child)
                 child = nxt
             secs = core.REPORT_RANGES[self.report_range][1]
-            if not core.in_range(self.events, secs):
+            plan = core.report_plan(secs, archive_url, self.report_archive)
+            events = core.report_events(self.events, self.report_archive, secs)
+            note = {"unconfigured": core.REPORT_NO_ARCHIVE, "fetch": self.report_archive_note}.get(plan, "")
+            if note:
+                self.chart_box.append(self.label(note, "po-muted", margin_top=8))
+            if not core.in_range(events, secs):
                 self.chart_box.append(self.label(core.REPORT_EMPTY, "po-muted", margin_top=8))
                 return
             layouts = (reports.layout_gate_runs, reports.layout_first_try, reports.layout_closed,
                        reports.layout_cycle_time, reports.layout_failed_legs)
-            for (name, data, text), layout in zip(reports.reports(self.events, secs, tz=local_tz()), layouts):
+            for (name, data, text), layout in zip(reports.reports(events, secs, tz=local_tz()), layouts):
                 area = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
                 area.add_css_class("po-chart")
                 area.append(self.label(name, "po-text"))
@@ -798,7 +929,24 @@ def main():
         def on_range(self, button, i):
             if button.get_active():
                 self.report_range = i
+                secs = core.REPORT_RANGES[i][1]
+                if secs <= core.REPORT_LIVE_SECONDS:
+                    self.report_archive, self.report_archive_note = None, ""  # inside the live window: drop it
+                elif archive_url and self.report_archive is None:
+                    self.report_archive_note = core.REPORT_LOADING_ARCHIVE
+                    threading.Thread(target=self.archive_worker, args=(self.on_report_archive, self.on_report_archive_error), daemon=True).start()
                 self.redraw_reports()
+
+        def on_report_archive(self, events):
+            if core.REPORT_RANGES[self.report_range][1] > core.REPORT_LIVE_SECONDS:
+                self.report_archive, self.report_archive_note = events, ""
+                self.redraw_reports()
+            return False
+
+        def on_report_archive_error(self, msg):
+            self.report_archive_note = "archive not loaded: %s" % msg
+            self.redraw_reports()
+            return False
 
         def on_reports(self, button):
             self.reports_on = button.get_active()
@@ -806,7 +954,13 @@ def main():
 
         def on_toggle(self, button):
             self.show_all = button.get_active()
+            self.page = core.PAGE
             button.set_label("Show last %d" % core.LAST if self.show_all else "Show all")
+            self.redraw()
+            self.show_status()
+
+        def on_more(self, _button):
+            self.page += core.PAGE
             self.redraw()
             self.show_status()
 
@@ -866,37 +1020,79 @@ def main():
             note.update_property([Gtk.AccessibleProperty.LABEL], [detail])
             return note
 
+        def build_card(self, ev, key, note_group):
+            r = core.row(ev)
+            card = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            card.add_css_class("po-card")
+            step = self.step_of(key)
+            if step:
+                card.add_css_class("po-fade-%d" % step)
+            for (col, _title, width, widest, grow), group in zip(core.COLUMNS, self.event_groups):
+                cls = "po-" + r["result_class"] if col == "result" else "po-warn" if col == "took" and r["slow"] else "po-muted" if col in ("kind", "legs", "agent", "took", "time") else "po-text"
+                lab = self.label(r[col], cls, width_chars=width, max_width_chars=widest, hexpand=grow, ellipsize=3)
+                lab.set_tooltip_text(r[col])
+                group.add_widget(lab)
+                card.append(lab)
+            if key in self.archived_keys:
+                card.append(self.label(core.ARCHIVED_MARK, "po-muted"))
+            slot = Gtk.Box(halign=Gtk.Align.CENTER)
+            if r["detail"]:
+                slot.append(self.note_icon(r["detail"]))
+            note_group.add_widget(slot)
+            slot.set_size_request(24, -1)
+            card.append(slot)
+            return card, step
+
         def redraw(self):
-            child = self.list.get_first_child()
-            while child is not None:
-                nxt = child.get_next_sibling()
-                self.list.remove(child)
-                child = nxt
-            groups = self.event_groups
-            note_group = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)
-            self.cards = []
-            for ev in core.sorted_events(core.visible(self.events, self.show_all), self.sorts["events"]):
-                r = core.row(ev)
-                card = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-                card.add_css_class("po-card")
-                key = core.event_key(ev)
-                step = self.step_of(key)
-                if step:
-                    card.add_css_class("po-fade-%d" % step)
-                self.cards.append((card, key, step))
-                for (key, _title, width, widest, grow), group in zip(core.COLUMNS, groups):
-                    cls = "po-" + r["result_class"] if key == "result" else "po-warn" if key == "took" and r["slow"] else "po-muted" if key in ("kind", "legs", "agent", "took", "time") else "po-text"
-                    lab = self.label(r[key], cls, width_chars=width, max_width_chars=widest, hexpand=grow, ellipsize=3)
-                    lab.set_tooltip_text(r[key])
-                    group.add_widget(lab)
-                    card.append(lab)
-                slot = Gtk.Box(halign=Gtk.Align.CENTER)
-                if r["detail"]:
-                    slot.append(self.note_icon(r["detail"]))
-                note_group.add_widget(slot)
-                slot.set_size_request(24, -1)
-                card.append(slot)
-                self.list.append(card)
+            """Bring the list to the shown events: cards are built only for new keys, dropped for keys that left, and moved only when the order says."""
+            shown, held = core.shown_events(self.events, self.show_all, self.sorts["events"], self.page, archive=self.archive)
+            self.archived_keys = {core.event_key(e) for e in core.archive_only(self.events, self.archive)} if self.archive else set()
+            by_key = {core.event_key(ev): ev for ev in shown}
+            keys = [core.event_key(ev) for ev in shown]
+            note_group = self.note_group
+            adj = self.event_scroll.get_vadjustment()
+            value, shift = adj.get_value(), 0
+            anchor = None  # the first card in view: cards added or dropped above it move it
+            if value > 0:
+                for k in self.card_index.keys:
+                    card = self.card_index.cards[k][0]
+                    alloc = card.get_allocation()
+                    if alloc.y + alloc.height > value:
+                        anchor = (k, alloc.y)
+                        break
+            def drop(c):
+                nonlocal shift
+                if anchor is not None and c[0].get_allocation().y < anchor[1]:
+                    shift -= c[0].get_allocation().height
+                self.list.remove(c[0])
+            self.card_index.sync(keys, lambda k: self.build_card(by_key[k], k, note_group), drop)
+            prev = None
+            for k in keys:
+                card = self.card_index.cards[k][0]
+                if card.get_parent() is None:
+                    self.list.insert_child_after(card, prev)
+                    if anchor is not None and anchor[0] in keys and keys.index(k) < keys.index(anchor[0]):
+                        shift += card.measure(Gtk.Orientation.VERTICAL, -1)[1]
+                elif card.get_prev_sibling() is not prev:
+                    self.list.reorder_child_after(card, prev)
+                prev = card
+            if shift and anchor is not None and anchor[0] in keys:
+                self.keep_scroll(adj, value + shift)
+            self.foot.set_visible(self.show_all)
+            self.more.set_visible(len(shown) < held)
+            self.count.set_text("%d of %d" % (len(shown), held))
+            self.shown_count, self.held_count = len(shown), held if self.show_all else len(self.events)
+
+        def keep_scroll(self, adj, target):
+            """Set the scroll value once the layout has grown to hold it (within five frames)."""
+            n = [0]
+            def tick(_widget, _clock):
+                n[0] += 1
+                if adj.get_upper() - adj.get_page_size() >= target or n[0] >= 5:
+                    adj.set_value(max(target, 0))
+                    return GLib.SOURCE_REMOVE
+                return GLib.SOURCE_CONTINUE
+            self.event_scroll.add_tick_callback(tick)
 
         def redraw_team(self):
             child = self.team_list.get_first_child()
@@ -1064,10 +1260,19 @@ def main():
                 box.append(text("on " + r["machine"], "po-text"))
                 if r["requires"]:
                     box.append(text("build: " + r["requires"]["package"], "po-muted"))
+                if r["ready"]:
+                    box.append(text(r["ready"], "po-pass"))
+                if r["snapshot"]:
+                    box.append(text("data snapshot: " + r["snapshot"], "po-muted"))
+                if r["fixtures"]:
+                    box.append(text("fixtures: " + ", ".join(("\u2714 " if f["present"] else "\u2718 ") + f["name"]
+                                                              for f in r["fixtures"]), "po-muted"))
                 for st in r["steps"]:
                     box.append(text("%d. %s" % (st["n"], st["text"]), "po-text", margin_start=12))
                     if st["command"]:
                         box.append(self.command_row(st["command"]))
+                    if st["expect"]:
+                        box.append(text("expect: " + st["expect"], "po-muted", margin_start=36))
                 box.append(text("done when: " + r["done_when"], "po-muted"))
 
         def on_copy(self, button, command):
@@ -1109,23 +1314,42 @@ def main():
             draft = self.drafts.get(aid, {})
             picks = {"choice": draft.get("choice"), "text": draft.get("text", ""), "result": draft.get("result"), "step": draft.get("step"), "note": draft.get("note", "")}
             controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, margin_top=6)
+            if r["kind"] == "choice":
+                controls = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_top=6)
             send = Gtk.Button(label="Send")
             send.add_css_class("po-small")
             send.set_sensitive(False)
             if r["kind"] == "choice":
                 group = None
+                opts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, hexpand=True)
                 for n, o in enumerate(r["options"]):
-                    btn = Gtk.ToggleButton(label=o["label"], group=group)
+                    # The label wraps inside the button; the description sits beside it when the
+                    # card is wide and under it when not (a FlowBox wraps its second child).
+                    btn = Gtk.ToggleButton(label=o["label"], group=group, halign=Gtk.Align.START)
+                    inner = btn.get_child()  # the button's own label: wraps instead of widening the card
+                    inner.set_wrap(True)
+                    inner.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+                    inner.set_xalign(0)
                     if group is None:
                         group = btn
                     if draft.get("choice") == o["label"]:
                         btn.set_active(True)
                     btn.connect("toggled", self.on_choice_pick, aid, o["label"], send, picks)
-                    controls.append(btn)
+                    if core.option_has_description(o):
+                        line = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=2, column_spacing=8, row_spacing=2, homogeneous=False, halign=Gtk.Align.START)
+                        line.append(btn)
+                        line.append(self.label(o["description"], "po-muted", wrap=True, valign=Gtk.Align.CENTER))
+                        opts.append(line)
+                    else:
+                        opts.append(btn)
+                controls.append(opts)
                 write_in, write_in_view = self.answer_box("or write your own", draft.get("note"), send, picks)
                 write_in_view.get_buffer().connect("changed", self.on_answer_note, aid, "choice", send, picks)
                 self.answer_views[(aid, "note")] = write_in_view
-                controls.append(write_in)
+                tail = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+                tail.append(write_in)
+                tail.append(send)
+                controls.append(tail)
             elif r["kind"] == "action":
                 group = None
                 for label in ("Pass", "Failed"):
@@ -1163,7 +1387,8 @@ def main():
                 picks["step_box"].set_visible(True)
             send.set_sensitive(core.answer_ready(r["kind"], picks))
             send.connect("clicked", self.on_send_answer, aid, r, picks)
-            controls.append(send)
+            if r["kind"] != "choice":  # a choice card put Send beside its write-in box above
+                controls.append(send)
             box.append(controls)
 
         def answer_box(self, placeholder, initial, send, picks):
@@ -1270,15 +1495,19 @@ def main():
             """Build the body, stash the draft, POST in a worker thread."""
             kind = r["kind"]
             params = core.answer_params(kind, picks)
-            body = core.answer_body(r, core.answer_id(), kind=kind, **params)
-            self.answers[aid] = {"answer_id": body["answer_id"], "body": body, "display": "sending…"}
+            installed = core.installed_build(r.get("requires")) if r.get("requires") else None
+            body = core.answer_body(r, core.answer_id(), kind=kind, installed=installed, **params)
+            self.answers[aid] = {"answer_id": body["answer_id"], "body": body, "display": "sending…",
+                                 "requires": r.get("requires")}
             self.drafts.pop(aid, None)
             button.set_sensitive(False)
             threading.Thread(target=self._send_answer, args=(aid, body), daemon=True).start()
 
         def on_retry_answer(self, button, aid):
-            """Re-post the same body (same answer_id)."""
+            """Re-post the same body (same answer_id), with the installed build read again (it may have changed)."""
             body = self.answers[aid]["body"]
+            if self.answers[aid].get("requires"):
+                body["installed"] = core.installed_build(self.answers[aid]["requires"])
             self.answers[aid]["display"] = "sending…"
             button.set_sensitive(False)
             threading.Thread(target=self._send_answer, args=(aid, body), daemon=True).start()

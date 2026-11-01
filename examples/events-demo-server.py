@@ -7,18 +7,27 @@ Serves /events.json with some made-up events (open, stamp and close events over
 the past days, enough for every Reports chart) and adds a new one every --every
 seconds, so a po-dashboard (or the page of a po serve pointed at the same data)
 open on it shows a card appear and fade. It also serves /decisions.json, the
-sample examples/decisions-feed.json, and /projects.json, the sample
+sample examples/decisions-feed.json, /archive.json, 60 older events (11 to 29 days back) for
+--archive-url, and /projects.json, the sample
 examples/projects-feed.json with each last_event moved to now (active, idle and
 inactive lights), for --decisions-url and --projects-url. POST /answers prints
 the body to stdout, answers 201 the first time it sees an answer_id, 200 for a
 repeat of the same answer_id, 404 for a missing id, 401 without a bearer token,
 for --answer-url. Stop with Ctrl-C.
+
+/events.json shows the conditional, incremental fetch (v0.87): every answer carries an
+ETag (a hash of the whole feed) and a request whose If-None-Match matches it gets
+304 with no body; every answer says X-Po-Since: full, and a request with
+?since=<time> gets only the events at or after that time with X-Po-Since: partial
+(its ETag is still the whole feed's, so the next If-None-Match works either way).
 """
 import argparse
 import datetime
+import hashlib
 import http.server
 import json
 import os
+import urllib.parse
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--port", type=int, default=8798)
@@ -56,6 +65,15 @@ def history():
     return out
 
 
+def archive():
+    """Older events, 11 to 29 days back (past the 10-day live window): what /archive.json serves."""
+    out = []
+    for n in range(60):
+        when = start - datetime.timedelta(days=11 + n * 18 / 60, minutes=7 * n)
+        out.append(event(n % 9, when) | {"agent": ("ada", "bob", "cy")[n % 3], "item": "0.%d" % (100 + n)})
+    return sorted(out, key=lambda e: e["time"], reverse=True)
+
+
 def projects():
     """examples/projects-feed.json with the last_event of each project moved to now minus 5 minutes, 3 hours, 3 days."""
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "projects-feed.json")) as f:
@@ -75,6 +93,13 @@ class H(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if self.path.startswith("/archive.json"):
+            body = json.dumps(archive()).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path.startswith("/projects.json"):
             body = json.dumps(projects()).encode()
             self.send_response(200)
@@ -84,9 +109,27 @@ class H(http.server.BaseHTTPRequestHandler):
             return
         now = datetime.datetime.now(datetime.timezone.utc)
         n = 5 + int((now - start).total_seconds() // a.every)
-        body = json.dumps(history() + [event(i, start - datetime.timedelta(minutes=5 - i)) if i < 5 else
-                           event(i, start + datetime.timedelta(seconds=(i - 5 + 1) * a.every)) for i in range(n)]).encode()
-        self.send_response(200 if self.path.startswith("/events.json") else 404)
+        events = history() + [event(i, start - datetime.timedelta(minutes=5 - i)) if i < 5 else
+                              event(i, start + datetime.timedelta(seconds=(i - 5 + 1) * a.every)) for i in range(n)]
+        body = json.dumps(events).encode()
+        if not self.path.startswith("/events.json"):
+            self.send_response(404)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        etag = '"%s"' % hashlib.sha256(body).hexdigest()[:16]
+        if self.headers.get("If-None-Match") == etag:  # unchanged since the client's copy: no body
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.end_headers()
+            return
+        since = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("since", [""])[0]
+        if since:  # only the events at or after since; the client merges them into what it holds
+            body = json.dumps([e for e in events if e["time"] >= since]).encode()
+        self.send_response(200)
+        self.send_header("ETag", etag)
+        self.send_header("X-Po-Since", "partial" if since else "full")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -136,5 +179,5 @@ class H(http.server.BaseHTTPRequestHandler):
 
 srv = http.server.ThreadingHTTPServer(("127.0.0.1", a.port), H)
 srv.answers = set()
-print("serving http://127.0.0.1:%d/events.json (a new event every %gs), /decisions.json, /projects.json and POST /answers" % (srv.server_address[1], a.every), flush=True)
+print("serving http://127.0.0.1:%d/events.json (a new event every %gs), /archive.json, /decisions.json, /projects.json and POST /answers" % (srv.server_address[1], a.every), flush=True)
 srv.serve_forever()

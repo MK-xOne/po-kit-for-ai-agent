@@ -2,15 +2,17 @@
   {
     "project": "orchard",
     "last_event": "2026-10-26T01:00:00Z",
+    "release": "release-3",
     "items": [
       {"item": "3.1", "title": "Plant", "status": "TODO", "agents": ["ana", "ben"]},
       {"item": "3.2", "title": "Water", "status": "DOING", "agents": ["cy"]},
-      {"item": "3.3", "title": "Harvest", "status": "DONE", "agents": ["dee", "cy", "ana"]}
+      {"item": "3.3", "title": "Harvest", "status": "DONE", "agents": ["dee", "cy", "ana"], "setup_open": 2}
     ]
   },
   {
     "project": "harbor",
     "last_event": "2026-10-25T20:00:00Z",
+    "release": null,
     "items": [
       {"item": "1.4", "title": "Dock", "status": "PAUSED", "agents": ["ben"]},
       {"item": "1.5", "title": "Sail", "status": "HELD", "agents": []}
@@ -19,8 +21,10 @@
   {
     "project": "meadow",
     "last_event": "2026-10-20T00:00:00Z",
+    "release": "v2.1",
     "items": [
-      {"item": "2.1", "title": "Mow", "status": "DONE", "agents": ["eve"]}
+      {"item": "2.1", "title": "Mow", "status": "DONE", "agents": ["eve"], "released": true},
+      {"item": "2.2", "title": "Rake", "status": "DONE", "agents": ["eve"], "released": true, "setup_open": 1}
     ]
   }
 ]

@@ -3,14 +3,92 @@
 Items and releases are different things. Every item close tags its item
 (`v0.8`, `v0.9`, ...); that is po's boundary law. A **release** bundles the
 items of one backlog scope and is cut once that scope is done, as the
-annotated tag `release-N`.
+annotated tag `release-N`. A pre-release review never holds a release; its
+fixes ship as the patch release `release-N.1` (then `release-N.2`).
 
 Each item's notes say what changed, what agents must now do (**Agents**), and
 which optional manifest keys a project may turn on (**Adopt**, by its PO's
 admin commit). At each item close they go under **Unreleased**; at a release,
-Unreleased becomes `## Release N (YYYY-MM-DD): <theme>`.
+Unreleased becomes `## Release N (YYYY-MM-DD): <theme>`. Each release entry opens with a
+`### Setup after install` block: every setup step of the release's items in
+order, or `None`.
 
 ## Unreleased
+
+## Release 22 (2026-11-01): faster po, RELEASED status, ready look cards, Setup after install
+
+### Setup after install
+
+| # | Machine | Command | Who | Check |
+|---|---|---|---|---|
+| 1 | the build host (private host glue; nothing in the public kit) | `install the host glue && systemctl --user daemon-reload && systemctl --user enable --now chan-cache.timer` (v0.89) | the session on that host | `systemctl --user list-timers chan-cache.timer` shows a next run; after it the channel-cache directory holds one file per channel |
+| 2 | the machine that shows the dashboard | install the release package (`pacman -Q` shows the release build), then restart `po-dashboard` (v0.74-v0.87 dashboard changes: feeds fetched conditionally, RELEASED filter, look cards held until ready) | the session on that machine | `po-dashboard --check` prints one line per project and the overview shows the release beside each project name |
+| 3 | the host where `po serve` runs | restart `po-serve` so `/events.json` answers `ETag`/304 and `?since=` (v0.87) | the session on that host | `curl -sI <serve-url>/events.json` shows an `ETag` header |
+
+**Agents:** `po setup` is new: devs write a `Setup after install` section in every item spec (steps or `None`); a look card needs `--expect` per step, fixtures and a reviewer's check (v0.81); read `AGENTS.md` "Releases and the pre-release review" (v0.80). **Adopt:** `[close] require_setup = true` (v0.84), `[release] source` (v0.83), drop or make a filter of `test_count_cmd` in a manifest with a `test` leg (v0.85). Items: v0.79-v0.89 (the entries below).
+
+### The dashboard's feeds are fetched conditionally, never twice at once (v0.87, 2026-11-01)
+
+Every feed (events, team, decisions, projects) still refreshes every 5 seconds, but a feed whose last fetch is still in flight skips that tick, so a slow server never has two fetches of one feed running. Fetches send `If-None-Match` with the `ETag` of the body last accepted, and a `304 Not Modified` leaves the data as it is (nothing downloaded or parsed). A server that answers `X-Po-Since: full` on the events feed is asked for `?since=<newest event time held>`; its `X-Po-Since: partial` answer holds only the events since, which the window adds; every 60th fetch is whole. A server without these headers is fetched whole each time, as before. New in `dashboard_core`: `Feed`, `feed_url_since`, `merge_since`. `examples/events-demo-server.py` serves `/events.json` with ETag/304 and `?since=`. **Agents:** nothing. **Adopt:** a feed server may send `ETag` (and answer 304) and offer `?since=` with `X-Po-Since`; install the release on the machine that shows the dashboard.
+
+
+### Backlog load in one process (v0.86, 2026-11-01)
+
+`po_backlog_load` forked one `git show` per spec file, and `po kickoff` read every spec file again for each heading rule and reloaded the backlog at every commit of its founding walk. The backlog and all spec files are now read by one `git cat-file --batch` process, the parsed backlog is memoised per commit within one run, and kickoff reads the spec files once for both rules. In a project with 135 spec files `po status` makes 28 git calls instead of 162 and `po kickoff` 37 instead of 354; the output is byte-identical. **Agents:** nothing. **Adopt:** nothing. **Note:** reading the backlog now needs `python3` on PATH (it did not before; po already used it for `po ready`, `po setup` and the feeds).
+
+### Shared channel-events cache (v0.89, 2026-11-01)
+
+The host's relay readers each fetched every channel's recent messages on every run. A new host script, `chan-cache`, run by a 5-minute timer, now keeps one cache file per channel (one fetch per channel per interval, then only what is newer); the readers use the cache while it is under 10 minutes old and fetch live otherwise, and the readers that post what they just checked always fetch live. Private only, no kit change, nothing exported. **Agents:** none. **Adopt:** nothing. **Setup after install:** on the build host, install the host glue and enable the new `chan-cache.timer` user timer (check: the timer lists a next run and the cache directory fills).
+
+### `po status` probes each worktree once (v0.88, 2026-11-01)
+
+`po status` read each open item's worktree three times (dirty count, dirty section, idle time), each a separate `git status`. One `git status -z` per worktree now feeds the dirty count and the idle time; the output is byte-identical and the git calls fewer. **Agents:** nothing. **Adopt:** nothing.
+
+### Setup after install (v0.84, 2026-11-01)
+
+Every item spec carries a `Setup after install` section: a table `| # | Machine | Command | Who | Check |` with one row per step, or the word `None`. With `[close] require_setup = true`, `po close` refuses (exit 6) an item whose spec lacks it or has it malformed; items founded before the switch was turned on are exempt (judged from the manifest at the item's founding commit). `po close --commit` records the steps as open in the git dir; `po setup list` shows the open ones, `po setup confirm <version> <n> --by <who>` closes one (logged as a `setup` event), `po setup record <version> --commit` writes them again from the item's tag. The manifest reader learns bare `true`/`false` for this switch. Release entries now open with a `### Setup after install` block.
+
+**Agents:** devs write the section in every item spec (steps or `None`); whoever does a setup step confirms it with `po setup confirm`. **Adopt:** `[close] require_setup = true` (optional; absent is off).
+
+### Stamp counts from the test leg's output (v0.85, 2026-11-01)
+
+When `[gate.legs]` has a leg named `test`, `po stamp` takes the test count from that leg's saved output instead of running `test_count_cmd` (the whole suite again, about 43% of po-kit's stamp time). `test_count_cmd` becomes optional and means a filter: the saved output is piped to it on stdin and it never reruns the suite; the count and the cross-check with the gate's own summary are unchanged. With no `test` leg (a single `[gate] command`, or other leg names) `test_count_cmd` is still required and still runs. po-kit's own manifest now uses a sed filter. **Agents:** nothing. **Adopt:** in a manifest with a `test` leg, delete `test_count_cmd`, or make it a filter reading stdin (`cargo test 2>&1` and `uv run pytest -q 2>&1` ignore stdin and keep rerunning the suite).
+
+### RELEASED status and the release number (v0.83, 2026-11-01)
+
+A new optional `[release]` section says what a release is: `source = "tag"` (the newest tag matching `pattern`, default `release-*`, by version order), `"github"` (the tag a feed producer reads from GitHub and passes in; the kit never calls GitHub) or `"none"` (the default). The new read-only `po released [--json] [--release <tag>]` lists the DONE items whose item tag is an ancestor of that release tag (`git merge-base --is-ancestor`). The projects feed gains an optional per-project `release` and per-item `released` (and `setup_open`, reserved for setup steps; absent means none open). The dashboard shows a released item with no open setup step as RELEASED, with its own filter button after DONE (the counts still add up to All); one with steps open stays DONE with a muted `released, setup open`. The latest release sits right-aligned beside the project name on the overview card and the project screen, `no release` in grey. `po-dashboard --check` prints `name | light | todo/doing/done/released | <release>`. **Agents:** nothing. **Adopt:** `[release] source` (and `pattern` for `tag`) in po.toml; a feed producer fills `release` and `released` from `po released --json`.
+
+### Look cards reach the owner only when ready (v0.81, 2026-11-01)
+
+A look card (an action with `requires`) is held, never shown, until three checks pass: a reviewer other than the dev ran every step against the bundle's package (`checked_by`, `check_sha256`; each step has an `expect`, the card lists its `fixtures`), the owner's machine has that exact build installed and checked (`ready`, a `snapshot` of the data before a downgrade, a downgrade refused when the saved data's schema is too new for the build), and every fixture is present. The dashboard shows `Ready: <build> installed, checked <time>`, the snapshot, the fixtures and each step's `expect`; `--check` leaves held cards out. New in `dashboard_core`: `package_nvr`, `step_problems`, `fixture_problems`, `look_ready`, `hold_looks`, `installed_build`. The answer body gains `installed` (the build `pacman -Q` reports on the dashboard's machine); a receiver that refuses a look answer from another build with 409 and `X-Reason: wrong build` shows as `not sent: wrong build`. **Agents:** a look card needs `--expect` for every step, its fixtures (or `--no-fixtures`) and a reviewer's step check before it is posted; a vague or failing step comes back as `FIX?`. **Adopt:** install the release on the machine that shows the dashboard; answer receivers should accept the optional `installed` field.
+
+### Projects tab counts by the status word (v0.82, 2026-11-01)
+
+A status counts by its first word, so `DONE (no change needed: ...)` is DONE and its note stays visible, muted, in the row. Items whose status word is in no filter are named in a muted `n not in a filter: <items>` line on the overview card and the project screen, so a miscount is never silent. **Agents:** nothing. **Adopt:** nothing.
+
+### A pre-release review never holds the release (v0.80, 2026-11-01)
+
+The pre-release review (test review, code review) is read-only and runs alongside release N; release N is cut on schedule. Only the fixes on the reviewer's list ship, as the patch release `release-N.1` (CHANGELOG heading `## Release N.1 (YYYY-MM-DD): <theme>`), then `release-N.2` for a later list; everything else waits for release N+1. `AGENTS.md` has the section "Releases and the pre-release review". **Agents:** nothing new beyond reading that section. **Adopt:** nothing.
+
+## Release 21 (2026-10-31): the dashboard's events scale (choice cards, paging, memory log, archive)
+
+**Agents:** nothing new for agents; `po events` shows the live window only (10 days), and `po events --archived` shows older events. **Adopt:** `[events] live_days` in po.toml (optional, default 10); `--archive-url` (or `PO_DASHBOARD_ARCHIVE_URL`) on the machine that shows the dashboard; install the release where `po serve` runs so `/archive.json` exists. Not covered by tests: the dashboard's widgets (choice card layout, Archive button, Load more) are covered through their pure helpers only.
+
+### Events older than the live window go to an archive (v0.77, 2026-10-31)
+
+The event log keeps the last `[events] live_days` days (default 10); older events move to `po-events-archive.jsonl` beside it, at append time and by `po events --archive-now`, in one atomic rewrite that loses nothing and duplicates nothing. `po events` shows live events only; `po events --archived [--json]` shows the archive. `po serve` adds `/archive.json`. The dashboard takes `--archive-url` (or `PO_DASHBOARD_ARCHIVE_URL`): an Archive button loads the archive once, on demand, below the live events (muted `archived` marker, further pages of 50) and a second press drops it; the Reports 30 d range reads live plus archive, or says `older than the live window; archive not configured`. **Agents:** nothing new. **Adopt:** `[events] live_days` (optional, default 10); `--archive-url` on the machine that shows the dashboard; install the release where `po serve` runs.
+
+### The Events list pages and adds only new cards (v0.76, 2026-10-31)
+
+With Show all on, the dashboard's Events list shows the newest 50 events and a Load more button adds 50 more; the count reads `N of M` in the status line and at the list's foot. A refresh no longer rebuilds the list: it builds cards only for new events, drops the ones that left and reuses the rest, and keeps the scroll position when cards come or go above the view. Events with identical content now show once. **Agents:** nothing new. **Adopt:** nothing to turn on; install the release on the machine that shows the dashboard.
+
+### The dashboard bounds its event records and logs its memory (v0.75, 2026-10-31)
+
+The window's `seen` and `born` records are pruned on every fetch, so they can no longer outgrow the feed. Every 60 seconds it also appends one line (time, process RSS in MB, events held, cards on screen, `len(seen)`, `len(born)`) to `$XDG_STATE_HOME/po-dashboard/memory.log` (default `~/.local/state/po-dashboard/memory.log`), capped at 1 MB; `--no-memory-log` turns it off. **Agents:** nothing new. **Adopt:** nothing to turn on; install the release on the machine that shows the dashboard.
+
+### A choice card keeps Send in view (v0.74, 2026-10-31)
+
+Fixes the dashboard's choice cards: a long option label widened the page and pushed Send out of view. Options now stack one per line and their labels wrap inside the card; a description sits beside its option when the card is wide and under it when not; the write-in box and Send share one row below the options. Picking and the posted answer are unchanged. **Agents:** nothing new. **Adopt:** nothing to turn on; install the release on the machine that shows the dashboard.
 
 ## Release 20 (2026-10-30): Copy sets explicit text and says Copied (patch to Release 19)
 

@@ -3,7 +3,7 @@
 
 [gate]
 test_format = "pytest"                # count pytest's "N passed" summary instead of libtest lines
-test_count_cmd = "uv run pytest -q 2>&1"
+# The leg named "test" is counted from its own output; test_count_cmd is only an optional filter over it.
 
 [gate.legs]
 lint = "uv run ruff check"

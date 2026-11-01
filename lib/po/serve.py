@@ -27,6 +27,7 @@ FADE_SECONDS = 60  # a row that appears while the page is open starts 25% darker
 NEW_TEXT = {"light": {"text": "#222222", "muted": "#333333", "pass": "#06471a", "fail": "#7a1610"},
             "dark": {"text": "#f2f2f2", "muted": "#e6e6e6", "pass": "#8ff0b0", "fail": "#ffc2bd"}}
 PO_CMD = ("po", "events", "--all", "--json")
+PO_ARCHIVE_CMD = ("po", "events", "--archived", "--json")
 TEAM_CMD = ("po", "team", "--json")
 
 
@@ -64,10 +65,11 @@ def parse_events(text):
     return [e for e in data if isinstance(e, dict)]
 
 
-def load_events(repo):
-    """All events, newest first. Raises RuntimeError with a message the page can show."""
+def load_events(repo, cmd=PO_CMD):
+    """All live events (cmd = the archive command: the archived ones), newest first.
+    Raises RuntimeError with a message the page can show."""
     try:
-        p = subprocess.run(PO_CMD, cwd=repo, capture_output=True, text=True, timeout=15)
+        p = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, timeout=15)
     except (OSError, subprocess.TimeoutExpired) as e:
         raise RuntimeError("cannot run po events: %s" % e)
     if p.returncode != 0:
@@ -216,7 +218,7 @@ tbody tr.new .r-pass,tbody tr.new .r-ok{{color:{dk[pass]}}} tbody tr.new .r-fail
 </style></head>
 <body data-limit="{limit}" data-slow="{slow}">
 <h1>{title}</h1>
-<nav><a href="/">last {last}</a><a href="/all">all</a><a href="/events.json">json</a></nav>
+<nav><a href="/">last {last}</a><a href="/all">all</a><a href="/events.json">json</a><a href="/archive.json">archive</a></nav>
 <p id="err">{err}</p>
 <table><colgroup>{colgroup}</colgroup><thead><tr>{head}</tr></thead>
 <tbody id="rows">
@@ -372,6 +374,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/team.json":
             try:
                 return self.send(200, "application/json", json.dumps(load_team(self.server.repo)))
+            except RuntimeError as e:
+                return self.send(502, "application/json", json.dumps({"error": str(e)}))
+        if path == "/archive.json":
+            try:
+                return self.send(200, "application/json", json.dumps(load_events(self.server.repo, PO_ARCHIVE_CMD)))
             except RuntimeError as e:
                 return self.send(502, "application/json", json.dumps({"error": str(e)}))
         if path not in ("/", "/all", "/events.json"):

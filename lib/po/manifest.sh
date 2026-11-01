@@ -11,6 +11,7 @@
 #     `# comment`; the only escapes are \" and \\
 #   - `[[team.agent]]`, repeatable: one roster entry each, with the string keys
 #     `name` (required, unique), `model` and `role`, kept in file order
+#   - `key = true` or `false`, only for the keys in PO_BOOLS
 #   - `key = ["a", "b"]`, a one-line array of basic strings, only for the
 #     keys in PO_ARRAYS; kept as its strings joined by newlines
 #   - `[project] name = "..."`, optional: a label the kit uses to filter a
@@ -42,8 +43,12 @@ declare -gA PO_SCHEMA=(
 	[hooks.on_close]=0
 	[kickoff.preamble]=0
 	[close.checklist]=0
+	[close.require_setup]=0
 	[stamp.prepare]=0
 	[stamp.slow_after]=0
+	[events.live_days]=0
+	[release.source]=0
+	[release.pattern]=0
 	[project.name]=0
 	[team.limits_file]=0
 	[team.usage_file]=0
@@ -60,11 +65,19 @@ declare -gA PO_ARRAYS=(
 	[dispatch.order]=1
 )
 
+# The keys whose value is a bare true or false (no quotes).
+declare -gA PO_BOOLS=(
+	[close.require_setup]=1
+)
+
 # Defaults for optional keys the kit reads.
 declare -gA PO_DEFAULTS=(
 	[layout.main]=main
 	[versioning.tag_style]=light
 	[stamp.slow_after]=300
+	[events.live_days]=10
+	[release.source]=none
+	[release.pattern]=release-*
 )
 
 # The parsed manifest: section.key -> value.
@@ -144,6 +157,10 @@ po_manifest_load() {
 		if [[ -n ${PO_ARRAYS[$full]+x} ]]; then
 			po_manifest_array "$rest" "$where" || exit 2
 			value=$PO_PARSED
+		elif [[ -n ${PO_BOOLS[$full]+x} ]]; then
+			[[ $rest =~ ^(true|false)([[:blank:]]+#.*)?$ ]] ||
+				po_die "$where: key '$key' in [$section] must be true or false, without quotes: $rest"
+			value=${BASH_REMATCH[1]}
 		elif [[ $rest == '['* ]]; then
 			po_die "$where: key '$key' in [$section] is not an array"
 		elif [[ $rest == '"'* ]]; then
@@ -170,8 +187,16 @@ po_manifest_load() {
 		po_die "$file: [layout] owner_column needs a non-empty \"column name\""
 	[[ -z ${PO_MANIFEST[stamp.slow_after]+x} || ${PO_MANIFEST[stamp.slow_after]} =~ ^[0-9]+$ ]] ||
 		po_die "$file: [stamp] slow_after must be an integer (seconds): ${PO_MANIFEST[stamp.slow_after]}"
+	[[ -z ${PO_MANIFEST[events.live_days]+x} || ${PO_MANIFEST[events.live_days]} =~ ^[0-9]+$ ]] ||
+		po_die "$file: [events] live_days must be an integer (days): ${PO_MANIFEST[events.live_days]}"
 	[[ -z ${PO_MANIFEST[versioning.tag_style]+x} || ${PO_MANIFEST[versioning.tag_style]} == light || ${PO_MANIFEST[versioning.tag_style]} == annotated ]] ||
 		po_die "$file: [versioning] tag_style must be \"light\" or \"annotated\": ${PO_MANIFEST[versioning.tag_style]}"
+	[[ -z ${PO_MANIFEST[release.source]+x} || ${PO_MANIFEST[release.source]} =~ ^(tag|github|none)$ ]] ||
+		po_die "$file: [release] source must be \"tag\", \"github\" or \"none\": ${PO_MANIFEST[release.source]}"
+	[[ -z ${PO_MANIFEST[release.pattern]+x} || ${PO_MANIFEST[release.source]:-} == tag ]] ||
+		po_die "$file: [release] pattern applies to source \"tag\" only"
+	[[ -z ${PO_MANIFEST[release.pattern]+x} || -n ${PO_MANIFEST[release.pattern]} ]] ||
+		po_die "$file: [release] pattern must not be empty"
 	[[ -z ${PO_MANIFEST[gate.test_format]+x} || ${PO_MANIFEST[gate.test_format]} == libtest || ${PO_MANIFEST[gate.test_format]} == pytest ]] ||
 		po_die "$file: [gate] test_format must be \"libtest\" or \"pytest\": ${PO_MANIFEST[gate.test_format]}"
 	[[ -z ${PO_MANIFEST[gate.run_sentinel]+x} || ${PO_MANIFEST[gate.run_sentinel]} == required ]] ||

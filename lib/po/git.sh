@@ -45,10 +45,33 @@ po_worktrees_load() {
 	PO_MAIN_WT=${PO_WT_PATH[0]}
 }
 
-# po_wt_dirty <path>: the number of `git status --porcelain` lines
-# (tracked changes and untracked files; ignored files do not count).
+# po_wt_probe <path>: one `git status -z` of the worktree, read once into
+# PO_PROBE_DIRTY[path] (the entry count: tracked changes and untracked
+# files; ignored files do not count) and PO_PROBE_MTIME[path] (the newest
+# mtime among the changed and untracked files, 0 when none; a deleted file
+# has none). Later calls for the same path reuse it: one `po status` run
+# reads a worktree's state once, however many lines show it.
+declare -A PO_PROBE_DIRTY=() PO_PROBE_MTIME=()
+po_wt_probe() {
+	local wt=$1 entry code path t n=0 newest=0
+	[[ -z ${PO_PROBE_DIRTY[$wt]+x} ]] || return 0
+	while IFS= read -r -d '' entry; do
+		code=${entry:0:2}
+		path=${entry:3}
+		n=$((n + 1))
+		[[ $code == *[RC]* ]] && IFS= read -r -d '' _ # the source of a rename
+		[[ -e $wt/$path || -L $wt/$path ]] || continue
+		t=$(stat -c %Y "$wt/$path") && ((t > newest)) && newest=$t
+	done < <(git -C "$wt" --no-optional-locks -c core.quotePath=false status --porcelain -z --untracked-files=all)
+	PO_PROBE_DIRTY[$wt]=$n
+	# shellcheck disable=SC2034 # read by status.sh
+	PO_PROBE_MTIME[$wt]=$newest
+}
+
+# po_wt_dirty <path>: the number of changed and untracked entries.
 po_wt_dirty() {
-	git -C "$1" --no-optional-locks status --porcelain --untracked-files=all | wc -l
+	po_wt_probe "$1"
+	printf '%s\n' "${PO_PROBE_DIRTY[$1]}"
 }
 
 # po_wt_ignored <path>: the number of ignored files and directories (a

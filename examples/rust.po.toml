@@ -3,7 +3,8 @@
 [gate]
 # po stamp runs the legs below in order and names the one that fails. A single
 # `command = "./gate.sh"` also works; the gate is then one leg, "gate".
-test_count_cmd = "cargo test 2>&1"    # parsed for libtest "test result: ok. N passed" lines
+# The leg named "test" is counted from its own output (libtest "test result: ok. N passed"
+# lines); test_count_cmd is only an optional filter over that output.
 
 [gate.legs]
 check = "cargo check"

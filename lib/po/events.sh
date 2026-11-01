@@ -12,7 +12,8 @@
 #   {"time":"2026-10-23T22:30:00Z","kind":"stamp","item":"0.12","project":"po-kit",
 #    "result":"pass","agent":"alice","legs":[{"name":"lint","result":"pass","seconds":3}],
 #    "seconds":3,"detail":""}
-# kind is stamp|open|close; result is pass|fail; item is null when the branch
+# kind is stamp|open|close|setup (a `po setup confirm`, its detail "step <n>
+# confirmed by <who>"); result is pass|fail; item is null when the branch
 # is not an item branch; a leg's result is pass, fail or skip (not reached);
 # detail says why a stamp failed, else "". A failed stamp adds two things:
 # the failing leg's "tail" (the last lines of its output, redacted, one
@@ -25,12 +26,66 @@
 # open or a close) has an unknown time, never 0: readers show it as -.
 
 PO_EVENTS_NAME=po-events.jsonl
+PO_EVENTS_ARCHIVE_NAME=po-events-archive.jsonl
+#
+# The live log keeps the last [events] live_days days (default 10). Older
+# events move to po-events-archive.jsonl beside it, at append time and by
+# `po events --archive-now`. An event is identified by its whole line.
 
 # po_events_file: the log's absolute path.
 po_events_file() {
 	local dir
 	dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 1
 	printf '%s/%s' "$dir" "$PO_EVENTS_NAME"
+}
+
+# po_events_archive_file: the archive's absolute path.
+po_events_archive_file() {
+	local dir
+	dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 1
+	printf '%s/%s' "$dir" "$PO_EVENTS_ARCHIVE_NAME"
+}
+
+# po_events_archive_now: move events older than the live window to the
+# archive; prints how many moved. Younger events, events whose time is not a
+# well-formed UTC stamp and lines that are not events stay live. The archive
+# is appended first (skipping lines already in it), then the live log is
+# replaced by one rename of a temp file, so a crash loses nothing and a rerun
+# adds no duplicate. PO_EVENTS_NOW (epoch seconds) stands in for the clock.
+po_events_archive_now() {
+	local file arch days now cutoff tmp_live tmp_old n lock
+	file=$(po_events_file) || return 1
+	[[ -s $file ]] || { printf '0'; return 0; }
+	arch=$(po_events_archive_file)
+	days=$((10#${PO_MANIFEST[events.live_days]:-10}))
+	now=${PO_EVENTS_NOW:-$(date -u +%s)}
+	cutoff=$(date -u -d "@$((now - days * 86400))" +%Y-%m-%dT%H:%M:%SZ) || return 1
+	lock=$file.lock
+	(
+		command -v flock >/dev/null 2>&1 && flock 9
+		tmp_live=$(mktemp "$file.live.XXXXXX") || exit 1
+		tmp_old=$(mktemp "$file.old.XXXXXX") || { rm -f "$tmp_live"; exit 1; }
+		awk -v cutoff="$cutoff" -v live="$tmp_live" -v old="$tmp_old" '
+			{
+				if (match($0, /^\{"time":"[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z"/) &&
+				    substr($0, 10, 20) < cutoff) print > old
+				else print > live
+			}' "$file" || { rm -f "$tmp_live" "$tmp_old"; exit 1; }
+		if [[ ! -s $tmp_old ]]; then
+			rm -f "$tmp_live" "$tmp_old"
+			printf '0'
+			exit 0
+		fi
+		n=$(wc -l <"$tmp_old")
+		if [[ -f $arch ]]; then
+			awk 'NR == FNR { seen[$0] = 1; next } !($0 in seen)' "$arch" "$tmp_old" >"$tmp_old.new" && mv -f "$tmp_old.new" "$tmp_old"
+		fi
+		{ cat -- "$tmp_old" >>"$arch"; } 2>/dev/null || { rm -f "$tmp_live" "$tmp_old"; exit 1; }
+		touch -r "$file" "$tmp_live" 2>/dev/null
+		mv -f "$tmp_live" "$file" || { rm -f "$tmp_live" "$tmp_old"; exit 1; }
+		rm -f "$tmp_old"
+		printf '%s' "$((n + 0))"
+	) 9>"$lock"
 }
 
 # po_json_str <text>: <text> as a JSON string. Newlines and tabs are
@@ -67,9 +122,17 @@ po_event_log() {
 	line=$(printf '{"time":"%s","kind":"%s","item":%s,"project":%s,"result":"%s","agent":%s,"legs":[%s]%s,"detail":%s%s}' \
 		"$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$kind" "$itemj" "$(po_json_str "$project")" "$result" \
 		"$(po_json_str "$(po_event_agent)")" "$legs" "$secj" "$(po_json_str "$detail")" "$logj")
-	if ! file=$(po_events_file) || ! { printf '%s\n' "$line" >>"$file"; } 2>/dev/null; then
+	if ! file=$(po_events_file) || ! {
+		(
+			command -v flock >/dev/null 2>&1 && flock 9
+			printf '%s\n' "$line" >>"$file"
+		) 9>"$file.lock"
+	} 2>/dev/null; then
 		printf 'po: warning: could not write the %s event to %s\n' "$kind" "${file:-the git dir}" >&2
+		return 0
 	fi
+	# Age out what left the live window; a failure here never fails the command.
+	po_events_archive_now >/dev/null 2>&1 || printf 'po: warning: could not archive old events\n' >&2
 	return 0
 }
 
@@ -174,17 +237,27 @@ po_event_local() {
 }
 
 po_cmd_events() {
-	local all=0 json=0
+	local all=0 json=0 archived=0 archive_now=0
 	while (($# > 0)); do
 		case $1 in
 		--all) all=1 ;;
 		--json) json=1 ;;
+		--archived) archived=1 ;;
+		--archive-now) archive_now=1 ;;
 		*) po_usage_die "events: unknown argument '$1'" ;;
 		esac
 		shift
 	done
 	local file lines=() line
 	file=$(po_events_file) || po_die "not inside a git repository"
+	if ((archive_now)); then
+		((!all && !json && !archived)) || po_usage_die "events: --archive-now takes no other option"
+		local moved
+		moved=$(po_events_archive_now) || po_die "could not archive the old events"
+		printf 'po events: archived %s events to %s\n' "$moved" "$(po_events_archive_file)"
+		return 0
+	fi
+	((!archived)) || file=$(po_events_archive_file)
 	if [[ -f $file ]]; then
 		# Newest first: the log is appended in time order. Lines that are not
 		# events (a torn write) are skipped.
@@ -198,6 +271,10 @@ po_cmd_events() {
 		return 0
 	fi
 	if ((${#lines[@]} == 0)); then
+		if ((archived)); then
+			printf 'po events: none archived (%s)\n' "$file"
+			return 0
+		fi
 		printf 'po events: none yet (%s)\n' "$file"
 		return 0
 	fi

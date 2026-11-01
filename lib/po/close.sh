@@ -22,6 +22,10 @@
 # non-blank line also runs, one `sh -c` each, and a failure is exit 7 once all
 # have run. Without --commit the whole plan is printed, admin message included, and
 # nothing changes. Never pushes.
+# With [close] require_setup = true the item's spec must hold a "Setup after
+# install" section (setup.sh; exit 6 without it, unless the item was founded
+# before the key was on); --commit records its steps as open (exit 7, the
+# boundary standing, when they cannot be written).
 
 po_close_usage() {
 	po_usage_die "usage: po close <version> [--next <version> [--next-title <title>] [--for <name>]] [--also-done <version>]... [--body-file <file>] [--run-checklist] [--commit]"
@@ -124,6 +128,9 @@ po_cmd_close() {
 
 	git show-ref --verify --quiet "refs/tags/$tag" && po_refuse "tag $tag already exists"
 
+	# Setup after install: the spec's section, under [close] require_setup.
+	po_setup_check "$version" "$tag" "$mtip" "$tip"
+
 	# --also-done: investigations that close with no merge and no tag.
 	local a ab
 	for a in "${also[@]}"; do
@@ -205,6 +212,7 @@ po_cmd_close() {
 	printf 'fresh     %s\n' "$(grep '^FRESH' <<<"$fresh_out")"
 	printf 'evidence  %s\n' "$(po_rel "$stamp")"
 	printf '%s\n' "$block" | sed 's/^/          /'
+	po_setup_plan_line
 	printf '\nSTEPS\n'
 	local s=1
 	printf '  %s. fast-forward %s %s -> %s\n' $((s++)) "$main" "$(po_short "$mtip")" "$(po_short "$tip")"
@@ -222,6 +230,7 @@ po_cmd_close() {
 	for a in "${also[@]}"; do
 		printf '     (%s closes with no merge and no tag; its branch, if any, is left to po prune)\n' "$(po_fill "$ttpl" "$a")"
 	done
+	po_setup_plan_block
 	local hook=''
 	[[ -z ${PO_MANIFEST[hooks.on_close]+x} ]] || hook=${PO_MANIFEST[hooks.on_close]}
 	if [[ -n $hook ]]; then
@@ -277,6 +286,15 @@ po_cmd_close() {
 		fi
 	fi
 	po_event_log close "$version" pass '' "$title"
+	local setupcode=0
+	if [[ $PO_SETUP_MODE != off && $PO_SETUP_KIND == steps ]]; then
+		if po_setup_record_steps "$version"; then
+			printf 'recorded %s setup step(s) for %s, open until po setup confirm\n' "$(po_setup_count)" "$tag"
+		else
+			printf 'po: warning: could not record the setup steps of %s; po setup record %s --commit writes them\n' "$tag" "$version" >&2
+			setupcode=1
+		fi
+	fi
 	local ckcode=0
 	[[ -z ${PO_MANIFEST[close.checklist]:-} ]] || po_close_checklist "$runlist" "$version" "$tag" "$title" || ckcode=$?
 	[[ -z $hook ]] || po_close_hook "$hook" "$version" "$tag" "$title" "$tip" "$body_file" "$next" "$block"
@@ -284,6 +302,7 @@ po_cmd_close() {
 		printf 'po: warning: %s checklist line(s) failed; the boundary stands, nothing is rolled back\n' "$ckcode" >&2
 		exit 7
 	fi
+	((setupcode == 0)) || exit 7
 }
 
 # po_close_checklist_plan <run>: the dry run's listing of the [close] checklist.

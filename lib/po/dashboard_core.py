@@ -9,13 +9,18 @@ import http.client
 import json
 import math
 import os
+import subprocess
+import sys
 import re
+import string
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 
 LAST = 10
+PAGE = 50  # events Show all adds per Load more
 INTERVAL_MS = 5000
 # The Reports pane: time ranges (label, seconds), the default one, and the chart areas
 # (placeholders until the charts exist) shown when the range holds events.
@@ -24,10 +29,15 @@ REPORT_DEFAULT = 1
 REPORT_CHARTS = ("Gate runs per agent", "First-try pass rate per agent", "Items closed per day, by project",
                  "Item cycle time per agent", "Failed legs by kind over time")
 REPORT_EMPTY = "no events in this range"
+REPORT_LIVE_SECONDS = 10 * 86400  # the kit's live window (po.toml [events] live_days, default 10); a longer range needs the archive
+REPORT_NO_ARCHIVE = "older than the live window; archive not configured"
+REPORT_LOADING_ARCHIVE = "loading the archive\u2026"
+ARCHIVED_MARK = "archived"
 URL_ENV = "PO_DASHBOARD_URL"
 TEAM_URL_ENV = "PO_DASHBOARD_TEAM_URL"
 DECISIONS_URL_ENV = "PO_DASHBOARD_DECISIONS_URL"
 PROJECTS_URL_ENV = "PO_DASHBOARD_PROJECTS_URL"
+ARCHIVE_URL_ENV = "PO_DASHBOARD_ARCHIVE_URL"
 DECISIONS_FILTER_ENV = "PO_DASHBOARD_DECISIONS_FILTER"  # the saved Actions filter's file, instead of the default under the config dir
 ANSWER_URL_ENV = "PO_DASHBOARD_ANSWER_URL"  # where to POST answers (v0.49); none = read-only Decisions
 ANSWER_TOKEN_ENV = "PO_DASHBOARD_ANSWER_TOKEN"  # bearer token for the answer POST (v0.49), env only
@@ -80,6 +90,11 @@ def resolve_projects_url(arg, env=None):
     return resolve_feed_url(arg, PROJECTS_URL_ENV, env)
 
 
+def resolve_archive_url(arg, env=None):
+    """--archive-url wins over the environment; neither is None (no Archive button, no default address)."""
+    return resolve_feed_url(arg, ARCHIVE_URL_ENV, env)
+
+
 def resolve_feed_url(arg, env_name, env=None):
     """An optional feed: http(s), file:// or a plain path to a file; none is None."""
     env = os.environ if env is None else env
@@ -105,6 +120,101 @@ def fetch(url, timeout=5):
         raise DashboardError("%s answered %d %s" % (url, e.code, e.reason))
     except (urllib.error.URLError, OSError, ValueError) as e:
         raise DashboardError("cannot reach %s: %s" % (url, getattr(e, "reason", e)))
+
+
+# ---- conditional, incremental feed fetches (v0.87) ---------------------------
+
+SINCE_HEADER = "X-Po-Since"  # a server that takes ?since= says so on every answer: "full", or "partial" for a ?since= answer
+FULL_EVERY = 60  # with ?since=, every 60th fetch (5 min at 5 s) is whole, so events that left the live window drop
+
+
+class Feed:
+    """One feed's fetch state: at most one fetch in flight, the ETag of the body last accepted, and
+    whether the server takes ?since=. Gtk-free: the window calls start() on each tick."""
+
+    def __init__(self, url):
+        self.url = url
+        self.etag = None
+        self.since_ok = False
+        self.fetches = 0
+        self._busy = False
+        self._lock = threading.Lock()
+
+    @property
+    def busy(self):
+        return self._busy
+
+    def begin(self):
+        """True, and the feed is now in flight; False when a fetch is still running (skip this tick)."""
+        with self._lock:
+            if self._busy:
+                return False
+            self._busy = True
+            return True
+
+    def end(self):
+        with self._lock:
+            self._busy = False
+
+    def start(self, target, *args):
+        """Run target(*args) in a daemon thread unless a fetch of this feed is still in flight; True if started."""
+        if not self.begin():
+            return False
+
+        def run():
+            try:
+                target(*args)
+            finally:
+                self.end()
+
+        threading.Thread(target=run, daemon=True).start()
+        return True
+
+    def since_for(self, events):
+        """The ?since= value for the next fetch: the newest event time held, or None for a whole fetch
+        (the server does not take it, nothing held yet, or the FULL_EVERY-th fetch)."""
+        if not self.since_ok or not events or self.fetches % FULL_EVERY == 0:
+            return None
+        return max((str(e.get("time") or "") for e in events), default="") or None
+
+    def load(self, parse, since=None, timeout=5):
+        """One fetch: (changed, data, partial). Sends If-None-Match with the ETag last accepted; a 304 is
+        (False, None, False) and parse is not called. A 200 is (True, parse(body), partial), partial when
+        the server answered a ?since= request with only the events since. The ETag is kept only once parse
+        succeeds, so a body that failed to parse is fetched whole again. Raises DashboardError."""
+        url = feed_url_since(self.url, since) if since else self.url
+        req = urllib.request.Request(url)
+        if self.etag:
+            req.add_header("If-None-Match", self.etag)
+        self.fetches += 1
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:  # noqa: S310 (scheme checked in resolve_url)
+                text = r.read().decode("utf-8", "replace")
+                etag = r.headers.get("ETag") if r.headers else None
+                mode = ((r.headers.get(SINCE_HEADER) if r.headers else None) or "").strip().lower()
+        except urllib.error.HTTPError as e:
+            if e.code == 304:
+                return False, None, False
+            raise DashboardError("%s answered %d %s" % (url, e.code, e.reason))
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            raise DashboardError("cannot reach %s: %s" % (url, getattr(e, "reason", e)))
+        data = parse(text)
+        self.etag = etag or None
+        self.since_ok = mode in ("full", "partial")
+        return True, data, bool(since) and mode == "partial"
+
+
+def feed_url_since(url, since):
+    """url with ?since=<since> added (or &since= after an existing query)."""
+    parts = urllib.parse.urlsplit(url)
+    query = (parts.query + "&" if parts.query else "") + urllib.parse.urlencode({"since": since})
+    return urllib.parse.urlunsplit(parts._replace(query=query))
+
+
+def merge_since(held, new):
+    """The events held plus those of a ?since= answer not held yet (same event_key counts once), in order."""
+    keys = {event_key(e) for e in held or []}
+    return list(held or []) + [e for e in new if event_key(e) not in keys]
 
 
 # ---- answering decisions (v0.49) --------------------------------------------
@@ -141,13 +251,14 @@ def answer_id():
     return str(uuid.uuid4())
 
 
-def answer_body(entry, answer_id, option=None, text=None, result=None, step=None, note=None, kind=None):
+def answer_body(entry, answer_id, option=None, text=None, result=None, step=None, note=None, kind=None, installed=None):
     """The POST body for answering a decision entry.
 
     One JSON object per answer, flat, null for fields the kind does not use:
     {answer_id, id, project, item, kind, option, text, result, step, note,
-     answered_at, client}. answer_id is made once per Send and kept with the
-     draft, so Retry re-posts the same body. kind is given when entry is a display row (its
+     answered_at, client, installed}. answer_id is made once per Send and kept with the
+     draft, so Retry re-posts the same body. installed (v0.81) is the build on the viewer's machine for a
+    look card ("<name> <ver-rel>", installed_build), else null. kind is given when entry is a display row (its
     shape is already decided; decision_shape of a row reads its requires=None as malformed).
     """
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -164,6 +275,7 @@ def answer_body(entry, answer_id, option=None, text=None, result=None, step=None
         "note": note,
         "answered_at": now,
         "client": CLIENT,
+        "installed": installed,
     }
 
 
@@ -175,6 +287,11 @@ def answer_counter(text):
     """The counter under an answer box: ("12 / 2000", over_limit), counting the stripped text."""
     n = len((text or "").strip())
     return ("%d / %d" % (n, ANSWER_MAX_TEXT), n > ANSWER_MAX_TEXT)
+
+
+def option_has_description(option):
+    """Whether a choice option carries a description line (non-blank text); none means nothing extra."""
+    return bool((option.get("description") or "").strip())
 
 
 def answer_ready(kind, picks):
@@ -209,17 +326,20 @@ def answer_params(kind, picks):
     return {"text": (picks.get("text") or "").strip()}
 
 
+WRONG_BUILD = "wrong build"  # the receiver's X-Reason on a 409 for a look answer from another build (v0.81)
+
+
 def answer_state(status_code, reason="", host=None):
     """The display string for an answer POST response code.
 
     200/201 -> 'answered \\u00b7 sent' (muted, controls disabled); 409 -> 'already answered'
-    (controls disabled); 404 -> 'no longer waiting'; 401/403 -> 'refused by <host>: <code>'
-    with a Retry button; anything else or no connection -> 'not sent: <reason>' with Retry.
+    (controls disabled), or 'not sent: wrong build' (with Retry) when reason is WRONG_BUILD;
+    404 -> 'no longer waiting'; 401/403 -> 'refused by <host>: <code>' with a Retry button; anything else or no connection -> 'not sent: <reason>' with Retry.
     """
     if status_code in (200, 201):
         return "answered \u00b7 sent"
     if status_code == 409:
-        return "already answered"
+        return "not sent: " + WRONG_BUILD if reason == WRONG_BUILD else "already answered"
     if status_code == 404:
         return "no longer waiting"
     if status_code in (401, 403):
@@ -279,6 +399,8 @@ def post_answer(url, body, token=None):
         with urllib.request.build_opener(_NoRedirect).open(req, timeout=ANSWER_TIMEOUT) as r:
             return answer_state(r.status, host=host)
     except urllib.error.HTTPError as e:
+        if e.code == 409:
+            return answer_state(409, ((e.headers.get("X-Reason") if e.headers else None) or "").strip(), host=host)
         return answer_state(e.code, answer_reason(e), host=host)
     except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as e:
         return answer_state(0, str(getattr(e, "reason", e)))
@@ -603,7 +725,8 @@ _PROJECT_STATUSES_DOING = {"DOING", "PAUSED", "BLOCKED"}
 
 
 def parse_projects(text):
-    """The projects feed: a JSON array of {project, last_event?, items: [{item, title?, status, agents: []}]}. Tolerant."""
+    """The projects feed: a JSON array of {project, last_event?, release?, items: [{item, title?, status, agents: [],
+    released?, setup_open?}]}. Tolerant: a wrong-typed optional field reads as absent."""
     text = (text or "").strip()
     if not text:
         return []
@@ -636,6 +759,8 @@ def parse_projects(text):
                 "title": str(title),
                 "status": str(it.get("status") if it.get("status") is not None else ""),
                 "agents": agents,
+                "released": it.get("released") is True,
+                "setup_open": setup_open(it),
             })
         le = entry.get("last_event")
         if le is not None and not isinstance(le, str):
@@ -643,23 +768,82 @@ def parse_projects(text):
         out.append({
             "project": str(entry.get("project") if entry.get("project") is not None else ""),
             "last_event": le,
+            "release": entry.get("release") if isinstance(entry.get("release"), str) and entry.get("release") else None,
             "items": norm_items,
         })
     return out
 
 
+def status_word(status):
+    """The first word of a status, upper-cased, trailing punctuation stripped: `DONE (no change needed: x)` is DONE."""
+    words = str(status or "").split()
+    return words[0].rstrip(string.punctuation).upper() if words else ""
+
+
+def setup_open(item):
+    """The item's open setup steps (v0.84 fills `setup_open`); absent or unreadable = 0, none open."""
+    n = (item or {}).get("setup_open")
+    return n if isinstance(n, int) and not isinstance(n, bool) and n > 0 else 0
+
+
+def setup_badge(item):
+    """The muted badge of an item with setup steps open: `setup 2 open`; None when none is open."""
+    n = setup_open(item)
+    return "setup %d open" % n if n else None
+
+
+def project_setup_open(pr):
+    """The open setup steps of all a project's items."""
+    return sum(setup_open(it) for it in (pr or {}).get("items") or [])
+
+
+def released_items(items):
+    """The items that count as RELEASED, in feed order: status word DONE, `released` true and no setup step open."""
+    return [it for it in items or [] if status_word((it or {}).get("status")) == "DONE"
+            and (it or {}).get("released") is True and setup_open(it) == 0]
+
+
+def item_word(item):
+    """The word the Projects view shows and counts an item by: RELEASED for a released item, else its status word."""
+    return "RELEASED" if released_items([item]) else status_word((item or {}).get("status"))
+
+
+def release_label(pr):
+    """The release next to a project's name: {text, muted}; `no release`, muted, when the feed gives none."""
+    rel = (pr or {}).get("release")
+    if isinstance(rel, str) and rel.strip():
+        return {"text": rel.strip(), "muted": False}
+    return {"text": "no release", "muted": True}
+
+
 def project_counts(items):
-    """todo, doing, done counts from a list of project items."""
-    todo = doing = done = 0
+    """todo, doing, done, released counts from a list of project items, by the word item_word gives."""
+    todo = doing = done = released = 0
     for it in items or []:
-        status = str((it or {}).get("status") or "").strip().upper()
-        if status == "TODO":
+        word = item_word(it)
+        if word == "TODO":
             todo += 1
-        elif status in _PROJECT_STATUSES_DOING:
+        elif word in _PROJECT_STATUSES_DOING:
             doing += 1
-        elif status == "DONE":
+        elif word == "DONE":
             done += 1
-    return {"todo": todo, "doing": doing, "done": done}
+        elif word == "RELEASED":
+            released += 1
+    return {"todo": todo, "doing": doing, "done": done, "released": released}
+
+
+def counts_add_up(items):
+    """The items whose word is in no filter; empty when All = TODO + DOING + DONE + RELEASED."""
+    known = {"TODO", "DONE", "RELEASED"} | _PROJECT_STATUSES_DOING
+    return [it for it in items or [] if item_word(it) not in known]
+
+
+def not_in_filter_line(items):
+    """The muted line `n not in a filter: <items>`, or "" when every item is in a filter."""
+    lost = counts_add_up(items)
+    if not lost:
+        return ""
+    return "%d not in a filter: %s" % (len(lost), ", ".join(str(it.get("item") or "?") for it in lost))
 
 
 def project_light(last_event, now=None):
@@ -679,45 +863,113 @@ def project_light(last_event, now=None):
 
 
 def filter_items(items, f):
-    """All/TODO/DOING/DONE filter keeping feed order."""
+    """All/TODO/DOING/DONE/RELEASED filter keeping feed order."""
     items = list(items or [])
     key = str(f).strip().lower() if f is not None else "all"
     if key in ("", "all"):
         return items
-    if key == "todo":
-        return [it for it in items if str(it.get("status") or "").strip().upper() == "TODO"]
     if key == "doing":
-        return [it for it in items if str(it.get("status") or "").strip().upper() in _PROJECT_STATUSES_DOING]
-    if key == "done":
-        return [it for it in items if str(it.get("status") or "").strip().upper() == "DONE"]
+        return [it for it in items if item_word(it) in _PROJECT_STATUSES_DOING]
+    if key in ("todo", "done", "released"):
+        return [it for it in items if item_word(it) == key.upper()]
     return items
 
 
 def project_check_lines(projects, now=None):
-    """One line per project for --check: name | light | todo/doing/done."""
+    """One line per project for --check: name | light | todo/doing/done/released | release (or `no release`), then
+    ` | setup open N` when N > 0 setup steps are open."""
     out = []
     for pr in projects:
         c = project_counts(pr["items"])
-        out.append("%s | %s | %d/%d/%d" % (pr["project"], project_light(pr["last_event"], now), c["todo"], c["doing"], c["done"]))
+        setup = project_setup_open(pr)
+        out.append("%s | %s | %d/%d/%d/%d | %s%s" % (pr["project"], project_light(pr["last_event"], now), c["todo"], c["doing"],
+                                                   c["done"], c["released"], release_label(pr)["text"],
+                                                   " | setup open %d" % setup if setup else ""))
     return out
 
 
 def project_card(pr, now=None):
-    """What a Projects card shows: {name, light, counts, text}; text is the tooltip and accessible label, so the
-    light is named in words as well as coloured."""
+    """What a Projects card shows: {name, light, counts, text, setup}; text is the tooltip and accessible label, so the
+    light is named in words as well as coloured; setup is the muted `setup open N` line ("" when none is open)."""
     light = project_light(pr.get("last_event"), now)
     counts = project_counts(pr.get("items"))
     name = str(pr.get("project", ""))
-    text = "%s, %s, TODO %d, DOING %d, DONE %d" % (name, light, counts["todo"], counts["doing"], counts["done"])
-    return {"name": name, "light": light, "counts": counts, "text": text}
+    release = release_label(pr)
+    setup = project_setup_open(pr)
+    setup_line = "setup open %d" % setup if setup else ""
+    text = "%s, %s, TODO %d, DOING %d, DONE %d, RELEASED %d, %s" % (name, light, counts["todo"], counts["doing"], counts["done"],
+                                                                 counts["released"], release["text"])
+    if setup_line:
+        text += ", " + setup_line
+    return {"name": name, "light": light, "counts": counts, "text": text, "lost": not_in_filter_line(pr.get("items")),
+            "release": release, "setup": setup_line}
 
 
-def load_projects(url, last=None):
-    """(projects, note) from the feed; a failed fetch keeps `last` and the note says so (note is "" when fine)."""
+def load_projects(url, last=None, feed=None):
+    """(projects, note) from the feed; a failed fetch keeps `last` and the note says so (note is "" when fine).
+    With a Feed (v0.87) the fetch is conditional: a 304 keeps `last`."""
     try:
+        if feed is not None:
+            changed, projects, _ = feed.load(parse_projects)
+            return (projects if changed else last), ""
         return parse_projects(fetch(url)), ""
     except DashboardError as e:
         return last, "%s (showing the last projects data)" % e if last is not None else str(e)
+
+
+def memory_log_path(env=None):
+    """$XDG_STATE_HOME (default ~/.local/state)/po-dashboard/memory.log."""
+    env = os.environ if env is None else env
+    base = (env.get("XDG_STATE_HOME") or "").strip()
+    if not base or not os.path.isabs(base):
+        base = os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, "po-dashboard", "memory.log")
+
+
+def process_rss_mb():
+    """Process RSS in MB from /proc/self/status, or None when unavailable."""
+    try:
+        with open("/proc/self/status", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def memory_log_line(ts, rss_mb, events, cards, seen, born):
+    """One memory-log line: ISO time, RSS MB (or ?), events held, cards on screen, len(seen), len(born)."""
+    rss = "%d" % rss_mb if rss_mb is not None else "?"
+    return "%s  %sMB  %d events  %d cards  seen=%d  born=%d" % (ts, rss, events, cards, seen, born)
+
+
+def memory_log_append(path, line, cap=1024 * 1024):
+    """Append line to path, dropping the oldest half when over cap. Returns True on success.
+
+    A failure to write is swallowed after one stderr note.
+    """
+    try:
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = f.read()
+        except FileNotFoundError:
+            data = ""
+        new = data + ("" if data.endswith("\n") or not data else "\n") + line + "\n"
+        encoded = new.encode("utf-8")
+        if len(encoded) > cap:
+            lines = new.splitlines(keepends=True)
+            half = len(lines) // 2
+            new = "".join(lines[half:])
+            if not new.endswith("\n"):
+                new += "\n"
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(new)
+        return True
+    except OSError as e:
+        sys.stderr.write("po-dashboard: cannot write memory log: %s\n" % e)
+        return False
 
 
 def parse_time(iso):
@@ -826,6 +1078,14 @@ def decision_row(entry, now=None, tz=None):
                         for i, st in enumerate(entry["steps"])]
         row["done_when"] = entry["done_when"].strip()
         row["requires"] = requires_of(entry)
+        ok, line = look_ready(entry, tz)
+        row["ready"] = line if ok else ""
+        fx = entry.get("fixtures") if isinstance(entry.get("fixtures"), list) else []
+        row["fixtures"] = [{"name": f["name"].strip(), "present": f.get("present") is True}
+                           for f in fx if isinstance(f, dict) and _text(f.get("name"))]
+        row["snapshot"] = entry["snapshot"].strip() if _text(entry.get("snapshot")) else ""
+        for st, src in zip(row["steps"], entry["steps"]):
+            st["expect"] = src["expect"].strip() if _text(src.get("expect")) else ""
     return row
 
 
@@ -909,6 +1169,133 @@ def install_check_lines(entries, install_dir):
         out.extend("install | %s | %s" % (project, cmd) for cmd in b["commands"] or (b["note"],))
         out.extend("install | %s | %s | %s" % (project, item, mark) for (_p, item), mark in b["mismatched"].items())
     return out
+
+
+# ---- look cards: shown only when ready (v0.81) ---------------------------------
+# A look card is an action with `requires`. The asker posts `checked_by`, `check_sha256`, `fixtures` and an
+# `expect` per step; the feed adds what only the viewer's machine can see (`ready`, each fixture's `present`,
+# `snapshot`). A look card that is not ready is held: never shown.
+
+_PKG_NVR = re.compile(r"(.+)-([^-]+)-([^-]+)-([^-]+)\.pkg\.tar\.[a-z0-9]+")
+FIXTURE_KINDS = ("path", "url")
+VAGUE = ("the page", "somewhere", "as usual", "etc", "and so on", "if needed", "try", "some", "whatever",
+         "check that it works")
+VAGUE_RE = re.compile(r"(?<![\w/.-])(%s)(?![\w/-])" % "|".join(re.escape(v) for v in VAGUE), re.I)
+_QUOTED = re.compile(r"(?<!\w)'[^']+'(?!\w)|\"[^\"]+\"|`[^`]+`")
+STEP_MIN = 12  # characters: a shorter step text says too little to follow
+FIXTURES_MAX, FIXTURE_NAME_MAX = 20, 60
+
+
+def package_nvr(filename):
+    """(name, "ver-rel") of a package file name `name-ver-rel-arch.pkg.tar.<ext>`, or None."""
+    if not isinstance(filename, str) or _PACKAGE.fullmatch(filename) is None:
+        return None
+    m = _PKG_NVR.fullmatch(filename)
+    return (m.group(1), "%s-%s" % (m.group(2), m.group(3))) if m else None
+
+
+def installed_build(requires, run=None):
+    """The build installed on this machine for the card's package, as `pacman -Q` prints it ("<name> <ver-rel>"),
+    or None when the package name is unreadable or pacman is absent or does not know it. run is subprocess.run."""
+    nvr = package_nvr((requires or {}).get("package")) if isinstance(requires, dict) else None
+    if nvr is None:
+        return None
+    run = run or subprocess.run
+    try:
+        p = run(["pacman", "-Q", nvr[0]], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = (p.stdout or "").strip()
+    return out if p.returncode == 0 and re.fullmatch(r"\S+ \S+", out) else None
+
+
+def is_look(entry):
+    """Whether the entry is a look card: a well-formed action naming its build."""
+    return decision_shape(entry) == "action" and requires_of(entry) is not None
+
+
+def step_problems(steps):
+    """Why the steps are not concrete enough for the owner to follow, one reason per problem; empty when fine.
+    Each step needs an `expect` (what the owner should see), a text of at least STEP_MIN characters, and no vague
+    phrase (VAGUE) unless it names its target in quotes or backticks."""
+    out = []
+    if not isinstance(steps, list) or not steps:
+        return ["no steps"]
+    for i, st in enumerate(steps, 1):
+        if not isinstance(st, dict):
+            out.append("step %d is not an object" % i)
+            continue
+        text = st.get("text") if isinstance(st.get("text"), str) else ""
+        if not _text(st.get("expect")):
+            out.append("step %d has no expect (what the owner should see)" % i)
+        if len(text.strip()) < STEP_MIN:
+            out.append("step %d is too short to follow" % i)
+        hit = VAGUE_RE.search(text)
+        if hit and not _QUOTED.search(text):
+            out.append("step %d is vague (%r): say exactly where to click or what to type" % (i, hit.group(1).lower()))
+    return out
+
+
+def fixture_problems(fixtures):
+    """Shape errors in a card's fixtures (a list, maybe empty, of {name, kind, target}); empty when fine. A `path`
+    target starts `~/` and has no `..`; a `url` target is https."""
+    if not isinstance(fixtures, list):
+        return ["fixtures missing: list them, or write [] for none"]
+    if len(fixtures) > FIXTURES_MAX:
+        return ["more than %d fixtures" % FIXTURES_MAX]
+    out = []
+    names = [f.get("name") for f in fixtures if isinstance(f, dict)]
+    for i, f in enumerate(fixtures, 1):
+        if isinstance(f, dict) and isinstance(f.get("name"), str) and len(f["name"]) > FIXTURE_NAME_MAX:
+            out.append("fixture %d: a name is at most %d characters" % (i, FIXTURE_NAME_MAX))
+            continue
+        if isinstance(f, dict) and names.count(f.get("name")) > 1:
+            out.append("fixture %d: the name %r is used twice" % (i, f.get("name")))
+            continue
+        if not isinstance(f, dict) or not _text(f.get("name")) or f.get("kind") not in FIXTURE_KINDS \
+                or not _text(f.get("target")):
+            out.append("fixture %d needs name, kind (path or url) and target" % i)
+            continue
+        t = f["target"]
+        if f["kind"] == "path" and (not t.startswith("~/") or ".." in t.split("/") or any(ch.isspace() for ch in t)):
+            out.append("fixture %s: a path starts ~/ with no .." % f["name"])
+        if f["kind"] == "url" and (not t.startswith("https://") or any(ch.isspace() for ch in t)):
+            out.append("fixture %s: a url is https" % f["name"])
+    return out
+
+
+def look_ready(entry, tz=None):
+    """(True, "Ready: <build> installed, checked <local time>") for a look card that passed the three checks,
+    else (False, reason). Not a look card: (True, "")."""
+    if not is_look(entry):
+        return True, ""
+    req = requires_of(entry)
+    nvr = package_nvr(req["package"])
+    if nvr is None:
+        return False, "the package name has no version"
+    if not _text(entry.get("checked_by")):
+        return False, "no step check"
+    if entry.get("check_sha256") != req["sha256"]:
+        return False, "the step check ran on another build"
+    probs = step_problems(entry.get("steps")) + fixture_problems(entry.get("fixtures"))
+    if probs:
+        return False, probs[0]
+    missing = [f["name"] for f in entry["fixtures"] if f.get("present") is not True]
+    if missing:
+        return False, "fixture not in place: " + ", ".join(missing)
+    ready = entry.get("ready")
+    if not isinstance(ready, dict) or not _text(ready.get("build")) or parse_time(ready.get("checked_at")) is None:
+        return False, "not checked on the install machine"
+    build = "%s %s" % nvr
+    if ready["build"].strip() != build:
+        return False, "installed is %s, the card needs %s" % (ready["build"].strip(), build)
+    return True, "Ready: %s installed, checked %s" % (build, local_time(ready["checked_at"], tz))
+
+
+def hold_looks(entries, tz=None):
+    """(entries to show, number held): a look card that is not ready is never shown."""
+    shown = [e for e in entries if look_ready(e, tz)[0]]
+    return shown, len(entries) - len(shown)
 
 
 def decision_key(entry):
@@ -1135,10 +1522,118 @@ def event_key(event):
     return json.dumps(event, sort_keys=True, separators=(",", ":"))
 
 
+def page_events(events, shown):
+    """The first `shown` of events (already sorted), the page the Events list holds with Show all on."""
+    return list(events[:max(shown, 0)])
+
+
+def with_archive(live, archive):
+    """live and archive events as one list, newest first; an event in both (same event_key) counts once."""
+    return sort_events(unique_events(list(live) + list(archive or [])))
+
+
+def archive_only(live, archive):
+    """The archived events that are not live, one copy each, newest first."""
+    live_keys = {event_key(e) for e in live}
+    return [e for e in sort_events(unique_events(archive or [])) if event_key(e) not in live_keys]
+
+
+def report_plan(secs, archive_url, archive):
+    """How the Reports range `secs` gets its events: 'live' (within the live window), 'merged' (live plus the
+    archive, already fetched), 'fetch' (an archive url is set and nothing fetched yet) or 'unconfigured'."""
+    if secs <= REPORT_LIVE_SECONDS:
+        return "live"
+    if archive is not None:
+        return "merged"
+    return "fetch" if archive_url else "unconfigured"
+
+
+def report_events(live, archive, secs):
+    """The events the Reports aggregation reads for range `secs`: live, plus the archive when the range outruns the live window."""
+    if secs <= REPORT_LIVE_SECONDS or archive is None:
+        return live
+    return with_archive(live, archive)
+
+
+def shown_events(events, show_all, sort, shown, tz=None, archive=None):
+    """(the events the list shows, the number held): the last LAST, or with Show all the first `shown` after the sort.
+
+    Events with identical content share a key, so they show once. An archive (a list, or None) adds its
+    events below the live ones, sorted on their own, whatever the sort; it counts only with Show all on.
+    """
+    if show_all:
+        live = sorted_events(unique_events(sort_events(events)), sort, tz)
+        held = live + sorted_events(archive_only(events, archive), sort, tz) if archive else live
+        return page_events(held, shown), len(held)
+    held = unique_events(visible(events, False))
+    return sorted_events(held, sort, tz), len(held)
+
+
+def events_status(shown, held, show_all):
+    """The Events status line: 'N of M events · all' with Show all on, 'M events · last 10' with it off."""
+    if show_all:
+        return "%d of %d events \u00b7 all" % (shown, held)
+    return "%d events \u00b7 last %d" % (held, LAST)
+
+
+def unique_events(events):
+    """events without a second copy of any event_key, in order."""
+    seen, out = set(), []
+    for e in events:
+        k = event_key(e)
+        if k not in seen:
+            seen.add(k)
+            out.append(e)
+    return out
+
+
+def diff_cards(old_keys, new_keys):
+    """(keys to add, keys to drop): in new_keys but not old_keys, and in old_keys but not new_keys."""
+    old, new = set(old_keys), set(new_keys)
+    return [k for k in new_keys if k not in old], [k for k in old_keys if k not in new]
+
+
+class CardIndex:
+    """The Events list's cards by event key, built only for a key not held yet. Gtk-free: the window passes make and drop."""
+
+    def __init__(self):
+        self.cards = {}
+        self.keys = []
+        self.built = 0  # card constructions so far
+
+    def sync(self, keys, make, drop):
+        add, gone = diff_cards(self.keys, keys)
+        for k in gone:
+            drop(self.cards.pop(k))
+        for k in add:
+            self.cards[k] = make(k)
+            self.built += 1
+        self.keys = list(keys)
+        return add, gone
+
+
 def new_keys(seen, events):
     """The keys of events not in seen (a set, or None before the first fetch, when nothing is new)."""
     keys = [event_key(e) for e in events]
     return [] if seen is None else [k for k in keys if k not in seen]
+
+
+def prune_records(seen, born, events, now):
+    """Prune the highlight records on every fetch.
+
+    `seen` becomes the keys of the events just fetched (an event that leaves the
+    feed leaves `seen`); `born` drops any key not in the feed or older than the
+    fade window (FADE_SECONDS). `seen` may be None (before the first fetch) and
+    is returned unchanged-safe; an event that stays keeps its `born`.
+    Returns (seen, born).
+    """
+    keys = {event_key(e) for e in events}
+    new_seen = keys
+    new_born = {}
+    for k, t in (born or {}).items():
+        if k in keys and (now - t) <= FADE_SECONDS:
+            new_born[k] = t
+    return new_seen, new_born
 
 
 def fade_step(elapsed, reduced=False):
@@ -1322,7 +1817,8 @@ def contrast(a, b):
     return (hi + 0.05) / (lo + 0.05)
 
 
-PROJECT_FILTERS = (("All", "all"), ("TODO", "todo"), ("DOING", "doing"), ("DONE", "done"))
+PROJECT_FILTERS = (("All", "all"), ("TODO", "todo"), ("DOING", "doing"), ("DONE", "done"), ("RELEASED", "released"))
+RELEASED_SETUP_OPEN = "released, setup %d open"  # the muted note of a released item whose setup steps are open (v0.84)
 
 
 def project_view_state(open_project=None, filters=None):
@@ -1364,10 +1860,21 @@ def project_screen(pr, key="all", now=None):
     filters = [{"label": lab, "key": k, "count": len(items) if k == "all" else counts[k]} for lab, k in PROJECT_FILTERS]
     rows = []
     for it in filter_items(items, key):
-        status = str(it.get("status") or "").strip().upper()
+        full = str(it.get("status") or "").strip()
+        status = item_word(it)
+        note = full[len(full.split()[0]):].strip() if full else ""
+        setup = setup_badge(it)
+        if status == "DONE" and it.get("released") is True:
+            # The count joins the released note, so the row says it once: `released, setup 2 open`.
+            rel = RELEASED_SETUP_OPEN % setup_open(it)
+            note = ("%s, %s" % (note, rel)) if note else rel
+            setup = None
         agents = list(it.get("agents") or [])
-        rows.append({"item": it.get("item", ""), "title": it.get("title", ""), "status": status, "agents": agents,
+        rows.append({"item": it.get("item", ""), "title": it.get("title", ""), "status": status, "note": note,
+                     "full": full, "agents": agents, "setup": setup,
                      "live": status == "DOING" and bool(agents),
                      "dash": not agents})
     name = str(pr.get("project", ""))
-    return {"name": name, "light": light, "text": "%s, %s" % (name, light), "filters": filters, "rows": rows}
+    release = release_label(pr)
+    return {"name": name, "light": light, "text": "%s, %s, %s" % (name, light, release["text"]), "filters": filters, "rows": rows,
+            "lost": not_in_filter_line(items), "release": release}

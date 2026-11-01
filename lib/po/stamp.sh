@@ -348,8 +348,18 @@ po_cmd_stamp() {
 	else
 		po_die "$PO_MANIFEST_FILE: no gate: set [gate] command or [gate.legs]"
 	fi
-	local count_cmd sumfn=po_stamp_sum summary="'test result:' line"
-	count_cmd=$(po_get gate.test_count_cmd)
+	local count_cmd sumfn=po_stamp_sum summary="'test result:' line" test_leg=-1
+	# A leg named test is the suite: its saved output is the count's source,
+	# so the suite runs once and test_count_cmd is only a filter over that
+	# output. With no test leg, test_count_cmd is the (required) counting run.
+	for i in "${!names[@]}"; do
+		[[ ${names[i]} == test ]] && test_leg=$i
+	done
+	if ((test_leg >= 0)); then
+		count_cmd=${PO_MANIFEST[gate.test_count_cmd]:-}
+	else
+		count_cmd=$(po_get gate.test_count_cmd)
+	fi
 	if [[ ${PO_MANIFEST[gate.test_format]:-libtest} == pytest ]]; then
 		sumfn=po_stamp_sum_pytest summary='pytest summary'
 	fi
@@ -429,8 +439,16 @@ po_cmd_stamp() {
 		gate_lines=$((gate_lines + PO_SUM_LINES))
 	done
 
+	local count_run=$count_cmd
+	if ((test_leg >= 0 && ${#PO_STAMP_TMP} > 0)); then
+		local saved
+		printf -v saved '%q' "$PO_STAMP_TMP/out-$((test_leg + off))"
+		count_run="cat $saved"
+		[[ -z $count_cmd ]] || count_run="cat $saved | { $count_cmd; }"
+		count_cmd=${count_cmd:-"the test leg's output"}
+	fi
 	printf 'po stamp: test count: %s\n' "$count_cmd" >&2
-	po_stamp_run "$wt" "$count_cmd" out-count "test count: $count_cmd"
+	po_stamp_run "$wt" "$count_run" out-count "test count: $count_cmd"
 	[[ $PO_RUN_CODE == 0 ]] || po_stamp_fail "test_count_cmd ($count_cmd) exited $PO_RUN_CODE"
 	((PO_RUN_ABORTED == 0)) ||
 		po_stamp_fail "test_count_cmd ($count_cmd) printed RUN-ABORTED: the runner died before its last block, so no count is taken"

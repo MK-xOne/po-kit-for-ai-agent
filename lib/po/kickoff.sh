@@ -24,7 +24,8 @@
 #
 # An optional [kickoff] preamble = ["line", ...] in po.toml prints its lines,
 # verbatim, at the very top, followed by a blank line; without it the output
-# is exactly what it was.
+# is exactly what it was. With [close] require_setup = true, an item that is
+# not exempt gets one line after its spec: the section po close will need.
 #
 # Writes nothing anywhere: no files, no refs, no index. Exit 0, 1 usage,
 # 2 a missing source — no spec section (a founding in progress), no
@@ -53,13 +54,19 @@ po_kickoff_sections() {
 			[[ ${PO_CELLS[i]} =~ ^[[:alnum:]][[:alnum:]._-]*$ ]] && labels+=("${PO_CELLS[i]}")
 		done
 	done
-	local rule
+	# Every spec file read once, in one git process, for both rules.
+	local rule dir
+	local -a files=()
+	while IFS= read -r file; do
+		if [[ $file == *.md ]]; then files+=("$file"); fi
+	done < <(git ls-tree -z --name-only "$rev" -- "$specs_dir/" | tr '\0' '\n')
+	dir=$(mktemp -d)
+	((${#files[@]} == 0)) || po_batch_read "$rev" "$dir" "${files[@]}"
 	for rule in id label; do
 		[[ $rule == label && ${#labels[@]} == 0 ]] && break
-		while IFS= read -r file; do
-			[[ $file == *.md ]] || continue
-			po_kickoff_scan "$rule" "$id" "$file" "$rev" "${labels[@]}"
-		done < <(git ls-tree -z --name-only "$rev" -- "$specs_dir/" | tr '\0' '\n')
+		for i in "${!files[@]}"; do
+			po_kickoff_scan "$rule" "$id" "${files[i]}" "$dir/$i" "${labels[@]}"
+		done
 		if ((${#PO_KO_SECTIONS[@]} > 0)); then
 			if [[ $rule == id ]]; then
 				PO_KO_RULE="heading $id"
@@ -67,15 +74,17 @@ po_kickoff_sections() {
 				PO_KO_RULE="heading names item $(printf '%s/' "${labels[@]}")"
 				PO_KO_RULE=${PO_KO_RULE%/}
 			fi
-			return 0
+			break
 		fi
 	done
+	rm -rf "$dir"
 }
 
-# po_kickoff_scan <id|label> <id> <file> <rev> [<label>...]: append the
-# sections of <file> whose heading matches to PO_KO_SECTIONS.
+# po_kickoff_scan <id|label> <id> <file> <copy> [<label>...]: append the
+# sections of <file> (its content read from the path <copy>) whose heading
+# matches to PO_KO_SECTIONS.
 po_kickoff_scan() {
-	local rule=$1 id=$2 file=$3 rev=$4 n i level=0 start=0 fence='' line hashes text l re
+	local rule=$1 id=$2 file=$3 copy=$4 n i level=0 start=0 fence='' line hashes text l re
 	shift 4
 	local -a lines labels=("$@") res=()
 	for l in "${labels[@]}"; do
@@ -83,7 +92,7 @@ po_kickoff_scan() {
 		# Not followed by more of a label: D is not D.1 or D-2.
 		res+=("(^|[^[:alnum:]_])item ${re}(\$|[^[:alnum:]_.-]|[.-](\$|[^[:alnum:]_]))")
 	done
-	mapfile -t lines < <(git show "$rev:$file")
+	mapfile -t lines <"$copy"
 	n=${#lines[@]}
 	for ((i = 0; i < n; i++)); do
 		line=${lines[i]}
@@ -238,6 +247,9 @@ po_cmd_kickoff() {
 			((last <= $(git show "$mtip:$file" | wc -l))) || printf '\n'
 		printf 'END SPEC SECTION\n'
 	done
+	po_setup_mode "$version" "$mtip"
+	[[ $PO_SETUP_MODE != on ]] ||
+		printf '\nsetup     this item needs a "Setup after install" section in its spec (its steps, or None) before po close\n'
 
 	if [[ -n $prev ]]; then
 		PO_KO_TITLE="ADMIN/RULING SINCE $prev"

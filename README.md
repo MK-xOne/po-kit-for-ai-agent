@@ -90,6 +90,9 @@ po [-C <repo>] [--manifest <file>] open <version|next> [<title>] [--for <name>] 
 po [-C <repo>] [--manifest <file>] close <version> [--next <version> [--next-title <title>] [--for <name>]]
                                          [--also-done <version>]... [--body-file <f>] [--commit]
 po [-C <repo>] [--manifest <file>] kickoff <version>
+po [-C <repo>] [--manifest <file>] setup list [--item <version>] [--all] [--json]
+po [-C <repo>] [--manifest <file>] setup confirm <version> <n> --by <who>
+po [-C <repo>] [--manifest <file>] setup record <version> [--commit]
 po [-C <repo>] [--manifest <file>] team [--json]
 po [-C <repo>] [--manifest <file>] serve [--bind <addr>] [--port <n>]
 po version
@@ -141,7 +144,7 @@ the same from any worktree.
   them with `git worktree remove` (never `--force`) and a compare-and-delete
   of each branch ref.
 - `po stamp` — runs the gate in the current worktree (`[gate.legs]` in
-  order, or `[gate] command` as one leg), then `test_count_cmd`, and
+  order, or `[gate] command` as one leg), takes the count, and
   prints the evidence block:
 
   ```
@@ -156,8 +159,13 @@ the same from any worktree.
   failure cannot happen.
 
   The count is the sum of every libtest `test result: ok. N passed` line
-  `test_count_cmd` prints, and must equal the gate's own when the gate
-  prints any. The block is also written to `gate-<n>.txt` at the
+  (or pytest's summary) the count source prints, and must equal the gate's own
+  when the gate prints any. When a leg is named `test`, its saved output is the
+  count source and the suite runs once; `test_count_cmd` is then optional and
+  only a filter: the saved output is piped to it on stdin, and it never reruns
+  the suite (a command that ignores stdin, such as `cargo test 2>&1`, still
+  reruns it, so drop it or turn it into a filter). With no `test` leg,
+  `test_count_cmd` is required and is the counting run, as before. The block is also written to `gate-<n>.txt` at the
   worktree root, `<n>` one past the highest there; nothing is ever
   overwritten. All or nothing: a failing leg (named), a missing or
   disagreeing count, a non-ok summary, or a worktree that changed while
@@ -246,7 +254,7 @@ the same from any worktree.
   changed file newer than it, it exits 4 and prints nothing on stdout. It
   never runs the gate and posts nothing; the tag comes from the branch
   name via `[layout] branch`.
-- `po events [--all] [--json]` — the gate event log, read-only. `po stamp`
+- `po events [--all] [--json] [--archived]` or `po events --archive-now` — the gate event log, read-only (but for `--archive-now`). `po stamp`
   appends one event per run, pass or fail, and `po open` and `po close` one
   each after a complete `--commit`, to `po-events.jsonl` in the repository's
   common git dir (shared by every worktree, never tracked, never dirt).
@@ -263,8 +271,19 @@ the same from any worktree.
   warns on stderr. `po events` prints the last 10, newest first, as a table
   in the viewer's local time, then, under it, each listed failed stamp's
   tail, indented, under a line naming the leg and the log; `--all` prints
-  every event; `--json` prints the stored lines (UTC) for machines; the two
+  every event in the live log; `--json` prints the stored lines (UTC) for machines; the two
   combine.
+
+  **The live window and the archive.** The log keeps the last `[events]
+  live_days` days (default 10). Older events move to `po-events-archive.jsonl`
+  beside it in the git dir, whenever a `po stamp`, `po open` or `po close`
+  appends an event and when you run `po events --archive-now` (which prints
+  how many moved). The move never touches an event inside the window, and an
+  event whose `time` is not a UTC stamp stays live. It is one atomic rewrite:
+  the archive is appended first (a line already in it is skipped), then the
+  live log is replaced by a rename of a temp file, so a crash loses nothing and
+  a rerun adds no duplicate. `po events` and `po events --json` show live
+  events only; `po events --archived [--json]` shows the archive, newest first.
 
   **Time taken.** A stamp event records whole seconds of wall clock: each
   leg's `seconds` (from the leg starting to its exit; a leg not reached has
@@ -324,6 +343,51 @@ the same from any worktree.
   one). A value that is not an array of quoted strings, or any other key under
   `[close]`, is a manifest error (2); `po doctor` lists the key as
   `adopt [close] checklist` for a manifest without it.
+- `[close] require_setup = true` — an optional switch (a bare `true` or
+  `false`, no quotes; absent is off). On, every item's spec carries a
+  `Setup after install` section, written by the dev: the single word `None`,
+  or a table with one row per step, in order:
+
+  ```markdown
+  ### Setup after install
+
+  | # | Machine | Command | Who | Check |
+  |---|---|---|---|---|
+  | 1 | build host | `systemctl --user restart viewer` | operator | the viewer page shows the new tag |
+  ```
+
+  The heading is any level from `##` down (`###` inside an item's section of
+  a shared spec file); the columns are exactly those five; steps are numbered
+  1, 2, 3; Command is one backticked command, or `-` when the step is not a
+  command (say what to do in Check); a `|` inside a command is written `\|`
+  or sits inside the backticks. `po close` looks for the section at the item
+  branch's tip, first in the item's spec sections (found as `po kickoff`
+  finds them), then in any `.md` file the item's backlog row names in
+  backticks. Missing or malformed: refused, exit 6, naming where it looked or
+  the line at fault. Items founded before the switch was on are exempt: po
+  reads the manifest at the item's founding commit (the oldest commit on main
+  where the backlog says DOING), and if the switch was not on there, the close
+  goes on and its plan says `setup     exempt: founded before [close]
+  require_setup` (a manifest outside the repository, or no founding commit
+  found, is never exempt). So turning it on is one admin commit, and every
+  item founded after it needs the section. The plan prints `setup     None`
+  or `setup     <n> step(s) (<file>:<line>)` after the evidence and a `SETUP`
+  block grouping the steps by machine and who; `po kickoff` prints one line
+  saying the section is needed. `po close --commit` records the steps as open
+  in `po-setup-steps.json` in the common git dir (a write that fails is a
+  warning and exit 7; the boundary stands, and `po setup record <version>
+  --commit` writes them again from the item's tag, keeping confirmed steps).
+  An exempt item with a well-formed section still has its steps recorded.
+- `po setup list [--item <version>] [--all] [--json]` — read-only: the
+  recorded steps still open (`--all` adds the confirmed ones, with who and
+  when), one line each (`v0.9 #1  open  build host  operator  <command>`,
+  then its `check:`); `--json` prints `{"steps": [{item, n, machine,
+  command, who, check, status, recorded_at, confirmed_by, confirmed_at}]}`.
+  `po setup confirm <version> <n> --by <who>` marks one step confirmed; it
+  is run by whoever did the step, not only the PO; a step already confirmed
+  says by whom and changes nothing; an unknown step is a usage error (1).
+  Each confirm is logged as a `setup` event in `po events`. A projects feed
+  producer can count each item's open steps into its `setup_open` field.
 - `[stamp] prepare` — an optional manifest key, a one-line array of
   strings (`prepare = ["cargo fmt", "ruff format"]`), the deterministic
   fixes (formatters) a project wants applied before every gate. `po stamp`
@@ -341,6 +405,17 @@ the same from any worktree.
   under `[stamp]` other than `prepare` and `slow_after`, is a manifest error
   (2); `po doctor` lists the key as `adopt [stamp] prepare` for a manifest
   without it.
+- `[events] live_days` — an optional integer, days (default 10): events older
+  than this leave `po-events.jsonl` for `po-events-archive.jsonl` (see `po
+  events`). Anything but an integer is a manifest error (2); `po doctor` lists
+  the key as `adopt [events] live_days` for a manifest without it.
+- `[release] source` — optional, `"tag"`, `"github"` or `"none"` (default
+  `none`): what counts as a release, read by `po released`. `tag` takes the
+  newest tag matching `[release] pattern` (a git tag glob, default
+  `release-*`; only with `tag`) by version order; `github` takes the tag the
+  caller passes with `po released --release <tag>` (a feed producer reads the
+  newest GitHub release; the kit never calls GitHub); `none` has no release.
+  Another value, or `pattern` without `tag`, is a manifest error (2).
 - `[stamp] slow_after` — an optional integer, seconds (default 300): a stamp
   run that took longer is marked `slow` in `po events` and in the
   dashboard. Information only.
@@ -354,6 +429,17 @@ the same from any worktree.
   whole plan — steps, the edits as a diff, the admin message, `--commit`
   readiness — and change nothing. Exit 6: refused by the item law.
 
+- `po released [--json] [--release <tag>]` — the DONE items the project's
+  latest release contains, judged from git, read-only: an item is released
+  when its item tag (`[versioning] tag` filled) is an ancestor of the release
+  tag (`git merge-base --is-ancestor`); a DONE row without an item tag (closed
+  without a commit) is not. The release comes from `[release] source`
+  (above). Prints `release: <tag>` (or `release: none`) and one released
+  version per line; `--json` prints `{"source", "release" (null when none),
+  "released": [versions]}`. `--release` is for source `github` only (exit 1
+  otherwise); a tag given that is not in the repository is exit 2 (fetch tags
+  first). A feed producer uses it to fill the projects feed's `release` and
+  `released` fields.
 - `po team [--json]` — the feed the dashboard Team view reads
   (`--team-url`, below), built from what the kit knows, read-only. The roster is
   the manifest's `[[team.agent]]` tables, in file order: `name` (required,
@@ -409,7 +495,7 @@ the same from any worktree.
   300), time, and a note icon when the event has a
   detail (its tooltip and aria-label are the detail, then, for a failed
   stamp, the failing leg's tail and the log's path); each row links to `/all`,
-  the full list, in the same layout; `/events.json` is the same data as JSON, and `/team.json` is `po team --json`. The pages poll it every
+  the full list, in the same layout; `/events.json` is the same data as JSON (live events only), `/archive.json` the archive in the same shape (`po events --archived --json`, read-only, on the same loopback rule), and `/team.json` is `po team --json`. The pages poll it every
   few seconds and redraw in place; times are UTC in the data and shown in the
   browser's local time. Every field is HTML-escaped. It reads events only by
   running `po events --json` (so it needs a po that has `po events`) and needs
@@ -419,7 +505,7 @@ the same from any worktree.
   interface's. There is no login, so bind only to an address whose reachers you
   trust. It prints `po serve: listening on http://<addr>:<port>/` and runs until
   stopped; `--port 0` picks a free port.
-- `po-dashboard [--url <url>] [--team-url <url>] [--decisions-url <url>] [--projects-url <url>] [--view events|team|decisions|projects|reports] [--project <name>] [--theme auto|light|dark] [--all] [--size WxH] [--check] [--screenshot <png>] [--screenshot-delay <s>]`
+- `po-dashboard [--url <url>] [--archive-url <url>] [--team-url <url>] [--decisions-url <url>] [--projects-url <url>] [--view events|team|decisions|projects|reports] [--project <name>] [--theme auto|light|dark] [--all] [--size WxH] [--check] [--screenshot <png>] [--screenshot-delay <s>]`
   (`bin/po-dashboard`, not a `po` subcommand) — a desktop window for the same
   events: the last 10 as soft raised single-line cards (result, item, project,
   kind, checks, agent, took (sortable like the others; `-` when unknown,
@@ -434,7 +520,20 @@ the same from any worktree.
   `/events.json` of a `po serve`; `--url` or `PO_DASHBOARD_URL`, with no
   default, and neither is an error (exit 1). It accepts a JSON array or one
   object per line. An unreachable URL shows an error line and keeps the last
-  data. The window has the desktop's own title bar and a neumorphic style (GTK
+  data. Every feed (events, team, decisions, projects) is fetched every 5
+  seconds, but a feed whose last fetch is still in flight skips that tick, so a
+  slow server never has two fetches of one feed running. Fetches are
+  conditional: the window sends `If-None-Match` with the `ETag` of the body it
+  last accepted, and a `304 Not Modified` leaves its data as it is (nothing is
+  downloaded or parsed again). A server that also takes `?since=<time>` on the
+  events feed says so with the header `X-Po-Since: full` on every answer; the
+  window then asks for `?since=<newest event time it holds>`, the server answers
+  with only the events at or after that time and `X-Po-Since: partial` (its
+  `ETag` stays the whole feed's), and the window adds the ones it does not hold
+  yet. Every 60th fetch is whole, so events that left the server's live window
+  drop. A server without `ETag` or `X-Po-Since` (a file, an older `po serve`)
+  is fetched whole each time, as before. `examples/events-demo-server.py`
+  shows the headers on its `/events.json`. The window has the desktop's own title bar and a neumorphic style (GTK
   CSS, one base colour per variant); pass and fail carry a symbol and a word
   as well as a colour, text and status colours meet WCAG AA (4.5:1), and the
   light or dark variant follows the desktop's setting (`--theme` overrides it).
@@ -501,7 +600,20 @@ the same from any worktree.
   with the real values filled in. When a project's cards name different builds, the block shows
   the newest asked card's build and each card on another build is marked
   `needs <package>: install it first`; a project never gets two blocks. **When `requires` is set,
-  the action's steps must not hold install commands**: they hold only the look steps. Order: Choices, then Actions, then unformatted and legacy,
+  the action's steps must not hold install commands**: they hold only the look steps.
+  **A look card (an action with `requires`) is shown only when it is ready** (v0.81). The asker's
+  block adds an `expect` to each step (what the owner should see), `fixtures` (a list, `[]` for
+  none, of `{name, kind, target}`: kind `path` with a target under `~/`, or `url` with an https
+  target), `checked_by` (the reviewer who ran every step) and `check_sha256` (the package sha256
+  that check ran against). The feed adds what only the owner's machine can see: `ready`
+  (`{build: "<name> <ver-rel>", commit, checked_at}`), `present` on each fixture, and `snapshot`
+  (where the owner's data was copied before a downgrade). The card is **held**, never shown, when
+  `ready` is missing or names another build than the package (`<name>-<ver>-<rel>-<arch>.pkg.tar.*`),
+  `check_sha256` differs from `requires.sha256`, `checked_by` is missing, a fixture is missing or not
+  present, or a step is vague: no `expect`, under 12 characters, or a phrase such as `the page`,
+  `somewhere` or `etc` without a quoted target. A shown look card says
+  `Ready: <name> <ver-rel> installed, checked <local time>`, then the snapshot, the fixtures (✔/✘) and
+  each step's `expect`. `--check` leaves held cards (and their Install block) out. Order: Choices, then Actions, then unformatted and legacy,
   each group oldest first. An `Actions` toggle and a `Decisions` toggle in the second button row
   (both on by default): `Actions` hides the Action entries, `Decisions` hides the Choice
   entries; unformatted and legacy entries stay visible under both. The status line says
@@ -522,7 +634,7 @@ window. `--check` prints the rows the window would show, without a
   `--projects-url` or `PO_DASHBOARD_PROJECTS_URL` (no default; `--projects-url`
   wins; an http(s) URL or a file, like the team feed) reads the projects feed, refreshed
   with the events; a failed fetch keeps the last projects data and says so. The feed is
-  a JSON array of `{project, last_event?, items: [{item, title?, status, agents: []}]}`:
+  a JSON array of `{project, last_event?, release?, items: [{item, title?, status, agents: [], released?, setup_open?}]}`:
   `last_event` is an ISO time or null; `status` is the item's po status word: TODO,
   DOING and DONE, with PAUSED and BLOCKED counted as DOING, and any other word (HELD)
   listed under All only and counted nowhere; `agents` are the names tied to the item,
@@ -530,10 +642,18 @@ window. `--check` prints the rows the window would show, without a
   for DOING the one working now, for DONE every agent involved, first event to last.
   A project's light is `active` when its last event is at most 30 minutes old, `idle`
   at most 24 hours old, else `inactive` (null, unreadable or in the future beyond a
-  minute is `inactive`). The kit defines the shape only; the producer is yours.
+  minute is `inactive`). `release` is the project's latest release name, null or absent
+  when none (`po released` gives it); an item's `released` is true when that release
+  contains it (absent: false); `setup_open` counts the item's setup steps not yet
+  confirmed (absent: 0). A DONE item with `released` true and no setup step open shows and
+  counts as RELEASED; with steps open it stays DONE with a muted `released, setup 2 open`.
+  Any other item with steps open shows a muted `setup 2 open` badge on its row, and a
+  project card a muted `setup open N` line (all its items' open steps); `--check` then adds
+  ` | setup open N` to the project's line.
+  The kit defines the shape only; the producer is yours.
   `examples/projects-feed.json` is a sample, and `examples/events-demo-server.py`
   serves it at `/projects.json` with fresh times. `--check` prints
-  `name | light | todo/doing/done` per project.
+  `name | light | todo/doing/done/released | <release or no release>` per project.
 
   Answering decisions (v0.49). When `--answer-url` (or `PO_DASHBOARD_ANSWER_URL`)
   is set to an http(s) URL, each expanded decision card below the fold gains Send
@@ -544,12 +664,13 @@ window. `--check` prints the rows the window would show, without a
   {"answer_id": "<uuid4>", "id": "<entry id>", "project": "<name>", "item": "<num>",
    "kind": "choice"|"action"|"unformatted", "option": "<label>"|null, "text": "<str>"|null,
    "result": "pass"|"failed"|null, "step": <n>|null, "note": "<str>"|null,
-   "answered_at": "<utc iso8601>", "client": "po-dashboard"}
+   "answered_at": "<utc iso8601>", "client": "po-dashboard", "installed": "<name> <ver-rel>"|null}
   ```
   `answer_id` is a lowercase dashed uuid4 (8-4-4-4-12 hex, version nibble 4, e.g.
   `0b7e3c1a-5d2f-4a8e-9c61-3f0d2b8a7e41`), made once per Send and kept with the draft,
-  so Retry re-posts the same body; `id` is the entry's 64-hex id from the feed. The card controls differ by kind:
-  - **Choice** — one radio row per option plus an `or write your own` text box;
+  so Retry re-posts the same body (with `installed` read again); `installed` is what `pacman -Q <name>`
+  prints on the dashboard's machine for a look card, null otherwise or when pacman does not know it; `id` is the entry's 64-hex id from the feed. The card controls differ by kind:
+  - **Choice** — one option per line, stacked, each a radio whose label wraps (its description, when it has one, beside it or under it), then an `or write your own` text box with Send on its own row below, whatever the label length;
     Send is enabled once an option is chosen (the text, if any, travels along).
   - **Action** — `Pass` and `Failed` buttons; Failed opens a step chooser (the
     step numbers) and a one-line note box; Send is enabled once a step is chosen
@@ -567,6 +688,7 @@ window. `--check` prints the rows the window would show, without a
   |---|---|
   | 200 / 201 | `answered · sent` (muted; controls disabled) |
   | 409 | `already answered` (controls disabled) |
+  | 409 with `X-Reason: wrong build` | `not sent: wrong build` (Retry): the look was answered on another build than the card's |
   | 404 | `no longer waiting` |
   | 401 / 403 | `refused by <host>: <code>` (Retry) |
   | other / no connection | `not sent: <reason>` (Retry) |
@@ -577,22 +699,25 @@ window. `--check` prints the rows the window would show, without a
   projects feed is set; `--view projects` starts in it, and exits 1 without a feed) is a
   grid of rectangular cards, one per project in the feed's order, wrapping to the window
   width. A card shows a status light (a filled circle: green `active`, yellow `idle`, red
-  `inactive`), the project name, and the counts `TODO`, `DOING` and `DONE`. The light is also
-  spelled out in the card's tooltip and accessible label ("orchard, active, TODO 1, DOING 1,
-  DONE 1"), so colour is not the only signal. Cards take Tab focus; clicking one, or Enter or
+  `inactive`), the project name with its latest release right-aligned beside it (`no
+  release` in grey when the feed gives none), and the counts `TODO`, `DOING`, `DONE` and
+  `RELEASED`. The light is also spelled out in the card's tooltip and accessible label
+  ("orchard, active, TODO 1, DOING 1, DONE 1, RELEASED 0, release-3"), so colour is not the
+  only signal. Cards take Tab focus; clicking one, or Enter or
   Space on it, opens that project's screen. An empty feed shows "no
   projects"; a failed fetch keeps the last cards and says so. A refresh that changes nothing
   leaves the cards alone, and one that does keeps the scroll position and the focused card.
   The **project screen** replaces the cards: a header with a Back button (Escape does the
   same; the overview keeps its scroll and the project's card takes the focus back), the
-  project name and its light; filter buttons All, TODO, DOING and DONE, each with its
+  project name, its light and its release (right-aligned, as on the card); filter buttons
+  All, TODO, DOING, DONE and RELEASED, each with its
   count (All at start; the choice is kept across refreshes and per project while the window
   is open); and one row per item in the feed's order: item id, title, status badge and its
   agents, as the feed gives them. TODO rows list the agents that could take the item, DOING
   rows the agent working now (with the live dot of the Team view), DONE rows every agent
   involved in order; none is a muted dash. A refresh rebuilds the rows without resetting
   the filter or the open project, and a project that leaves the feed returns to the
-  overview. `--project <name>` with `--view projects` opens straight on that screen.
+  overview. A status counts by its first word (`DONE (no change needed: x)` is DONE, its note shown muted in the row); items in no filter are named in a muted `n not in a filter: <items>` line on the overview card and the project screen. `--project <name>` with `--view projects` opens straight on that screen.
   `--view projects --screenshot <png>` (add `--project orchard` for a project screen)
   saves the pane once the feed has loaded. Light and
   dark themes use the dashboard's palette.
@@ -601,6 +726,8 @@ window. `--check` prints the rows the window would show, without a
   `--screenshot-delay` seconds, 0.6 by default), then quits.
   In the Events view a second, thinner row of buttons sits under the header: "Show all"
   and "Reports". The row is hidden in Team; in Decisions it holds the "Actions" and "Decisions" toggles; the view buttons never move.
+  With Show all on the list holds the newest 50 events (after the sort) and a "Load more" button at its foot adds 50 per click, with `N of M` beside it; Show all off resets it. A refresh adds cards only for new events and leaves the others (and the scroll and focus) as they are.
+  With `--archive-url` (or `PO_DASHBOARD_ARCHIVE_URL`; the `/archive.json` of a `po serve`, or a file) the row also holds an "Archive" button. Pressing it fetches the archive once (never on the 5-second refresh), turns Show all on, and appends the archived events below the live ones as further pages of 50 under "Load more", each with a muted `archived` marker; pressing it again hides them and drops the data from memory. A failed fetch says so in the error line and keeps the live list. Without the URL the button is hidden.
   "Reports" swaps the list for a report pane (a title, a time-range choice 24 h / 7 d / 30 d,
   7 d by default, and five charts; "no events in this range" when the range holds none);
   "Reports" again returns to the list. The charts (the numbers come from `lib/po/dashboard_reports.py`,
@@ -619,7 +746,7 @@ window. `--check` prints the rows the window would show, without a
   technology whose label, also its tooltip, is the numbers as a sentence. Days and hours are in the
   viewer's time zone. The charts read these fields of each event in the feed: `kind`, `item`,
   `project`, `result`, `agent`, `time` and `legs` (a list of `{name, result}`); `examples/events-demo-server.py`
-  serves enough open, stamp and close events to show all five. `--screenshot` with `--view reports` saves the pane. The range and the pane
+  serves enough open, stamp and close events to show all five (and an `/archive.json` of older ones). The 24 h and 7 d ranges read the live events only. The 30 d range is longer than the default live window (10 days), so it needs the archive: with `--archive-url` set it is fetched when 30 d is chosen (and dropped when you leave the range) and the charts read live plus archive; without it the pane says `older than the live window; archive not configured` above the charts of the live events. `--screenshot` with `--view reports` saves the pane. The range and the pane
   survive the 5-second refresh. `--view reports` starts in the pane.
   The Events and Team lists have a header line of column titles in muted text
   (same widths as the rows, so each sits over its data). Each is a button
@@ -675,8 +802,18 @@ window. `--check` prints the rows the window would show, without a
 Tests: `tests/run.sh` (throwaway repos in a temp dir). The runner fails loudly when a block dies: it ends with a `RUN-END` line (or prints `RUN-ABORTED` and exits non-zero), and `[gate] run_sentinel = "required"` makes `po stamp` refuse a test count from a run that has no `RUN-END`. Lint:
 `shellcheck -x bin/po bin/po-install lib/po/*.sh tests/run.sh`.
 `AGENTS.md` is a short guide for coding agents that use po;
-`CHANGELOG.md` lists what each release changed.
+`CHANGELOG.md` lists what each release changed. A pre-release review never holds a release; its fixes ship as `release-N.1` (see `AGENTS.md`, "Releases and the pre-release review").
+
+## Memory log (po-dashboard)
+
+The dashboard appends one line every 60 seconds to `$XDG_STATE_HOME/po-dashboard/memory.log`
+(default `~/.local/state/po-dashboard/memory.log`), written by `po-dashboard`: ISO time, process RSS
+in MB, events held, cards on screen, `len(seen)`, `len(born)`. Read it with
+`tail -n 5 ~/.local/state/po-dashboard/memory.log`; RSS growth over hours with flat
+events/seen/born means a leak outside the records. Pass `--no-memory-log` to disable it.
 
 ## License
 
 MIT; see `LICENSE`. Provided as-is.
+
+

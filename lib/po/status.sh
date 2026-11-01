@@ -17,19 +17,15 @@ po_rel() {
 # commit date, the newest gate-<n>.txt, and the newest mtime among the
 # worktree's changed and untracked files (a deleted file has none).
 po_wt_idle() {
-	local wt=$1 newest t entry code path f
+	local wt=$1 newest t f
 	newest=$(git -C "$wt" log -1 --format=%ct HEAD 2>/dev/null) || newest=0
 	for f in "$wt"/gate-*.txt; do
 		[[ ${f##*/} =~ $PO_STAMP_NAME_RE ]] || continue
 		t=$(stat -c %Y "$f") && ((t > newest)) && newest=$t
 	done
-	while IFS= read -r -d '' entry; do
-		code=${entry:0:2}
-		path=${entry:3}
-		[[ $code == *[RC]* ]] && IFS= read -r -d '' _ # the source of a rename
-		[[ -e $wt/$path || -L $wt/$path ]] || continue
-		t=$(stat -c %Y "$wt/$path") && ((t > newest)) && newest=$t
-	done < <(git -C "$wt" --no-optional-locks -c core.quotePath=false status --porcelain -z --untracked-files=all)
+	po_wt_probe "$wt"
+	t=${PO_PROBE_MTIME[$wt]}
+	((t > newest)) && newest=$t
 	t=$(($(date +%s) - newest))
 	printf '%s' $((t < 0 ? 0 : t))
 }
@@ -52,6 +48,7 @@ po_item_lines() {
 	if [[ -n ${2:-} ]]; then
 		suffix='  idle -'
 		if ((found >= 0)) && [[ " ${PO_WT_FLAGS[found]} " != *' prunable '* ]]; then
+			po_wt_probe "${PO_WT_PATH[found]}" # in this shell: $(...) below cannot keep the cache
 			idle=$(po_wt_idle "${PO_WT_PATH[found]}")
 			suffix="  idle $(po_fmt_idle "$idle")"
 		fi
@@ -69,6 +66,7 @@ po_item_lines() {
 	elif [[ " ${PO_WT_FLAGS[found]} " == *' prunable '* ]]; then
 		printf '          worktree %s  MISSING (prunable)\n' "$(po_rel "${PO_WT_PATH[found]}")"
 	else
+		po_wt_probe "${PO_WT_PATH[found]}"
 		printf '          worktree %s  dirty %s\n' \
 			"$(po_rel "${PO_WT_PATH[found]}")" "$(po_wt_dirty "${PO_WT_PATH[found]}")"
 	fi
@@ -187,6 +185,7 @@ po_cmd_status() {
 		registered[$p]=1
 		if [[ " ${PO_WT_FLAGS[i]} " != *' prunable '* ]]; then
 			local n
+			po_wt_probe "$p"
 			n=$(po_wt_dirty "$p")
 			((n == 0)) || dirty+=("$(po_rel "$p")"$'\t'"$n")
 		fi

@@ -64,23 +64,109 @@ po_trim() {
 	printf '%s' "$s"
 }
 
+# po_batch_read <rev> <outdir> <path>...: write the content of each path at
+# <rev> to <outdir>/<index> (empty when missing) with one git process.
+po_batch_read() {
+	local rev=$1 outdir=$2
+	shift 2
+	printf '%s\n' "$@" | python3 -I -c '
+import subprocess, sys, os
+rev, outdir = sys.argv[1], sys.argv[2]
+names = [ln.rstrip("\n") for ln in sys.stdin if ln.strip()]
+inp = "".join(f"{rev}:{p}\n" for p in names).encode()
+data = subprocess.run(["git", "cat-file", "--batch"], input=inp,
+                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout
+pos = 0
+for idx in range(len(names)):
+    content = b""
+    nl = data.find(b"\n", pos)
+    if nl >= 0:
+        parts = data[pos:nl].split()
+        pos = nl + 1
+        if len(parts) >= 3 and parts[1] != b"missing":
+            size = int(parts[2])
+            content = data[pos:pos + size]
+            pos += size + 1
+    with open(os.path.join(outdir, str(idx)), "wb") as fh:
+        fh.write(content)
+' "$rev" "$outdir"
+}
+
+# Memo globals for po_backlog_load (per commit, within one po run).
+PO_BACKLOG_MEMO_REV=''
+PO_BACKLOG_MEMO_ITEMS=''
+PO_BACKLOG_MEMO_OWNERS=''
+
 # po_backlog_load [<rev>]: fill PO_ITEMS from main, or from <rev>.
 po_backlog_load() {
-	local main backlog specs_dir file
+	local main backlog specs_dir sha
 	main=${1:-$(po_get layout.main)}
+	# The memo is keyed by the commit, so a ref that moves mid-run misses.
+	sha=$(git rev-parse -q --verify "$main^{commit}" 2>/dev/null) || sha=''
 	backlog=$(po_get layout.backlog)
 	specs_dir=$(po_get layout.specs_dir)
+
+	# Memo hit: restore without touching git.
+	if [[ -n $sha && $sha == "${PO_BACKLOG_MEMO_REV:-}" ]]; then
+		PO_ITEMS=()
+		if [[ -n "${PO_BACKLOG_MEMO_ITEMS:-}" ]]; then
+			while IFS= read -r _m_line; do
+				[[ -z "$_m_line" ]] && continue
+				PO_ITEMS+=("$_m_line")
+			done <<< "$PO_BACKLOG_MEMO_ITEMS"
+		fi
+		PO_OWNERS=()
+		if [[ -n "${PO_BACKLOG_MEMO_OWNERS:-}" ]]; then
+			while IFS=$'\t' read -r _m_k _m_v; do
+				[[ -z "$_m_k" ]] && continue
+				PO_OWNERS[$_m_k]=$_m_v
+			done <<< "$PO_BACKLOG_MEMO_OWNERS"
+		fi
+		return 0
+	fi
+
 	PO_ITEMS=()
 	PO_OWNERS=()
 	git cat-file -e "$main:$backlog" 2>/dev/null ||
 		po_die "backlog '$backlog' not found on $main"
-	po_backlog_tables "$backlog" <(git show "$main:$backlog")
 	git cat-file -e "$main:${specs_dir%/}/" 2>/dev/null ||
 		po_die "specs_dir '$specs_dir' not found on $main"
-	while IFS= read -r file; do
-		[[ $file == *.md ]] || continue
-		po_backlog_headings "$file" <(git show "$main:$file")
+
+	local -a _files=()
+	_files+=("$backlog")
+	local _f
+	while IFS= read -r _f; do
+		[[ $_f == *.md ]] || continue
+		_files+=("$_f")
 	done < <(git ls-tree -z --name-only "$main" -- "$specs_dir/" | tr '\0' '\n')
+
+	local _tmpdir
+	_tmpdir=$(mktemp -d)
+	po_batch_read "$main" "$_tmpdir" "${_files[@]}"
+
+	local _i=0
+	po_backlog_tables "$backlog" "$_tmpdir/0"
+	_i=1
+	local _file
+	for _file in "${_files[@]:1}"; do
+		[[ $_file == *.md ]] || { _i=$((_i+1)); continue; }
+		po_backlog_headings "$_file" "$_tmpdir/$_i"
+		_i=$((_i+1))
+	done
+
+	rm -rf "$_tmpdir"
+
+	PO_BACKLOG_MEMO_REV=$sha
+	PO_BACKLOG_MEMO_ITEMS=''
+	local _rec
+	for _rec in "${PO_ITEMS[@]}"; do
+		PO_BACKLOG_MEMO_ITEMS+="$_rec"$'\n'
+	done
+	PO_BACKLOG_MEMO_OWNERS=''
+	local _k
+	for _k in "${!PO_OWNERS[@]}"; do
+		PO_BACKLOG_MEMO_OWNERS+="$_k"$'\t'"${PO_OWNERS[$_k]}"$'\n'
+	done
 }
 
 # Split one table row into PO_CELLS (outer pipes dropped, cells trimmed).

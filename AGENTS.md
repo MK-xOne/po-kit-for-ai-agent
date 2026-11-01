@@ -25,6 +25,9 @@ every backlog status; **devs** each work one item in its own worktree.
   window, also only when asked; `--team-url <feed>` or `PO_DASHBOARD_TEAM_URL` adds its Team view, `--decisions-url <feed>` or `PO_DASHBOARD_DECISIONS_URL` its read-only Decisions view; a new event fades in, 60 s), `po dispatch --plan` (who would get which ready item), `po team [--json]` (the Team-view feed from the manifest roster, the events and the backlog owner column), `po version` (the installed tag), `po doctor` (does
   every adopter's manifest still work under the installed po, and which optional
   keys could it adopt).
+- **Setup steps:** `po setup list` (read-only) shows the setup steps recorded at
+  each close that nobody has confirmed yet. Whoever does a step confirms it:
+  `po setup confirm <version> <n> --by <name>`.
 - **The PO's only:** `po open`, `po close`, `po prune`, `po dispatch` with `--commit`, and every
   backlog status. Without `--commit` they print a plan and change nothing; a dev
   may run them that way to check.
@@ -39,6 +42,10 @@ every backlog status; **devs** each work one item in its own worktree.
 
 1. `cd` into the worktree the prompt names, then `pwd`.
 2. Do the item. Gate with the repo's own command (e.g. `./check.sh`).
+2b. Write the spec's `Setup after install` section: per step the machine, the exact
+   command, who does it and how to check it worked (a table, see README), or the
+   single word `None`. Where the manifest sets `[close] require_setup = true`, the
+   PO's `po close` refuses an item without it.
 2a. An item that changes or replaces a behaviour updates or deletes the tests that pinned the old behaviour, in the same commit. A new test is added beside them only for what is new. Report lists the tests changed or deleted (names) or says `none pinned the old behaviour`.
 3. `po stamp` in the worktree; on exit 4, fix and run it again.
 4. Report: `po report [--note <text>]...` prints the report block (files changed,
@@ -82,7 +89,35 @@ bundle first. The card names the build with `requires` and carries no install co
 with a placeholder, a bare install-file name, an install step beside `requires`, or a `requires`
 that is not the current bundle is not shown, and its asker gets one `FIX?` with the reason.
 
+**A look card reaches the owner only when ready** (three checks, all before the owner is asked):
+1. *Step check*: a reviewer, never the card's dev, runs every step on the build host against the
+   bundle's package. Each step says exactly where to click or what to type, with its `expect` (what
+   the owner should see); the card lists every `fixture` it needs (`[]` for none). A failed or vague
+   step goes back to the dev as one `FIX?`, never to the owner. The card then carries `checked_by` and
+   `check_sha256`; a rebuilt bundle or an edited step needs a new check.
+2. *Build check*: the owner's machine has that exact build installed and confirmed (its commit too).
+   A downgrade is refused when the owner's saved data is at a schema the older build cannot read;
+   otherwise the data is copied first and the card names the copy (`snapshot`).
+3. *Prepared ahead*: every fixture is present on the owner's machine.
+Until then the card is held and never shown. An answer given on another build is not a ruling: the
+dashboard shows `not sent: wrong build`.
+
 An ask without these fields shows as `unformatted` and may wait longer.
+
+## Releases and the pre-release review
+
+A pre-release review (the test review, a code review) is read-only and runs alongside
+the release; it never holds release N. Release N is cut on schedule. Only the fixes on
+the reviewer's list ship, as the patch release N.1 (then N.2 for a later list); every
+other item waits for release N+1, the next full release.
+
+Each release entry in `CHANGELOG.md` opens with a `### Setup after install` block:
+every setup step of the release's items in order (`1. v0.9 · build host · operator ·
+`command` · check: ...`), or the word `None`.
+
+A patch release is the annotated tag `release-N.1` with a CHANGELOG heading
+`## Release N.1 (YYYY-MM-DD): <theme>` that lists only the reviewer's fixes. Its items
+are those the reviewer listed, nothing else.
 
 ## When po-kit changes
 

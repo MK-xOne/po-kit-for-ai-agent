@@ -459,6 +459,42 @@ COUNT_CMD="echo 'test result: FAILED. 1 passed; 1 failed;'" stamp_manifest check
 stamp_fails "a summary that is not ok fails" 'printed a summary that is not ok'
 COUNT_CMD="sh ./fake-test.sh; exit 101" stamp_manifest check=true
 stamp_fails "a count command that exits non-zero fails" 'exited 101'
+# The test leg's saved output is the count: the suite runs once (a runner that
+# logs each invocation), test_count_cmd is only a filter over that output.
+RUNS=$TMP/suite-runs
+SUITE="echo run >>$RUNS; sh ./fake-test.sh"
+count_runs() { grep -c run "$RUNS" 2>/dev/null || true; }
+rm -f "$RUNS"
+stamp_manifest check=true "test=$SUITE"
+sed -i '/test_count_cmd/d' "$TMP/s.toml"
+out=$("$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>/dev/null)
+[[ $(count_runs) == 1 ]] && grep -qx 'gate PASS: check/test   tests 5 passed' <<<"$out" &&
+	ok "a stamp with a test leg runs the suite once and counts from its output" ||
+	bad "suite run once" "runs $(count_runs): $out"
+rm -f "$W"/gate-*.txt "$RUNS"
+COUNT_CMD="grep -v Compiling" stamp_manifest check=true "test=$SUITE"
+out=$("$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>/dev/null)
+[[ $(count_runs) == 1 ]] && grep -qx 'gate PASS: check/test   tests 5 passed' <<<"$out" &&
+	ok "test_count_cmd filters the test leg's saved output without rerunning it" ||
+	bad "filter over saved output" "runs $(count_runs): $out"
+rm -f "$W"/gate-*.txt "$RUNS"
+COUNT_CMD="grep -m1 '^test result'" stamp_manifest check=true "test=$SUITE"
+stamp_fails "the filter's output is what the cross-check counts" 'the gate passed 5 tests but test_count_cmd counted 3'
+rm -f "$RUNS"
+COUNT_CMD="echo no tests here" stamp_manifest check=true "test=$SUITE"
+stamp_fails "a filter that drops the summary fails" "printed no 'test result:' line"
+rm -f "$RUNS"
+COUNT_CMD="exit 3" stamp_manifest check=true "test=$SUITE"
+stamp_fails "a failing filter fails the stamp" 'exited 3'
+rm -f "$RUNS"
+COUNT_CMD="$SUITE" stamp_manifest check=true
+sed -i '/^\[gate.legs\]/,$d' "$TMP/s.toml"
+printf 'command = "%s"\n' "$SUITE" >>"$TMP/s.toml"
+"$PO" -C "$W" --manifest "$TMP/s.toml" stamp >/dev/null 2>&1
+[[ $(count_runs) == 2 ]] && ok "with no test leg test_count_cmd still reruns the suite" || bad "no test leg" "runs $(count_runs)"
+rm -f "$W"/gate-*.txt "$RUNS"
+stamp_manifest "${STD_LEGS[@]}"
+
 stamp_manifest "${STD_LEGS[@]}" "touchy=echo z >>new.txt"
 stamp_fails "a tracked file changed by the gate fails the stamp" 'the worktree changed while the gate ran'
 git -C "$W" checkout -q -- new.txt
@@ -1220,6 +1256,160 @@ ckbad "a checklist given an integer is a manifest error" '3' 'value must be an a
 printf '[close]\nother = "x"\n' | cat "$BM" - >"$TMP/ckb.toml"
 expect "an unknown [close] key is a manifest error" 2 "unknown key 'other' in \[close\]" -- -C "$CB" --manifest "$TMP/ckb.toml" status
 
+# [close] require_setup: the "Setup after install" section (item v0.84).
+SM=$TMP/su.toml
+{ cat "$BM"; printf '\n[close]\nrequire_setup = true\n'; } >"$SM"
+{ cat "$SM"; printf '\n[docs]\nrules = "docs/BACKLOG.md"\n'; } >"$TMP/su-k.toml"
+{ cat "$BM"; printf '\n[docs]\nrules = "docs/BACKLOG.md"\n'; } >"$TMP/su-k0.toml"
+setup_spec() { # <repo> <text>: put <text> in v1.0.3's spec section on its branch, re-stamp
+	local w=$1/.wt/item-v1.0.3
+	python3 -I -c 'import sys; p=sys.argv[1]; s=open(p).read(); open(p,"w").write(s.replace("Body of three.\n", "Body of three.\n\n"+sys.argv[2]+"\n", 1))' "$w/docs/backlog/v1.md" "$2"
+	git -C "$w" commit -q -a --amend -m "v1.0.3: Third"
+	rm -f "$w"/gate-*.txt
+	"$PO" -C "$w" --manifest "$BM" stamp >/dev/null 2>&1
+}
+# shellcheck disable=SC2016 # backticks in markdown, not expansions
+SU_TABLE='### Setup after install
+
+| # | Machine | Command | Who | Check |
+|---|---|---|---|---|
+| 1 | build host | `systemctl --user restart viewer` | operator | the viewer shows the tag |
+| 2 | laptop | `viewer-install \| tee log` | owner | the menu entry opens it |
+| 3 | build host | - | operator | click Reload; the page says v1.0.3 |'
+SU=$TMP/su1
+make_brepo "$SU"
+before=$(bsnap "$SU")
+expect "require_setup: a spec without the section is refused" 6 'refused: v1\.0\.3.s spec has no "Setup after install" section \(looked in: docs/backlog/v1\.md:7-10\); write its steps, or the word None' -- \
+	-C "$SU" --manifest "$SM" close 1.0.3
+[[ $(bsnap "$SU") == "$before" ]] && ok "require_setup: the refusal changes nothing" || bad "setup refusal wrote"
+base=$("$PO" -C "$SU" --manifest "$BM" close 1.0.3 2>&1)
+{ cat "$BM"; printf '\n[close]\nrequire_setup = false   # off\n'; } >"$TMP/su-off.toml"
+out=$("$PO" -C "$SU" --manifest "$TMP/su-off.toml" close 1.0.3 2>&1)
+[[ $out == "$base" ]] && ok "require_setup = false leaves the close plan byte-identical" || bad "require_setup false" "$out"
+{ cat "$BM"; printf '\n[close]\nrequire_setup = "true"\n'; } >"$TMP/su-bad.toml"
+expect "require_setup as a quoted string is a manifest error" 2 "key 'require_setup' in \[close\] must be true or false, without quotes" -- -C "$SU" --manifest "$TMP/su-bad.toml" status
+{ cat "$BM"; printf '\n[close]\nrequire_setup = yes\n'; } >"$TMP/su-bad.toml"
+expect "require_setup = yes is a manifest error" 2 'must be true or false' -- -C "$SU" --manifest "$TMP/su-bad.toml" status
+{ cat "$BM"; printf '\n[close]\nchecklist = true\n'; } >"$TMP/su-bad.toml"
+expect "true for a key that is not a switch is a manifest error" 2 'value must be an array' -- -C "$SU" --manifest "$TMP/su-bad.toml" status
+expect "kickoff names the section the close will need" 0 '^setup     this item needs a "Setup after install" section in its spec \(its steps, or None\) before po close$' -- \
+	-C "$SU" --manifest "$TMP/su-k.toml" kickoff 1.0.3
+out=$("$PO" -C "$SU" --manifest "$TMP/su-k0.toml" kickoff 1.0.3 2>&1)
+code=$?
+[[ $code == 0 ]] && ! grep -q '^setup ' <<<"$out" && ok "kickoff without require_setup prints no setup line" || bad "kickoff setup line" "$out"
+setup_spec "$SU" '### Setup after install
+
+None'
+expect "require_setup: a section saying None is accepted" 0 '^setup     None \(docs/backlog/v1\.md:11\)$' -- -C "$SU" --manifest "$SM" close 1.0.3
+out=$("$PO" -C "$SU" --manifest "$SM" close 1.0.3 2>&1)
+! grep -q '^SETUP' <<<"$out" && ok "a None section has no SETUP block" || bad "None block" "$out"
+SU=$TMP/su2
+make_brepo "$SU"
+setup_spec "$SU" "$SU_TABLE"
+out=$("$PO" -C "$SU" --manifest "$SM" close 1.0.3 2>&1)
+code=$?
+[[ $code == 0 ]] && grep -qx 'setup     3 step(s) (docs/backlog/v1.md:11)' <<<"$out" &&
+	ok "require_setup: a table of steps is accepted and counted" || bad "setup table (exit $code)" "$out"
+want='SETUP (3 step(s); recorded open by --commit, open until po setup confirm)
+  build host · operator
+    1. systemctl --user restart viewer
+       check: the viewer shows the tag
+    3. -
+       check: click Reload; the page says v1.0.3
+  laptop · owner
+    2. viewer-install | tee log
+       check: the menu entry opens it'
+[[ $(sed -n '/^SETUP (/,/^$/p' <<<"$out" | sed '/^$/d') == "$want" ]] &&
+	ok "the close plan groups the steps by machine and who" || bad "SETUP block" "$out"
+setup_bad() { # <name> <section> <pattern>
+	local q=$TMP/su-bad-$((++SU_N))
+	make_brepo "$q"
+	setup_spec "$q" "$2"
+	expect "$1" 6 "$3" -- -C "$q" --manifest "$SM" close 1.0.3
+}
+SU_N=0
+setup_bad "a step numbered out of order is refused" "${SU_TABLE/| 2 | laptop/| 4 | laptop}" 'steps must be numbered 1, 2, 3\.\.\.; expected 2, found 4'
+setup_bad "a step without a Check is refused" "${SU_TABLE/| the menu entry opens it |/| |}" 'line 16: step 2 has no Check'
+setup_bad "a command not in backticks is refused" "${SU_TABLE/\`systemctl --user restart viewer\`/systemctl restart}" "step 1's Command must be one \`backticked\` command"
+setup_bad "wrong columns are refused" "${SU_TABLE/| Who |/| Owner |}" 'the columns must be \| # \| Machine \| Command \| Who \| Check \|'
+setup_bad "prose instead of a table is refused" '### Setup after install
+
+Restart the viewer.' 'not a table row and not the word None'
+setup_bad "an empty section is refused" '### Setup after install
+' 'the section is empty'
+# The section in a file the backlog row names.
+SU=$TMP/su3
+# shellcheck disable=SC2016 # backticks in markdown, not expansions
+BREPO_TABLE='| Item | Title | Status |
+|---|---|---|
+| v1.0.1 | First | DONE |
+| v1.0.3 | Third (`docs/notes/three.md`) | DOING |' make_brepo "$SU"
+mkdir -p "$SU/.wt/item-v1.0.3/docs/notes"
+printf '# Three\n\nNotes.\n\n## Setup after install\n\nNone\n' >"$SU/.wt/item-v1.0.3/docs/notes/three.md"
+git -C "$SU/.wt/item-v1.0.3" add docs/notes/three.md
+git -C "$SU/.wt/item-v1.0.3" commit -q --amend -m "v1.0.3: Third"
+rm -f "$SU/.wt/item-v1.0.3"/gate-*.txt
+"$PO" -C "$SU/.wt/item-v1.0.3" --manifest "$BM" stamp >/dev/null 2>&1
+expect "the section is found in a file the backlog row names" 0 '^setup     None \(docs/notes/three\.md:5\)$' -- -C "$SU" --manifest "$SM" close 1.0.3
+# Exempt: founded before the key was on, judged from the manifest at the founding commit.
+SU=$TMP/su4
+make_brepo "$SU"
+cp "$TMP/su-k0.toml" "$SU/po.toml"
+git -C "$SU" add po.toml
+git -C "$SU" commit -qm "admin: manifest"
+cp "$TMP/su-k.toml" "$SU/po.toml"
+git -C "$SU" commit -qam "admin: adopt require_setup"
+git -C "$SU/.wt/item-v1.0.3" rebase -q main
+rm -f "$SU/.wt/item-v1.0.3"/gate-*.txt
+"$PO" -C "$SU/.wt/item-v1.0.3" stamp >/dev/null 2>&1
+expect "an item founded before require_setup was on is exempt" 0 '^setup     exempt: founded before \[close\] require_setup$' -- -C "$SU" close 1.0.3
+out=$("$PO" -C "$SU" kickoff 1.0.3 2>&1)
+code=$?
+[[ $code == 0 ]] && ! grep -q '^setup ' <<<"$out" && ok "kickoff prints no setup line for an exempt item" || bad "kickoff exempt" "$out"
+"$PO" -C "$SU" open 1.0.5 --commit >/dev/null 2>&1
+SU5=$SU/.wt/item-v1.0.5
+echo five >"$SU5/five.txt"
+git -C "$SU5" add five.txt
+git -C "$SU5" commit -qm "v1.0.5: Parser"
+"$PO" -C "$SU5" stamp >/dev/null 2>&1
+expect "an item founded after require_setup was on needs the section" 6 'v1\.0\.5.s spec has no "Setup after install" section' -- -C "$SU" close 1.0.5
+# --commit records the steps; po setup list, confirm, record.
+SU=$TMP/su2
+out=$("$PO" -C "$SU" --manifest "$SM" close 1.0.3 --commit 2>&1)
+code=$?
+[[ $code == 0 ]] && grep -qx 'recorded 3 setup step(s) for v1.0.3, open until po setup confirm' <<<"$out" &&
+	[[ -f $SU/.git/po-setup-steps.json ]] &&
+	ok "close --commit records the steps in the git dir" || bad "setup record at close (exit $code)" "$out"
+expect "setup list shows the open steps" 0 '^v1\.0\.3 #2  open  laptop  owner  viewer-install \| tee log$' -- -C "$SU" --manifest "$SM" setup list
+expect "setup list shows each step's check" 0 '^    check: the viewer shows the tag$' -- -C "$SU" --manifest "$SM" setup list --item v1.0.3
+expect "setup confirm marks a step done" 0 '^confirmed v1\.0\.3 step 2 \(by ann\)$' -- -C "$SU" --manifest "$SM" setup confirm 1.0.3 2 --by ann
+out=$("$PO" -C "$SU" --manifest "$SM" setup list 2>&1)
+[[ $(grep -c '^v1\.0\.3 #' <<<"$out") == 2 ]] && ! grep -q '#2' <<<"$out" &&
+	ok "a confirmed step leaves the open list" || bad "list after confirm" "$out"
+expect "setup list --all shows who confirmed it and when" 0 '^v1\.0\.3 #2  confirmed by ann at [0-9-]+T[0-9:]+Z  laptop' -- -C "$SU" --manifest "$SM" setup list --all
+python3 -I -c 'import json,sys
+d = json.loads(sys.argv[1])
+s = {x["n"]: x for x in d["steps"]}
+assert set(s) == {1, 2, 3} and s[2]["status"] == "confirmed" and s[2]["confirmed_by"] == "ann", d
+assert s[1]["status"] == "open" and s[1]["item"] == "1.0.3" and s[1]["machine"] == "build host" and s[1]["confirmed_by"] is None, d
+assert s[3]["command"] == "-" and s[1]["recorded_at"].endswith("Z"), d' "$("$PO" -C "$SU" --manifest "$SM" setup list --all --json)" &&
+	ok "setup list --json carries every field of a step" || bad "setup list json"
+expect "confirming a confirmed step changes nothing" 0 '^already confirmed by ann at ' -- -C "$SU" --manifest "$SM" setup confirm 1.0.3 2 --by bob
+expect "confirming an unknown step is a usage error" 1 'v1\.0\.3 has no recorded step 9' -- -C "$SU" --manifest "$SM" setup confirm 1.0.3 9 --by ann
+expect "setup confirm needs --by" 1 'setup confirm: --by <who> is required' -- -C "$SU" --manifest "$SM" setup confirm 1.0.3 1
+expect "setup needs a subcommand" 1 'usage: po setup list' -- -C "$SU" --manifest "$SM" setup
+# captured first: under pipefail, grep -q quitting early would SIGPIPE po events and fail the pipeline
+out=$("$PO" -C "$SU" --manifest "$SM" events --json)
+grep -q '"kind":"setup","item":"1.0.3".*"detail":"step 2 confirmed by ann"' <<<"$out" &&
+	ok "a confirm is logged as a setup event" || bad "setup event" "$out"
+expect "setup record without --commit is a dry run" 0 'po setup record: DRY RUN' -- -C "$SU" --manifest "$SM" setup record 1.0.3
+"$PO" -C "$SU" --manifest "$SM" setup record 1.0.3 --commit >/dev/null 2>&1
+python3 -I -c 'import json,sys
+s = {x["n"]: x for x in json.loads(sys.argv[1])["steps"]}
+assert len(s) == 3 and s[2]["confirmed_by"] == "ann" and s[1]["status"] == "open", s' "$("$PO" -C "$SU" --manifest "$SM" setup list --all --json)" &&
+	ok "setup record re-writes the open steps and keeps the confirmed ones" || bad "setup record"
+expect "setup list in a repo with no steps is empty" 0 '^$' -- -C "$TMP/su1" --manifest "$SM" setup list
+
 # ---- kickoff --------------------------------------------------------------
 K=$TMP/kick
 git init -q -b main "$K"
@@ -1450,6 +1640,47 @@ expect "an unknown [kickoff] key is a manifest error" 2 "unknown key 'other' in 
 printf '[gate]\ncommand = ["a"]\n' >"$TMP/kpg.toml"
 expect "an array for a key that is not an array key is a manifest error" 2 'is not an array' -- -C "$K" --manifest "$TMP/kpg.toml" status
 
+# ---- git call count: one process reads every spec file (v0.86) -------------
+# A repository with 100 spec files; a counting `git` shim in front of PATH
+# logs each call. status and kickoff must stay within a cap that does
+# not grow with the number of files (before: about two calls per file).
+GC=$TMP/gcount
+git init -q -b main "$GC"
+git -C "$GC" config user.name t
+git -C "$GC" config user.email t@example.invalid
+mkdir -p "$GC/docs/backlog" "$TMP/gshim"
+printf '# Backlog\n' >"$GC/docs/BACKLOG.md"
+printf '# Rules\n' >"$GC/RULES.md"
+for _n in $(seq 1 100); do
+	printf '# era %s\n\n## v1.%s — Item %s — DONE\nbody %s.\n' "$_n" "$_n" "$_n" "$_n" >"$GC/docs/backlog/v1-$_n.md"
+done
+printf '\n## v1.101 — Open one — TODO\nlater.\n' >>"$GC/docs/backlog/v1-100.md"
+git -C "$GC" add -A && git -C "$GC" commit -qm "admin: founded"
+GCM=$TMP/gc.toml
+printf '%s' "${GOOD_MANIFEST/'tag = "v{version}"   # comment after a string'/'tag = "v{version}"
+admin_prefix = "admin:"
+item_commit = "v{version}: {title}"'}" >"$GCM"
+printf '[docs]\nrules = "RULES.md"\n' >>"$GCM"
+printf '#!/bin/sh\necho x >>"%s"\nexec "%s" "$@"\n' "$TMP/gcalls" "$(command -v git)" >"$TMP/gshim/git"
+chmod +x "$TMP/gshim/git"
+gcount() {
+	: >"$TMP/gcalls"
+	PATH="$TMP/gshim:$PATH" "$PO" -C "$GC" --manifest "$GCM" "$@" >"$TMP/gout" 2>&1
+	GCODE=$?
+	GCALLS=$(wc -l <"$TMP/gcalls")
+}
+for _cmd in status "kickoff 1.100"; do
+	# shellcheck disable=SC2086 # the words of one po command
+	gcount $_cmd
+	((GCODE == 0 && GCALLS <= 40)) && ok "$_cmd on 100 spec files makes at most 40 git calls ($GCALLS)" ||
+		bad "$_cmd on 100 spec files: exit 0 and at most 40 git calls" "$GCALLS calls (exit $GCODE): $(head -3 "$TMP/gout")"
+done
+gcount kickoff 1.100
+grep -q '^SPEC SECTION docs/backlog/v1-100.md:3-5 ' "$TMP/gout" && grep -q '^body 100\.$' "$TMP/gout" &&
+	ok "kickoff on 100 spec files still finds its section in the right file" || bad "kickoff 100 files section" "$(cat "$TMP/gout")"
+gcount status
+((GCODE == 0)) && ok "status on 100 spec files exits 0" || bad "status 100 files" "$(cat "$TMP/gout")"
+
 # ---- report ---------------------------------------------------------------
 HR=$TMP/report
 make_repo "$HR"
@@ -1598,6 +1829,29 @@ after=$(isnap; stat -c '%n %Y' "$IW"/*)
 printf '| v1.0.3 | Third | DONE | backlog/v1.md |\n' >>"$ID/docs/BACKLOG.md"
 git -C "$ID" commit -qam conflict
 expect "a backlog conflict (3) outranks idle (8)" 3 'CONFLICTS' -- -C "$ID" status --idle 100
+
+# ---- status: one git probe per worktree (v0.88) -----------------------------
+# A git wrapper on PATH logs every `git -C <dir> ... status` call; the open
+# item's worktree is dirty (dirty.txt) and shows dirty, idle and the dirty
+# section, yet is read once.
+idle_set $((2 * H)) none $((H))
+GW=$TMP/gitwrap
+mkdir -p "$GW"
+REAL_GIT=$(command -v git)
+# shellcheck disable=SC2016 # the wrapper script expands its own $* and $2
+printf '#!/bin/sh\ncase " $* " in *" status "*) echo "$2" >>"$GIT_STATUS_LOG" ;; esac\nexec "%s" "$@"\n' "$REAL_GIT" >"$GW/git"
+chmod +x "$GW/git"
+export GIT_STATUS_LOG=$TMP/status-calls.log
+: >"$GIT_STATUS_LOG"
+out=$(PATH=$GW:$PATH "$PO" -C "$ID" status --idle 100000 2>&1)
+[[ $(grep -cx "$IW" "$GIT_STATUS_LOG") == 1 ]] &&
+	ok "status probes an item's worktree with one git status" ||
+	bad "status git status calls on the item worktree" "$(sort "$GIT_STATUS_LOG" | uniq -c)"
+[[ $(sort "$GIT_STATUS_LOG" | uniq -d | wc -l) == 0 ]] &&
+	ok "status probes no worktree twice" || bad "status probed a worktree twice" "$(sort "$GIT_STATUS_LOG" | uniq -c)"
+grep -qE "worktree .*item-v1\.0\.3  dirty 1\$" <<<"$out" && grep -qE "idle 1h00m\$" <<<"$out" &&
+	ok "status output with one probe shows the same dirty count and idle" || bad "status probe output" "$out"
+unset GIT_STATUS_LOG
 
 # ---- owners from the backlog (item J) -------------------------------------
 OM=$TMP/o.toml
@@ -1759,6 +2013,74 @@ rmdir "$SLOG"
 mv "$SLOG.keep" "$SLOG"
 stamp_manifest "${STD_LEGS[@]}"
 rm -f "$W"/gate-*.txt
+
+# ---- events: archive by age (item v0.77) -----------------------------------
+# Events older than [events] live_days (default 10) move to po-events-archive.jsonl
+# beside the log. PO_EVENTS_NOW (epoch seconds) stands in for the clock.
+AR=$TMP/archive
+make_repo "$AR"
+ALOG=$AR/.git/po-events.jsonl
+AARC=$AR/.git/po-events-archive.jsonl
+NOW=1800000000
+ar_ev() { # <age in seconds> <detail>
+	printf '{"time":"%s","kind":"open","item":"9","project":"demo","result":"pass","agent":"a","legs":[],"detail":"%s"}\n' \
+		"$(date -u -d "@$((NOW - $1))" +%Y-%m-%dT%H:%M:%SZ)" "$2"
+}
+ar_run() { PO_EVENTS_NOW=$NOW "$PO" -C "$AR" --manifest "${AR_MANIFEST:-$TMP/s.toml}" events "$@"; }
+{ ar_ev 864001 older; ar_ev 864000 exactly; ar_ev 100 young; printf '{"time":"not a time","kind":"x"}\n{"torn'; } >"$ALOG"
+out=$(ar_run --archive-now 2>&1)
+[[ $out == *'archived 1 events'* && $(grep -c . "$AARC") == 1 && "$(cat "$AARC")" == *'"detail":"older"'* ]] &&
+	ok "archive: an event 10 days and 1 s old moves to the archive file" || bad "archive older" "$out"
+[[ $(grep -c '"detail":"exactly"' "$ALOG") == 1 && $(grep -c '"detail":"young"' "$ALOG") == 1 && $(grep -c '"detail":"older"' "$ALOG") == 0 ]] &&
+	ok "archive: an event at exactly 10 days stays live, so does a younger one" || bad "archive boundary" "$(cat "$ALOG")"
+grep -q 'not a time' "$ALOG" && grep -q '^{"torn' "$ALOG" && ! grep -q 'not a time' "$AARC" &&
+	ok "archive: an event with a bad time and a torn line stay live" || bad "archive bad time" "$(cat "$ALOG")"
+out=$(ar_run --json 2>&1)
+[[ $out != *older* && $out == *young* ]] && ok "archive: po events --json shows live events only" || bad "events --json live" "$out"
+out=$(ar_run --archived --json 2>&1)
+[[ $out == *older* && $out != *young* && $(wc -l <<<"$out") == 1 ]] && ok "archive: --archived --json shows the archive" || bad "archived json" "$out"
+out=$(ar_run --archived 2>&1)
+[[ $out == TIME* && $out == *open* ]] && ok "archive: --archived prints the table" || bad "archived table" "$out"
+before=$(cat "$AARC")
+out=$(ar_run --archive-now 2>&1)
+[[ $out == *'archived 0 events'* && "$(cat "$AARC")" == "$before" ]] && ok "archive: a second --archive-now moves nothing" || bad "archive rerun" "$out"
+# crash safety: the archive was written, the live rewrite never happened
+ar_ev 900000 crashed >>"$ALOG"
+ar_ev 900000 crashed >>"$AARC"
+ar_run --archive-now >/dev/null 2>&1
+[[ $(grep -c '"detail":"crashed"' "$AARC") == 1 && $(grep -c '"detail":"crashed"' "$ALOG") == 0 ]] &&
+	ok "archive: archive written, live rewrite interrupted, the rerun makes no duplicate" || bad "archive crash" "$(cat "$AARC")"
+# a failed archive write leaves the live log whole
+ar_ev 950000 keepme >>"$ALOG"
+cp "$ALOG" "$TMP/alog.before"
+mv "$AARC" "$AARC.bak"; mkdir "$AARC"
+out=$(ar_run --archive-now 2>&1); rc=$?
+rmdir "$AARC"; mv "$AARC.bak" "$AARC"
+[[ $rc != 0 && -n $out ]] && cmp -s "$ALOG" "$TMP/alog.before" && ok "archive: when the archive cannot be written it exits non-zero with a message and the live log is untouched" || bad "archive write failure" "rc=$rc out=$out $(diff "$ALOG" "$TMP/alog.before")"
+ar_run --archive-now >/dev/null 2>&1
+# live_days override
+printf '%s\n[events]\nlive_days = 1\n' "$(cat "$TMP/s.toml")" >"$TMP/live1.toml"
+AR_MANIFEST=$TMP/live1.toml ar_run --archive-now >/dev/null 2>&1
+ar_ev 86401 oneday >>"$ALOG"
+AR_MANIFEST=$TMP/live1.toml ar_run --archive-now >/dev/null 2>&1
+[[ $(grep -c '"detail":"young"' "$ALOG") == 1 && $(grep -c '"detail":"oneday"' "$AARC") == 1 && $(grep -c '"detail":"exactly"' "$ALOG") == 0 ]] &&
+	ok "archive: [events] live_days = 1 moves what is over a day old" || bad "live_days override" "$(cat "$ALOG")"
+printf '%s\n[events]\nlive_days = "ten"\n' "$(cat "$TMP/s.toml")" >"$TMP/live-bad.toml"
+expect "manifest: a non-integer [events] live_days is refused" 2 'live_days must be an integer' -- -C "$AR" --manifest "$TMP/live-bad.toml" events
+expect "events: --archive-now takes no other option" 1 'archive-now takes no other option' -- -C "$AR" --manifest "$TMP/s.toml" events --archive-now --json
+EAR=$TMP/archive-none
+make_repo "$EAR"
+expect "events --archived with no archive says so and exits 0" 0 'none archived' -- -C "$EAR" --manifest "$TMP/s.toml" events --archived
+# append time: a stamp ages out an old event
+SC=$TMP/archive-stamp
+git clone -q "$S" "$SC" 2>/dev/null
+git -C "$SC" config user.name t
+git -C "$SC" config user.email t@example.invalid
+ar_ev 99999999 ancient >"$SC/.git/po-events.jsonl"
+"$PO" -C "$SC" --manifest "$TMP/s.toml" stamp >/dev/null 2>&1
+[[ $(grep -c '"detail":"ancient"' "$SC/.git/po-events-archive.jsonl" 2>/dev/null) == 1 && $(grep -c '"detail":"ancient"' "$SC/.git/po-events.jsonl") == 0 &&
+	$(grep -c '"kind":"stamp"' "$SC/.git/po-events.jsonl") -ge 1 ]] &&
+	ok "archive: a po stamp moves the old events at append time" || bad "archive at stamp" "$(cat "$SC/.git/po-events.jsonl" | cut -c1-120)"
 
 # ---- failed gates keep their evidence (item Z) ------------------------------
 # A failed stamp's event carries the failing leg's last 40 lines, redacted, and
@@ -2138,14 +2460,18 @@ PY
 cat >"$SV/bin/po" <<'EOF'
 #!/usr/bin/env bash
 [[ $1 == events && $* == *--json* ]] || { echo "fake po: unexpected: $*" >&2; exit 9; }
-cat "$FAKE_EVENTS"
+if [[ $* == *--archived* ]]; then cat "$FAKE_ARCHIVE"; else cat "$FAKE_EVENTS"; fi
 EOF
 chmod +x "$SV/bin/po"
+# the archive the fake serves: two older events, oldest first like the real file
+printf '%s\n%s\n' \
+	'{"time":"2026-09-01T10:00:00Z","kind":"open","item":"0.1","project":"demo","result":"pass","agent":"a","legs":[],"detail":""}' \
+	'{"time":"2026-09-02T10:00:00Z","kind":"close","item":"0.1","project":"demo","result":"pass","agent":"a","legs":[],"detail":""}' >"$SV/archive.json"
 
 # sv_start [po serve args...]: sets SV_URL and SV_PID, or SV_URL empty.
 sv_start() {
 	: >"$SV/out"
-	(cd "$SV/repo" && PATH="$SV/bin:$PATH" FAKE_EVENTS="$SV/events.json" exec "$PO" serve --port 0 "$@" >"$SV/out" 2>"$SV/err") &
+	(cd "$SV/repo" && PATH="$SV/bin:$PATH" FAKE_EVENTS="$SV/events.json" FAKE_ARCHIVE="$SV/archive.json" exec "$PO" serve --port 0 "$@" >"$SV/out" 2>"$SV/err") &
 	SV_PID=$!
 	SV_URL=
 	local _
@@ -2194,6 +2520,15 @@ else
 	[[ $(head -1 <<<"$out") == 200 ]] &&
 		[[ $(tail -n +2 <<<"$out" | python3 -I -c 'import json,sys; d=json.load(sys.stdin); print(len(d), d[0]["item"], d[-1]["item"])') == "12 1.11 1.0" ]] &&
 		ok "/events.json serves all events, newest first" || bad "/events.json" "$out"
+	out=$(sv_req GET /archive.json)
+	[[ $(head -1 <<<"$out") == 200 ]] &&
+		[[ $(tail -n +2 <<<"$out" | python3 -I -c 'import json,sys; d=json.load(sys.stdin); print(len(d), d[0]["kind"], d[-1]["kind"])') == "2 close open" ]] &&
+		ok "/archive.json serves the archive, newest first, from po events --archived" || bad "/archive.json" "$out"
+	out=$(sv_req GET /events.json)
+	[[ $(tail -n +2 <<<"$out" | python3 -I -c 'import json,sys; print(sum(1 for e in json.load(sys.stdin) if e["item"]=="0.1"))') == 0 ]] &&
+		ok "/events.json stays live only: no archived event in it" || bad "/events.json live only" "$out"
+	[[ $(sv_req POST /archive.json | head -1) == 405 ]] &&
+		ok "/archive.json is read-only: POST is 405" || bad "archive POST"
 	out=$(sv_req GET /all)
 	[[ $out == *'<script>alert'* ]] && bad "item name reached the page unescaped" "$out" ||
 		{ [[ $out == *'&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;&amp;'* && $out == *'&quot;&gt;&lt;img src=x&gt;'* ]] &&
@@ -2788,7 +3123,17 @@ check("dashboard decisions: check lines show kind item project title waiting ask
 check("dashboard decisions: the feed is never changed", [e["item"] for e in dec] == ["2.3", "0.7", "2.5"])
 ex = c.parse_decisions(open(sys.argv[1] + "/../../examples/decisions-feed.json").read())
 check("dashboard decisions: the example feed parses, with and without a thread URL",
-      len(ex) == 4 and all(k in e for e in ex for k in ("project", "item", "title", "waiting_for", "asked_at")) and sorted(bool(r["thread_url"]) for r in c.decision_rows(ex)) == [False, False, True, True])
+      len(ex) == 6 and all(k in e for e in ex for k in ("project", "item", "title", "waiting_for", "asked_at")) and sorted(bool(r["thread_url"]) for r in c.decision_rows(ex)) == [False] * 4 + [True] * 2)
+_long = [e for e in ex if e.get("id") == "ask-0909"][0]
+_desc = [e for e in ex if e.get("id") == "ask-0206"][0]
+check("dashboard decisions: the example feed has a choice with 200+ char labels and one with descriptions",
+      c.decision_shape(_long) == "choice" and all(len(o["label"]) > 200 for o in _long["options"]) and c.decision_shape(_desc) == "choice" and any(o.get("description") for o in _desc["options"]))
+check("dashboard answers: option_has_description is true only for non-blank text",
+      [c.option_has_description(o) for o in _desc["options"]] == [True, True, False] and not c.option_has_description({"label": "x", "description": "  "}) and not c.option_has_description({"label": "x", "description": None}))
+_short_b = c.answer_body(dict(_long, item="0.9"), "0b7e3c1a-5d2f-4a8e-9c61-3f0d2b8a7e41", option="Yes")
+_long_b = c.answer_body(dict(_long, item="0.9"), "0b7e3c1a-5d2f-4a8e-9c61-3f0d2b8a7e41", option=_long["options"][0]["label"])
+check("dashboard answers: the body for a long-label choice has the same shape as for a short label",
+      set(_short_b) == set(_long_b) and _long_b["option"] == _long["options"][0]["label"] and {k: v for k, v in _long_b.items() if k != "option"} == {k: v for k, v in _short_b.items() if k != "option"})
 # v0.36: kinds, group order, the Actions filter.
 CH = {"kind": "choice", "id": "a1", "question": "Approve?", "options": [{"label": "Yes", "recommended": True}, {"label": "No", "description": "back to spec"}]}
 AC = {"kind": "action", "id": "a2", "machine": "host", "steps": [{"text": "restart", "command": "systemctl restart x"}, {"text": "look"}], "done_when": "it is up"}
@@ -2814,7 +3159,7 @@ check("dashboard decisions: a choice row carries the kind, id, question and opti
       gr["kind"] == "choice" and gr["id"] == "a1" and gr["question"] == "Approve?" and gr["options"] == [{"label": "Yes", "description": "", "recommended": True}, {"label": "No", "description": "back to spec", "recommended": False}])
 ar = c.decision_row(dict(AC, item="g"), now)
 check("dashboard decisions: an action row carries the machine, numbered steps with their commands, and done_when",
-      ar["kind"] == "action" and ar["machine"] == "host" and ar["steps"] == [{"n": 1, "text": "restart", "command": "systemctl restart x"}, {"n": 2, "text": "look", "command": ""}] and ar["done_when"] == "it is up")
+      ar["kind"] == "action" and ar["machine"] == "host" and ar["steps"] == [{"n": 1, "text": "restart", "command": "systemctl restart x", "expect": ""}, {"n": 2, "text": "look", "command": "", "expect": ""}] and ar["done_when"] == "it is up")
 check("dashboard decisions: an unformatted row has no kind fields", "options" not in c.decision_row(dict(CH, kind="poll"), now) and c.decision_row(dict(CH, kind="poll"), now)["kind"] == "unformatted")
 check("dashboard decisions: the key stays project and item, not the id", c.decision_key(dict(CH, project="p", item="1")) == ("p", "1"))
 kl = c.decision_check_lines([dict(CH, item="g4", project="p", title="T", waiting_for="w", asked_at="2026-10-24T09:00:00Z"), {"item": "g2", "project": "p", "title": "T", "waiting_for": "w", "asked_at": "2026-10-24T08:00:00Z"}], now, utc)
@@ -2894,6 +3239,78 @@ check("dashboard install: no produced command holds < or > besides the here-stri
 check("dashboard install: no produced command names the package by a bare file name",
       all(not bare(cmd, d, rq["package"]) for d in ("/home/me/pkgs", "/", "/a/b/") for rq in (RQ, RQB) for cmd in c.install_commands(d, rq)))
 check("dashboard install: no produced command holds a pipe", all("|" not in x for x in produced))
+# v0.81: a look card (an action with requires) is shown only when ready: step-checked on its build, every step
+# concrete with its expect, fixtures stated and present, and the build installed and checked on the viewer's machine.
+PK81 = "orchard-1.9.70-1-x86_64.pkg.tar.zst"
+LK = dict(AC, id="lk", project="orchard", item="1.9.70", asked_at="2026-11-01T02:00:00Z",
+          steps=[{"text": "click Bookmarks in the menu bar", "expect": "a menu with three bookmarks"},
+                 {"text": "type 'example.org/live' in the address bar and press Enter", "command": "", "expect": "the stream plays"}],
+          requires={"package": PK81, "sha256": SHA}, checked_by="rev", check_sha256=SHA,
+          fixtures=[{"name": "profile", "kind": "path", "target": "~/.config/orchard/profile.json", "present": True},
+                    {"name": "stream", "kind": "url", "target": "https://example.org/live", "present": True}],
+          ready={"build": "orchard 1.9.70-1", "commit": "abc1234", "checked_at": "2026-11-01T03:00:00Z"},
+          snapshot="/home/me/orchard-data-snapshot-20261031-2320")
+check("look: package_nvr reads name and ver-rel from a package file name",
+      c.package_nvr(PK81) == ("orchard", "1.9.70-1") and c.package_nvr("lib-x-2.0.r3.g1a2b-2-any.pkg.tar.xz") == ("lib-x", "2.0.r3.g1a2b-2"))
+check("look: package_nvr refuses names that are not package files",
+      all(c.package_nvr(x) is None for x in ("a-1-x86_64.pkg.tar.zst", "orchard.pkg.tar.zst", "a/b-1-1-any.pkg.tar.zst", "<p>-1-1-any.pkg.tar.zst", None, 3)))
+check("look: matching build shown with the Ready line (local time)",
+      c.look_ready(LK, utc) == (True, "Ready: orchard 1.9.70-1 installed, checked 2026-11-01 03:00:00"))
+_lr = c.decision_row(LK, now, utc)
+check("look: the row carries the Ready line, each step's expect, the fixtures and the snapshot",
+      _lr["ready"] == "Ready: orchard 1.9.70-1 installed, checked 2026-11-01 03:00:00" and [st["expect"] for st in _lr["steps"]] == ["a menu with three bookmarks", "the stream plays"]
+      and _lr["fixtures"] == [{"name": "profile", "present": True}, {"name": "stream", "present": True}] and _lr["snapshot"] == LK["snapshot"])
+_wrong = dict(LK, ready=dict(LK["ready"], build="orchard 1.9.69-1"))
+check("look: wrong build held", c.look_ready(_wrong, utc) == (False, "installed is orchard 1.9.69-1, the card needs orchard 1.9.70-1"))
+check("look: hold_looks shows the ready card and holds the wrong build", c.hold_looks([LK, _wrong, CH], utc) == ([LK, CH], 1))
+check("look: a held card is absent from the check lines once held out",
+      [l.split(" | ")[1] for l in c.decision_check_lines(c.hold_looks([LK, dict(_wrong, item="1.9.69")], utc)[0], now, utc)] == ["1.9.70"])
+_nr = {k: v for k, v in LK.items() if k != "ready"}
+check("look: no report from the install machine is held", c.look_ready(_nr)[0] is False and c.decision_row(_nr, now)["ready"] == "")
+check("look: an unreadable checked_at is held", c.look_ready(dict(LK, ready=dict(LK["ready"], checked_at="soon")))[0] is False)
+check("look: no step check is held", c.look_ready({k: v for k, v in LK.items() if k != "checked_by"}) == (False, "no step check"))
+check("look: a step check on another build is held", c.look_ready(dict(LK, check_sha256=SHB)) == (False, "the step check ran on another build"))
+check("look: a fixture not present is held",
+      c.look_ready(dict(LK, fixtures=[dict(LK["fixtures"][0], present=False), LK["fixtures"][1]])) == (False, "fixture not in place: profile"))
+check("look: a card without fixtures is held", c.look_ready({k: v for k, v in LK.items() if k != "fixtures"}) == (False, "fixtures missing: list them, or write [] for none"))
+check("look: fixtures [] is a stated none", c.look_ready(dict(LK, fixtures=[]))[0] is True)
+check("look: a vague step is held", c.look_ready(dict(LK, steps=[{"text": "right-click the page and look around", "expect": "a menu"}]))[0] is False)
+check("look: a card that is not a look card is not held", c.look_ready(AC) == (True, "") and c.look_ready(CH) == (True, ""))
+check("look: step_problems names a missing expect, a short step and a vague phrase",
+      c.step_problems([{"text": "open the Downloads panel"}, {"text": "look", "expect": "x"}, {"text": "right-click the page", "expect": "a menu"}])
+      == ["step 1 has no expect (what the owner should see)", "step 2 is too short to follow", "step 3 is vague ('the page'): say exactly where to click or what to type"])
+check("look: a quoted target clears a vague phrase", c.step_problems([{"text": "right-click the page 'Settings' tab", "expect": "a menu"}]) == [])
+check("look: a vague word inside another word or a path is not vague",
+      c.step_problems([{"text": "click Retry in the sync bar", "expect": "a"}, {"text": "open the registry panel", "expect": "a"},
+                       {"text": "press F5 to fetch new mail", "expect": "a"}, {"text": "open /etc/hosts in the editor", "expect": "a"}]) == [])
+check("look: apostrophes inside words are not a quoted target",
+      c.step_problems([{"text": "don't worry, click somewhere it's fine", "expect": "a"}]) == ["step 1 is vague ('somewhere'): say exactly where to click or what to type"])
+check("look: fixture_problems refuses a name used twice, a long name and too many fixtures",
+      c.fixture_problems([{"name": "s", "kind": "path", "target": "~/a"}, {"name": "s", "kind": "path", "target": "~/b"}])
+      == ["fixture 1: the name 's' is used twice", "fixture 2: the name 's' is used twice"]
+      and c.fixture_problems([{"name": "n" * 61, "kind": "path", "target": "~/a"}]) == ["fixture 1: a name is at most 60 characters"]
+      and c.fixture_problems([{"name": "f%d" % i, "kind": "path", "target": "~/a"} for i in range(21)]) == ["more than 20 fixtures"])
+check("look: step_problems on no steps", c.step_problems([]) == ["no steps"] and c.step_problems(None) == ["no steps"])
+check("look: fixture_problems refuses a bad kind, a path outside ~/, a .. and a plain http url",
+      c.fixture_problems([{"name": "a", "kind": "cmd", "target": "x"}, {"name": "b", "kind": "path", "target": "/etc/x"},
+                          {"name": "c", "kind": "path", "target": "~/../x"}, {"name": "d", "kind": "url", "target": "http://x"}])
+      == ["fixture 1 needs name, kind (path or url) and target", "fixture b: a path starts ~/ with no ..", "fixture c: a path starts ~/ with no ..", "fixture d: a url is https"])
+class _P:
+    def __init__(self, rc, out):
+        self.returncode, self.stdout = rc, out
+_calls = []
+def _run_ok(cmd, **kw):
+    _calls.append(cmd)
+    return _P(0, "orchard 1.9.70-1\n")
+def _run_raise(cmd, **kw):
+    raise FileNotFoundError("pacman")
+check("look: installed_build asks pacman -Q for the package name", c.installed_build(LK["requires"], _run_ok) == "orchard 1.9.70-1" and _calls == [["pacman", "-Q", "orchard"]])
+check("look: installed_build is None when pacman does not know it, is absent, or the name is unreadable",
+      c.installed_build(LK["requires"], lambda cmd, **kw: _P(1, "")) is None and c.installed_build(LK["requires"], _run_raise) is None
+      and c.installed_build({"package": "x.pkg", "sha256": SHA}, _run_ok) is None and c.installed_build(None, _run_ok) is None)
+check("look: answer_body carries installed (null by default)",
+      c.answer_body(LK, "6bde9c70-bd8f-4ae0-a2c7-9f6d8bebde07", result="pass", installed="orchard 1.9.70-1")["installed"] == "orchard 1.9.70-1"
+      and c.answer_body(AC, "6bde9c70-bd8f-4ae0-a2c7-9f6d8bebde07", result="pass")["installed"] is None)
 check("dashboard decisions: the filter file is under the config dir, or named by the environment",
       c.decisions_filter_path({"XDG_CONFIG_HOME": "/x/cfg"}) == "/x/cfg/po-dashboard/decisions.json" and c.decisions_filter_path({"PO_DASHBOARD_DECISIONS_FILTER": "/y/f.json", "XDG_CONFIG_HOME": "/x"}) == "/y/f.json")
 import tempfile, json
@@ -2977,7 +3394,7 @@ check("dashboard answers: answer_id is a lowercase dashed uuid4, unique per call
 _eid = "9f3c" * 16  # a 64-hex entry id, as in the feed
 _real = [("choice", c.answer_body(dict(_check_entry_choice, id=_eid), c.answer_id(), option="Yes", text="")),
          ("action", c.answer_body(dict(_check_entry_action, id=_eid), c.answer_id(), result="failed", step=1, note="n"))]
-_FIELDS = {"answer_id", "id", "project", "item", "kind", "option", "text", "result", "step", "note", "answered_at", "client"}
+_FIELDS = {"answer_id", "id", "project", "item", "kind", "option", "text", "result", "step", "note", "answered_at", "client", "installed"}
 for _k, _rb in _real:
     _rb = json.loads(json.dumps(_rb).encode("utf-8"))
     check("dashboard answers: the real %s body has the README fields and formats" % _k,
@@ -3021,13 +3438,15 @@ class AnswerH(http.server.BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         self.rfile.read(length)
         token = self.headers.get("Authorization", "")
-        code = int(self.path[1:])
+        code = int(self.path[1:4])
         if code == 401 and token:
             self.send_response(201)  # a bearer token is accepted
         else:
             self.send_response(code)
         if code == 400:
             self.send_header("X-Reason", "kind")
+        if self.path == "/409wb":
+            self.send_header("X-Reason", "wrong build")
         self.send_header("Content-Length", "0")
         self.end_headers()
     def log_message(self, *a):
@@ -3049,6 +3468,12 @@ check("dashboard answers: 401 with a token is answered · sent", c.post_answer(a
 check("dashboard answers: 500 is not sent", c.post_answer(abase + "/500", ab).startswith("not sent:"))
 check("dashboard answers: an X-Reason header is shown next to the reason", c.post_answer(abase + "/400", ab) == "not sent: bad request (kind)")
 check("dashboard answers: the POST waits up to 20 s", c.ANSWER_TIMEOUT == 20)
+# v0.81: the receiver refuses a look answer from another build with 409 and X-Reason: wrong build.
+_wb = c.post_answer(abase + "/409wb", ab)
+check("dashboard answers: 409 with X-Reason wrong build is not sent: wrong build, with Retry",
+      _wb == "not sent: wrong build" and c.answer_needs_retry(_wb) and c.answer_state_class(_wb) == "po-fail", _wb)
+check("dashboard answers: answer_state 409 without the wrong build reason stays already answered",
+      c.answer_state(409, "other") == "already answered" and c.answer_state(409, "wrong build") == "not sent: wrong build")
 check("dashboard answers: a connection failure is not sent", c.post_answer("http://127.0.0.1:1/", ab).startswith("not sent:"))
 asrv.shutdown()
 asrv.server_close()
@@ -3224,8 +3649,8 @@ for name, text in (("not JSON", "{oops"), ("a JSON object", '{"project":"p"}')):
         check("dashboard projects: %s is a DashboardError" % name, True)
 st = lambda *words: [{"status": w} for w in words]
 check("dashboard projects: PAUSED and BLOCKED count as DOING, HELD counts nowhere",
-      c.project_counts(st("TODO", "DOING", "PAUSED", "BLOCKED", "DONE", "HELD", "", "weird")) == {"todo": 1, "doing": 3, "done": 1})
-check("dashboard projects: an empty or missing item list counts zero", c.project_counts([]) == c.project_counts(None) == {"todo": 0, "doing": 0, "done": 0})
+      c.project_counts(st("TODO", "DOING", "PAUSED", "BLOCKED", "DONE", "HELD", "", "weird")) == {"todo": 1, "doing": 3, "done": 1, "released": 0})
+check("dashboard projects: an empty or missing item list counts zero", c.project_counts([]) == c.project_counts(None) == {"todo": 0, "doing": 0, "done": 0, "released": 0})
 pnow = datetime.datetime(2026, 10, 26, 12, 0, 0, tzinfo=utc)
 ago = lambda **kw: (pnow - datetime.timedelta(**kw)).strftime("%Y-%m-%dT%H:%M:%SZ")
 check("dashboard projects: the light thresholds are 30 minutes and 24 hours", c.PROJECT_ACTIVE_MINUTES == 30 and c.PROJECT_IDLE_HOURS == 24)
@@ -3243,13 +3668,27 @@ fl = lambda f: [x["item"] for x in c.filter_items(fi, f)]
 check("dashboard projects: All keeps every item in the feed's order, HELD included", fl("All") == list("abcdef"))
 check("dashboard projects: TODO and DONE keep the feed's order", fl("TODO") == ["a", "f"] and fl("DONE") == ["b"])
 check("dashboard projects: DOING includes PAUSED and BLOCKED, not HELD", fl("DOING") == ["c", "e"])
+_nc = [{"item": "57", "status": "DONE (no change needed: x)"}, {"item": "58", "status": "held: later"}, {"item": "59", "status": "doing."}, {"item": "60", "status": "todo"}]
+check("dashboard projects: status_word is the first word, upper-cased, punctuation stripped",
+      c.status_word("DONE (no change needed: x)") == "DONE" and c.status_word("doing") == "DOING" and c.status_word("DONE:") == "DONE" and c.status_word("") == c.status_word(None) == "")
+check("dashboard projects: `DONE (no change needed: x)` counts as DONE and shows under the DONE filter",
+      c.project_counts(_nc)["done"] == 1 and [x["item"] for x in c.filter_items(_nc, "done")] == ["57"])
+check("dashboard projects: lowercase and a trailing colon count by the status word", c.project_counts(_nc) == {"todo": 1, "doing": 1, "done": 1, "released": 0} and [x["item"] for x in c.filter_items(_nc, "doing")] == ["59"])
+check("dashboard projects: HELD counts in All only and counts_add_up names it", [x["item"] for x in c.filter_items(_nc, "all")] == ["57", "58", "59", "60"] and [x["item"] for x in c.counts_add_up(_nc)] == ["58"])
+check("dashboard projects: the not-in-a-filter line names the items, empty when none", c.not_in_filter_line(_nc) == "1 not in a filter: 58" and c.not_in_filter_line(_nc[:1]) == "" and c.counts_add_up(None) == [])
+_feed = [{"status": w} for w in ["TODO"] * 2 + ["DOING"] + ["DONE"] * 3 + ["DONE (no change needed: y)", "HELD"]]
+_fc = c.project_counts(_feed)
+check("dashboard projects: the feed shape, todo + doing + done + unlisted = All", _fc["todo"] + _fc["doing"] + _fc["done"] + len(c.counts_add_up(_feed)) == len(_feed) == 8)
+_sr = c.project_screen({"project": "p", "items": _nc}, "all", pnow)
+check("dashboard project screen: a row keeps the full status, word and muted note, and the screen carries the lost line",
+      _sr["rows"][0]["status"] == "DONE" and _sr["rows"][0]["note"] == "(no change needed: x)" and _sr["rows"][0]["full"] == "DONE (no change needed: x)" and _sr["lost"] == "1 not in a filter: 58")
 check("dashboard projects: the list given is not changed", [x["item"] for x in fi] == list("abcdef"))
 pf = c.parse_projects(open(sys.argv[1] + "/../../examples/projects-feed.json").read())
 pcl = c.project_check_lines(pf, datetime.datetime(2026, 10, 26, 1, 10, 0, tzinfo=utc))
 check("dashboard projects: the example feed has one project per light, items in every status",
       [l.split(" | ")[1] for l in pcl] == ["active", "idle", "inactive"] and {i["status"] for p in pf for i in p["items"]} >= {"TODO", "DOING", "PAUSED", "HELD", "DONE"})
 check("dashboard projects: the example's DONE agents are in order", [i["agents"] for i in pf[0]["items"] if i["status"] == "DONE"] == [["dee", "cy", "ana"]])
-check("dashboard projects: --check prints name, light and todo/doing/done", pcl[0] == "orchard | active | 1/1/1" and pcl[1] == "harbor | idle | 0/1/0")
+check("dashboard projects: --check prints name, light, todo/doing/done/released, the release and open setup steps", pcl == ["orchard | active | 1/1/1/0 | release-3 | setup open 2", "harbor | idle | 0/1/0/0 | no release", "meadow | inactive | 0/0/1/1 | v2.1 | setup open 1"])
 _pn = datetime.datetime(2026, 10, 26, 1, 10, 0, tzinfo=utc)
 _st0 = c.project_view_state()
 check("dashboard project screen: the state starts on the overview with no filters", _st0 == {"open": None, "filters": {}})
@@ -3267,8 +3706,8 @@ check("dashboard project screen: a project that left the feed returns to the ove
 check("dashboard project screen: no feed yet keeps nothing open", c.project_state_reconcile(_st2, None)["open"] is None)
 _ps = c.project_screen(pf[0], "all", _pn)
 check("dashboard project screen: the header has the name and the light in words", _ps["name"] == "orchard" and _ps["light"] == "active" and "active" in _ps["text"])
-check("dashboard project screen: filter buttons are All, TODO, DOING, DONE with their counts", [(f["label"], f["count"]) for f in _ps["filters"]] == [("All", 3), ("TODO", 1), ("DOING", 1), ("DONE", 1)])
-check("dashboard project screen: HELD counts in All only", [(f["label"], f["count"]) for f in c.project_screen(pf[1], "all", _pn)["filters"]] == [("All", 2), ("TODO", 0), ("DOING", 1), ("DONE", 0)])
+check("dashboard project screen: filter buttons are All, TODO, DOING, DONE, RELEASED with their counts", [(f["label"], f["count"]) for f in _ps["filters"]] == [("All", 3), ("TODO", 1), ("DOING", 1), ("DONE", 1), ("RELEASED", 0)])
+check("dashboard project screen: HELD counts in All only", [(f["label"], f["count"]) for f in c.project_screen(pf[1], "all", _pn)["filters"]] == [("All", 2), ("TODO", 0), ("DOING", 1), ("DONE", 0), ("RELEASED", 0)])
 check("dashboard project screen: rows are in the feed's order with id, title and status badge", [(r["item"], r["title"], r["status"]) for r in _ps["rows"]] == [("3.1", "Plant", "TODO"), ("3.2", "Water", "DOING"), ("3.3", "Harvest", "DONE")])
 check("dashboard project screen: TODO lists the agents that could take it", _ps["rows"][0]["agents"] == ["ana", "ben"] and not _ps["rows"][0]["live"])
 check("dashboard project screen: DOING marks the current agent live", _ps["rows"][1]["agents"] == ["cy"] and _ps["rows"][1]["live"])
@@ -3294,11 +3733,46 @@ check("dashboard projects: a failed first fetch has no data and the plain reason
 os.rmdir(pdir)
 # The Projects card (v0.38): the text a card's tooltip and accessible label carry names the light in words.
 _pc = c.project_card(pf[0], pnow)
-check("dashboard projects: a card carries name, light and the three counts", _pc["name"] == pf[0]["project"] and _pc["light"] in ("active", "idle", "inactive") and sorted(_pc["counts"]) == ["doing", "done", "todo"])
+check("dashboard projects: a card carries name, light and the four counts", _pc["name"] == pf[0]["project"] and _pc["light"] in ("active", "idle", "inactive") and sorted(_pc["counts"]) == ["doing", "done", "released", "todo"])
 _pl = {"project": "p", "last_event": "2026-10-26T11:50:00Z", "items": [{"item": "1", "status": "TODO"}, {"item": "2", "status": "DOING"}, {"item": "3", "status": "DONE"}, {"item": "4", "status": "DONE"}]}
-check("dashboard projects: the card text names the light in words, not only colour", c.project_card(_pl, pnow)["text"] == "p, active, TODO 1, DOING 1, DONE 2")
+check("dashboard projects: the card text names the light in words, not only colour", c.project_card(_pl, pnow)["text"] == "p, active, TODO 1, DOING 1, DONE 2, RELEASED 0, no release")
 check("dashboard projects: the card text names an idle and an inactive light too", ", idle," in c.project_card(dict(_pl, last_event="2026-10-26T01:00:00Z"), pnow)["text"] and ", inactive," in c.project_card(dict(_pl, last_event=None), pnow)["text"])
-check("dashboard projects: a card for an entry with no items counts zero", c.project_card({"project": "q"}, pnow)["text"] == "q, inactive, TODO 0, DOING 0, DONE 0")
+check("dashboard projects: a card for an entry with no items counts zero", c.project_card({"project": "q"}, pnow)["text"] == "q, inactive, TODO 0, DOING 0, DONE 0, RELEASED 0, no release")
+# v0.83: RELEASED and the release label.
+_rp = c.parse_projects('[{"project":"p","release":"release-2","items":[{"item":"1","status":"DONE","released":true},{"item":"2","status":"DONE","released":true,"setup_open":2},{"item":"3","status":"DONE"},{"item":"4","status":"TODO","released":true},{"item":"5","status":"DONE (no change needed: x)","released":true},{"item":"6","status":"HELD"}]},{"project":"q","release":7,"items":[{"item":"1","status":"DONE","released":"yes","setup_open":"x"}]},{"project":"r","release":""}]')
+check("dashboard released: parse keeps release, released and setup_open", _rp[0]["release"] == "release-2" and _rp[0]["items"][0]["released"] is True and _rp[0]["items"][1]["setup_open"] == 2 and _rp[0]["items"][2]["released"] is False and _rp[0]["items"][2]["setup_open"] == 0)
+check("dashboard released: a wrong-typed or empty release, released or setup_open reads as absent", _rp[1]["release"] is None and _rp[2]["release"] is None and _rp[1]["items"][0]["released"] is False and _rp[1]["items"][0]["setup_open"] == 0)
+check("dashboard released: released_items is DONE + released + no setup step open, in feed order", [x["item"] for x in c.released_items(_rp[0]["items"])] == ["1", "5"] and c.released_items(None) == [])
+check("dashboard released: setup_open absent counts as none open (the v0.84 stub)", c.setup_open({"status": "DONE"}) == 0 and c.setup_open({"setup_open": True}) == 0 and c.setup_open({"setup_open": 3}) == 3)
+check("dashboard released: a released item with setup open stays DONE", c.item_word(_rp[0]["items"][1]) == "DONE" and c.item_word(_rp[0]["items"][0]) == "RELEASED" and c.item_word(_rp[0]["items"][3]) == "TODO")
+_rc = c.project_counts(_rp[0]["items"])
+check("dashboard released: counts move released items out of DONE", _rc == {"todo": 1, "doing": 0, "done": 2, "released": 2})
+check("dashboard released: the filters add up to All with RELEASED and a HELD item",
+      _rc["todo"] + _rc["doing"] + _rc["done"] + _rc["released"] + len(c.counts_add_up(_rp[0]["items"])) == len(_rp[0]["items"]) and c.not_in_filter_line(_rp[0]["items"]) == "1 not in a filter: 6")
+check("dashboard released: the RELEASED filter sits right after DONE", [k for _l, k in c.PROJECT_FILTERS] == ["all", "todo", "doing", "done", "released"])
+check("dashboard released: the RELEASED filter lists released items, DONE the rest", [x["item"] for x in c.filter_items(_rp[0]["items"], "released")] == ["1", "5"] and [x["item"] for x in c.filter_items(_rp[0]["items"], "done")] == ["2", "3"])
+_rs = c.project_screen(_rp[0], "all", pnow)
+check("dashboard released: the screen row shows RELEASED, and `released, setup N open` muted on a DONE row with steps open",
+      [r["status"] for r in _rs["rows"]] == ["RELEASED", "DONE", "DONE", "TODO", "RELEASED", "HELD"] and _rs["rows"][1]["note"] == "released, setup 2 open" and _rs["rows"][2]["note"] == "" and _rs["rows"][4]["note"] == "(no change needed: x)")
+check("dashboard released: a status note and the setup-open note go together", c.project_screen({"project": "p", "items": [{"item": "1", "status": "DONE (tag v1)", "released": True, "setup_open": 1}]}, "all", pnow)["rows"][0]["note"] == "(tag v1), released, setup 1 open")
+check("dashboard released: the screen filter counts include RELEASED", [(f["label"], f["count"]) for f in _rs["filters"]] == [("All", 6), ("TODO", 1), ("DOING", 0), ("DONE", 2), ("RELEASED", 2)])
+check("dashboard released: release_label gives the name, plain", c.release_label(_rp[0]) == {"text": "release-2", "muted": False} and c.release_label({"release": " v1.8.2 "}) == {"text": "v1.8.2", "muted": False})
+check("dashboard released: release_label is a muted `no release` for null, absent, empty or not a string",
+      all(c.release_label(x) == {"text": "no release", "muted": True} for x in ({"release": None}, {}, {"release": ""}, {"release": "  "}, {"release": 3}, None)))
+check("dashboard released: the card and the screen carry the label, the card text names it", c.project_card(_rp[0], pnow)["release"] == c.release_label(_rp[0]) and _rs["release"]["text"] == "release-2" and c.project_card(_rp[0], pnow)["text"].endswith(", RELEASED 2, release-2, setup open 2"))
+_sp = {"project": "p", "last_event": None, "items": [{"item": "1", "status": "DONE", "setup_open": 2}, {"item": "2", "status": "DONE", "released": True, "setup_open": 1}, {"item": "3", "status": "TODO"}]}
+check("dashboard setup: setup_badge is `setup N open`, None when no step is open",
+      c.setup_badge({"setup_open": 2}) == "setup 2 open" and c.setup_badge({"setup_open": 1}) == "setup 1 open" and c.setup_badge({}) is None and c.setup_badge({"setup_open": "x"}) is None)
+check("dashboard setup: project_setup_open sums the items' open steps", c.project_setup_open(_sp) == 3 and c.project_setup_open({"project": "q"}) == 0 and c.project_setup_open(None) == 0)
+_ss = c.project_screen(_sp, "all", pnow)
+check("dashboard setup: a screen row with steps open carries its badge; a released one says the count in its note instead",
+      [r["setup"] for r in _ss["rows"]] == ["setup 2 open", None, None] and _ss["rows"][1]["note"] == "released, setup 1 open")
+_sc = c.project_card(_sp, pnow)
+check("dashboard setup: the card counts the open steps in a muted line and its text", _sc["setup"] == "setup open 3" and _sc["text"].endswith(", no release, setup open 3"))
+check("dashboard setup: a project without open steps has no setup line, its text unchanged",
+      c.project_card({"project": "q"}, pnow)["setup"] == "" and c.project_card({"project": "q"}, pnow)["text"] == "q, inactive, TODO 0, DOING 0, DONE 0, RELEASED 0, no release")
+check("dashboard setup: --check adds ` | setup open N` only when steps are open",
+      c.project_check_lines([_sp, {"project": "q", "last_event": None, "items": []}], pnow) == ["p | inactive | 1/0/2/0 | no release | setup open 3", "q | inactive | 0/0/0/0 | no release"])
 check("dashboard projects: the three lights have a colour class in both themes", all(".po-light-%s" % l in c.css_properties(c.css(v)) for l in ("active", "idle", "inactive") for v in ("light", "dark")))
 check("dashboard projects: the lights are green, yellow and red, three different colours", len({c.css_properties(c.css("light"))[".po-light-%s" % l]["color"] for l in ("active", "idle", "inactive")}) == 3)
 srv_proc = subprocess.Popen([sys.executable, "-I", sys.argv[1] + "/../../examples/events-demo-server.py", "--port", "0"], stdout=subprocess.PIPE, text=True)
@@ -3310,9 +3784,283 @@ try:
 finally:
     srv_proc.kill()
     srv_proc.wait()
+# v0.75 prune_records
+ev0 = [{"time":"t1","item":"a"}]
+k0 = c.event_key(ev0[0])
+pr = c.prune_records({k0}, {k0: 5.0}, ev0, 5.0)
+check("prune_records: kept event keeps born", pr == ({k0}, {k0: 5.0}))
+pr2 = c.prune_records({k0}, {k0: 5.0}, [], 5.0)
+check("prune_records: left the feed drops", pr2 == (set(), {}))
+pr3 = c.prune_records(None, {}, ev0, 5.0)
+check("prune_records: seen None safe", pr3[0] == {k0})
+pr4 = c.prune_records({k0}, {k0: 0.0}, ev0, 100.0)
+check("prune_records: expired born dropped", pr4 == ({k0}, {}))
+pr5 = c.prune_records(set(), {}, [], 1.0)
+check("prune_records: empty", pr5 == (set(), {}))
+
+# v0.76 paging and the card diff
+_pe = [{"time": "2026-01-01T%02d:%02d:00Z" % (i // 60, i % 60), "item": str(i)} for i in range(120)]
+check("page_events: under the page size holds all", len(c.page_events(_pe[:30], 50)) == 30)
+check("page_events: exactly the page size holds all", len(c.page_events(_pe[:50], 50)) == 50)
+check("page_events: over the page size is cut at it", c.page_events(_pe, 50) == _pe[:50])
+check("page_events: a second page holds 100", c.page_events(_pe, 100) == _pe[:100])
+check("page_events: empty is empty", c.page_events([], 50) == [])
+check("shown_events: Show all pages after the sort (newest first by default)", [e["item"] for e in c.shown_events(_pe, True, None, 50)[0]][:2] == ["119", "118"] and c.shown_events(_pe, True, None, 50)[1] == 120)
+check("shown_events: a sort applies to the whole set before the page", c.shown_events(_pe, True, ("time", False), 50)[0][0]["item"] == "0")
+check("shown_events: Show all off is the last 10", len(c.shown_events(_pe, False, None, 50)[0]) == 10)
+check("events_status: Show all says N of M", c.events_status(50, 120, True) == "50 of 120 events \u00b7 all" and c.events_status(7, 7, True) == "7 of 7 events \u00b7 all")
+check("events_status: Show all off is unchanged", c.events_status(10, 120, False) == "120 events \u00b7 last 10")
+check("diff_cards: new and gone keys", c.diff_cards(["a", "b"], ["b", "c"]) == (["c"], ["a"]))
+check("diff_cards: same keys is nothing", c.diff_cards(["a", "b"], ["b", "a"]) == ([], []))
+check("diff_cards: first fill adds all, empty drops all", c.diff_cards([], ["a"]) == (["a"], []) and c.diff_cards(["a"], []) == ([], ["a"]))
+_ci, _dropped = c.CardIndex(), []
+_evs = [{"time": "t%d" % i} for i in range(5)]
+_keys = [c.event_key(e) for e in _evs]
+_ci.sync(_keys, lambda k: object(), _dropped.append)
+_first = dict(_ci.cards)
+check("CardIndex: the first fetch builds one card per key", _ci.built == 5)
+_ci.sync(list(_keys), lambda k: object(), _dropped.append)
+check("CardIndex: a refresh with an unchanged feed builds zero cards", _ci.built == 5 and _dropped == [] and _ci.cards == _first)
+_k6 = c.event_key({"time": "t9"})
+_ci.sync([_k6] + _keys[:-1], lambda k: object(), _dropped.append)
+check("CardIndex: one new and one gone builds one and drops one, reusing the rest", _ci.built == 6 and _dropped == [_first[_keys[-1]]] and all(_ci.cards[k] is _first[k] for k in _keys[:-1]))
+
+# memory log line
+line = c.memory_log_line("2026-01-01T00:00:00Z", 12, 3, 4, 5, 6)
+check("memory log line format", "12MB" in line and "3 events" in line and "4 cards" in line and "seen=5" in line and "born=6" in line)
+
+# memory log line with None rss
+line2 = c.memory_log_line("2026-01-01T00:00:00Z", None, 3, 4, 5, 6)
+check("memory log line None rss", "?" in line2)
+
+# cap drops oldest half
+d2 = tempfile.mkdtemp()
+path2 = os.path.join(d2, "memory.log")
+c.memory_log_append(path2, "FIRSTLINE")
+# pad to force cap
+c.memory_log_append(path2, "x" * 1100000)
+content2 = open(path2).read()
+check("memory log cap drops oldest", "FIRSTLINE" not in content2 and content2.endswith("\n"))
+
+# many short lines
+d3 = tempfile.mkdtemp()
+path3 = os.path.join(d3, "memory.log")
+for i in range(600):
+    c.memory_log_append(path3, "line %d %s" % (i, "a"*50), cap=20000)
+content3 = open(path3, "rb").read()
+check("memory log many lines cap", len(content3) <= 20000)
+check("memory log many lines last present", b"line 599" in content3 and b"line 0 " not in content3)
+
+
+# write failure returns False
+# make notadir a file
+with open(os.path.join(d2, "notadir"), "w") as f:
+    f.write("x")
+try:
+    r = c.memory_log_append(os.path.join(d2, "notadir", "x"), "line")
+    check("memory log write failure", r is False)
+except Exception:
+    check("memory log write failure", False)
+
+
+
+# ---- v0.77: the archive in the dashboard ----
+_lv = [{"time": "2026-10-30T10:00:00Z", "kind": "open", "item": "1"}, {"time": "2026-10-29T10:00:00Z", "kind": "open", "item": "2"}]
+_ar = [{"time": "2026-09-01T10:00:00Z", "kind": "open", "item": "7"}, {"time": "2026-10-29T10:00:00Z", "kind": "open", "item": "2"}, {"time": "2026-09-02T10:00:00Z", "kind": "close", "item": "7"}]
+_w = c.with_archive(_lv, _ar)
+check("with_archive: live plus archive, newest first, an event in both once", [e["item"] for e in _w] == ["1", "2", "7", "7"] and len(_w) == 4)
+check("with_archive: no archive is the live events sorted", c.with_archive(_lv, None) == _lv and c.with_archive([], []) == [])
+check("with_archive: an archive alone", len(c.with_archive([], _ar)) == 3)
+check("archive_only: the archived events that are not live, newest first", [e["time"] for e in c.archive_only(_lv, _ar)] == ["2026-09-02T10:00:00Z", "2026-09-01T10:00:00Z"])
+_lv40 = [{"time": "2026-10-%02dT10:00:00Z" % (i % 28 + 1), "kind": "stamp", "item": "L%d" % i} for i in range(60)]
+_ar40 = [{"time": "2026-08-%02dT10:00:00Z" % (i % 28 + 1), "kind": "stamp", "item": "A%d" % i} for i in range(60)]
+_sh, _held = c.shown_events(_lv40, True, None, 50, archive=_ar40)
+check("shown_events: live events fill the first pages and the archive follows, held counts both", _held == 120 and all(e["item"].startswith("L") for e in _sh) and len(_sh) == 50)
+_sh, _held = c.shown_events(_lv40, True, None, 100, archive=_ar40)
+check("shown_events: the second page reaches the archive, below every live event", [e["item"][0] for e in _sh] == ["L"] * 60 + ["A"] * 40)
+_sh, _held = c.shown_events(_lv40, True, ("item", False), 120, archive=_ar40)
+check("shown_events: a sort sorts live and archive apart, the archive stays below", [e["item"][0] for e in _sh] == ["L"] * 60 + ["A"] * 60)
+_sh, _held = c.shown_events(_lv40, False, None, 50, archive=_ar40)
+check("shown_events: with Show all off the archive is not shown", len(_sh) == 10 and _held == 10)
+_sh, _held = c.shown_events(_lv40, True, None, 50)
+check("shown_events: no archive is the live events paged: first L27, 50 shown, held 60", _held == 60 and len(_sh) == 50 and all(e["item"].startswith("L") for e in _sh) and _sh[0]["item"] == "L27")
+check("shown_events: an empty archive is the same as none", c.shown_events(_lv40, True, None, 50, archive=[]) == c.shown_events(_lv40, True, None, 50))
+check("report_plan: the 24 h and 7 d ranges never need the archive", [c.report_plan(s, "u", None) for s in (86400, 7 * 86400)] == ["live", "live"])
+check("report_plan: 30 d with no archive url is unconfigured", c.report_plan(30 * 86400, None, None) == "unconfigured")
+check("report_plan: 30 d with a url and nothing fetched says fetch", c.report_plan(30 * 86400, "u", None) == "fetch")
+check("report_plan: 30 d with the archive fetched is merged", c.report_plan(30 * 86400, "u", []) == "merged")
+check("report_events: 24 h and 7 d read the live events only", c.report_events(_lv, _ar, 7 * 86400) == _lv and c.report_events(_lv, _ar, 86400) == _lv)
+check("report_events: 30 d reads live plus archive", len(c.report_events(_lv, _ar, 30 * 86400)) == 4)
+check("report_events: 30 d without the archive reads live", c.report_events(_lv, None, 30 * 86400) == _lv)
+check("archive url: unset is None, set is kept, a bad one is an error",
+      c.resolve_archive_url(None, {}) is None and c.resolve_archive_url("http://x/archive.json", {}) == "http://x/archive.json"
+      and c.resolve_archive_url(None, {"PO_DASHBOARD_ARCHIVE_URL": "http://y/a"}) == "http://y/a"
+      and c.resolve_archive_url("http://z/a", {"PO_DASHBOARD_ARCHIVE_URL": "http://y/a"}) == "http://z/a")
+try:
+    c.resolve_archive_url("nope", {})
+    check("archive url: a bad one is an error", False)
+except c.DashboardError:
+    check("archive url: a bad one is an error", True)
+import dashboard_reports as rep77
+_n = c.parse_time("2026-10-31T12:00:00Z")
+_g = lambda evs: rep77.reports(evs, 30 * 86400, _n)[0][1]
+_stamp = lambda t, i: {"time": t, "kind": "stamp", "item": i, "project": "p", "result": "pass", "agent": "ada", "legs": [], "detail": ""}
+_L = [_stamp("2026-10-30T10:00:00Z", "1")]
+_A = [_stamp("2026-10-15T10:00:00Z", "2"), _stamp("2026-10-05T10:00:00Z", "3")]
+check("reports 30 d: the aggregation reads live plus archive; live alone leaves the older runs out",
+      len(c.in_range(c.report_events(_L, _A, 30 * 86400), 30 * 86400, _n)) == 3 and len(c.in_range(c.report_events(_L, None, 30 * 86400), 30 * 86400, _n)) == 1
+      and _g(c.report_events(_L, _A, 30 * 86400))["total"] == 3 and _g(_L)["total"] == 1)
+check("reports 7 d: the archive never changes the 7 d aggregation", rep77.reports(c.report_events(_L, _A, 7 * 86400), 7 * 86400, _n)[0][1] == rep77.reports(_L, 7 * 86400, _n)[0][1])
+
+
 print("BLOCK-END dashboard-core")
+
 PY
 
+# v0.87: the feeds are fetched conditionally (ETag, 304, ?since=) and never twice at once.
+block dashboard-feeds python3 -B -I - "$DBLIB" "$DB" "$(dirname "$PO")/../README.md" <<'PY'
+import hashlib, http.server, json, os, subprocess, sys, tempfile, threading, time
+sys.path.insert(0, sys.argv[1])
+import dashboard_core as c
+
+def check(name, cond, detail=""):
+    print("%s\t%s\t%s" % ("ok" if cond else "FAIL", name, str(detail).replace("\n", " | ")))
+
+class Srv(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+
+def serve(handler):
+    srv = Srv(("127.0.0.1", 0), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, "http://127.0.0.1:%d/events.json" % srv.server_address[1]
+
+# A slow feed: each answer takes 0.4 s; the server counts the requests running at once.
+state = {"now": 0, "max": 0, "hits": 0}
+lock = threading.Lock()
+class Slow(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        with lock:
+            state["now"] += 1; state["hits"] += 1; state["max"] = max(state["max"], state["now"])
+        time.sleep(0.4)
+        body = b"[]"
+        self.send_response(200); self.send_header("Content-Length", "2"); self.end_headers(); self.wfile.write(body)
+        with lock:
+            state["now"] -= 1
+    def log_message(self, *a): pass
+srv, url = serve(Slow)
+feed = c.Feed(url)
+started = skipped = 0
+for _ in range(30):  # a tick every 0.05 s for 1.5 s, much faster than the feed answers
+    if feed.start(feed.load, c.parse_events):
+        started += 1
+    else:
+        skipped += 1
+    time.sleep(0.05)
+deadline = time.time() + 3
+while feed.busy and time.time() < deadline:
+    time.sleep(0.05)
+check("feeds: a slow feed never has two fetches in flight", state["max"] == 1 and state["hits"] == started, state)
+check("feeds: a tick while the feed's fetch is in flight is skipped, and the feed is free again after", skipped > 20 and 2 <= started <= 6 and not feed.busy, (started, skipped))
+srv.shutdown()
+def quiet_load(f):
+    try:
+        f.load(c.parse_events, timeout=1)
+    except c.DashboardError:
+        pass
+gone = c.Feed("http://127.0.0.1:9/x.json")
+gone_started = gone.start(quiet_load, gone)
+deadline = time.time() + 3
+while gone.busy and time.time() < deadline:
+    time.sleep(0.05)
+check("feeds: a fetch that fails still frees the feed", gone_started and not gone.busy)
+
+# An ETag feed: 304 when If-None-Match matches.
+seen = []
+body = {"v": json.dumps([{"time": "2026-11-01T01:00:00Z", "item": "1"}])}
+class Tagged(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        b = body["v"].encode()
+        tag = '"%s"' % hashlib.sha256(b).hexdigest()[:12]
+        seen.append(self.headers.get("If-None-Match"))
+        if self.headers.get("If-None-Match") == tag:
+            self.send_response(304); self.send_header("ETag", tag); self.end_headers(); return
+        self.send_response(200); self.send_header("ETag", tag); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+    def log_message(self, *a): pass
+srv, url = serve(Tagged)
+parsed = []
+def parse(t):
+    parsed.append(t)
+    return c.parse_events(t)
+feed = c.Feed(url)
+first = feed.load(parse)
+second = feed.load(parse)
+check("feeds: the first fetch sends no If-None-Match and is the whole feed", seen[0] is None and first[0] is True and first[1][0]["item"] == "1" and first[2] is False, (seen, first))
+check("feeds: a fetch sends If-None-Match with the ETag last accepted", seen[1] is not None and seen[1] == feed.etag, seen)
+check("feeds: 304 leaves the data untouched (no data back, the body not parsed again)", second == (False, None, False) and len(parsed) == 1, (second, len(parsed)))
+body["v"] = json.dumps([{"time": "2026-11-01T02:00:00Z", "item": "2"}])
+third = feed.load(parse)
+check("feeds: a changed feed answers 200 with the new data and a new ETag", third[0] is True and third[1][0]["item"] == "2" and len(parsed) == 2, third)
+fp = c.Feed(url)
+def bad(t):
+    raise c.DashboardError("not JSON")
+try:
+    fp.load(bad)
+except c.DashboardError:
+    pass
+check("feeds: an ETag is kept only once the body parsed, so a bad body is fetched whole again", fp.etag is None)
+last = [{"project": "kept"}]
+pfeed = c.Feed(url)
+pfeed.load(lambda t: t)
+got, note = c.load_projects(url, last, pfeed)
+check("feeds: load_projects with a Feed keeps the last projects on 304", got is last and note == "", (got, note))
+srv.shutdown()
+with tempfile.TemporaryDirectory() as td:
+    with open(os.path.join(td, "events.json"), "w") as fh:
+        fh.write("[]")
+    ffile = c.Feed("file://" + os.path.join(td, "events.json"))
+    check("feeds: a feed without ETag (a file) is fetched whole each time", ffile.load(c.parse_events)[0] and ffile.load(c.parse_events)[0] and ffile.etag is None and not ffile.since_ok)
+
+# ?since=: only when the server offers it, the newest time held, whole every FULL_EVERY-th fetch.
+evs = [{"time": "2026-11-01T01:00:00Z", "item": "a"}, {"time": "2026-11-01T03:00:00Z", "item": "b"}, {"time": "2026-11-01T02:00:00Z", "item": "c"}]
+f = c.Feed("http://h/events.json")
+check("feeds: no ?since= while the server has not offered it", f.since_for(evs) is None)
+f.since_ok, f.fetches = True, 1
+check("feeds: ?since= is the newest event time held once offered", f.since_for(evs) == "2026-11-01T03:00:00Z")
+check("feeds: no ?since= with nothing held", f.since_for([]) is None)
+f.fetches = c.FULL_EVERY
+check("feeds: every FULL_EVERY-th fetch is whole", f.since_for(evs) is None and c.FULL_EVERY == 60)
+check("feeds: feed_url_since adds since to the query", c.feed_url_since("http://h/e.json", "2026-11-01T03:00:00Z") == "http://h/e.json?since=2026-11-01T03%3A00%3A00Z"
+      and c.feed_url_since("http://h/e.json?x=1", "t") == "http://h/e.json?x=1&since=t")
+m = c.merge_since(evs, [evs[1], {"time": "2026-11-01T04:00:00Z", "item": "d"}])
+check("feeds: merge_since adds only the events not held", [e["item"] for e in m] == ["a", "b", "c", "d"] and c.merge_since(evs, []) == evs)
+
+# The demo server: ETag, 304, X-Po-Since full and partial, through Feed.
+proc = subprocess.Popen([sys.executable, "-I", sys.argv[1] + "/../../examples/events-demo-server.py", "--port", "0", "--every", "999"], stdout=subprocess.PIPE, text=True)
+try:
+    port = int(proc.stdout.readline().split("127.0.0.1:")[1].split("/")[0])
+    df = c.Feed("http://127.0.0.1:%d/events.json" % port)
+    whole = df.load(c.parse_events)
+    check("feeds: the demo server's events carry an ETag and X-Po-Since: full", whole[0] and whole[2] is False and df.etag and df.since_ok, df.etag)
+    check("feeds: the demo server answers a matching If-None-Match with 304", df.load(c.parse_events) == (False, None, False))
+    newest = df.since_for(whole[1]) or max(e["time"] for e in whole[1])
+    df.etag = None
+    part = df.load(c.parse_events, newest)
+    check("feeds: the demo server answers ?since= with the events since, marked partial", part[0] and part[2] is True and 0 < len(part[1]) < len(whole[1]) and all(e["time"] >= newest for e in part[1]), len(part[1]))
+finally:
+    proc.kill()
+    proc.wait()
+
+db = open(sys.argv[2]).read()
+check("po-dashboard starts each feed's fetch through Feed.start (no bare fetch thread per tick)",
+      "threading.Thread(target=self.fetch_worker" not in db and 'feeds["events"].start(self.fetch_worker' in db
+      and 'feeds["team"].start(self.team_worker)' in db and 'feeds["decisions"].start(self.decisions_worker)' in db and 'feeds["projects"].start(self.projects_worker)' in db)
+readme = open(sys.argv[3]).read()
+check("README documents the in-flight skip, If-None-Match/304 and ?since=",
+      "still in flight skips that tick" in readme and "If-None-Match" in readme and "304 Not Modified" in readme and "?since=<time>" in readme and "X-Po-Since" in readme)
+print("BLOCK-END dashboard-feeds")
+PY
+
+grep -q '"unconfigured": core.REPORT_NO_ARCHIVE' "$DB" && ok "po-dashboard shows the not-configured note for the unconfigured plan" || bad "dashboard report note wiring"
 grep -q 'sort by %s' "$DB" && grep -q 'Gtk.Button' "$DB" && ok "po-dashboard headers are buttons labelled sort by <column>" || bad "dashboard header buttons"
 # bin/po-dashboard: argument handling needs no display.
 out=$(env -u PO_DASHBOARD_URL python3 -B "$DB" 2>&1)
@@ -3349,6 +4097,14 @@ out=$(env -u PO_DASHBOARD_TEAM_URL python3 -B "$DB" --url "$CHK_URL" --check 2>&
 	[[ $(head -1 <<<"$out") == "1.11 | demo | stamp | "* ]] && ok "po-dashboard --check prints the last 10 rows, newest first" || bad "dashboard check" "$out"
 out=$(python3 -B "$DB" --url "$CHK_URL" --check --all 2>&1)
 [[ $(wc -l <<<"$out") == 12 ]] && ok "po-dashboard --check --all prints every event" || bad "dashboard check all" "$out"
+# --check exits before the window exists, so the 60 s timer never runs and no run writes the log here:
+# the flag is proved by the empty state dir plus the one place that arms the timer being guarded by it.
+mkdir -p "$TMP/xdg-state"
+out=$(XDG_STATE_HOME="$TMP/xdg-state" python3 -B "$DB" --url "$CHK_URL" --check --no-memory-log 2>&1)
+[[ $(wc -l <<<"$out") == 10 && -z $(find "$TMP/xdg-state" -type f) ]] &&
+	grep -q 'if not getattr(a, "no_memory_log", False):' "$DB" && grep -A1 'if not getattr(a, "no_memory_log", False):' "$DB" | grep -q 'timeout_add_seconds(60, self.log_memory)' &&
+	ok "po-dashboard --check --no-memory-log is accepted, writes no memory log, and guards the 60 s timer" || bad "dashboard no-memory-log" "$out"
+[[ $(python3 -B "$DB" --help 2>&1) == *--no-memory-log* ]] && ok "po-dashboard --help lists --no-memory-log" || bad "dashboard help no-memory-log"
 out=$(PO_DASHBOARD_TEAM_URL="$TMP/team.json" python3 -B "$DB" --url "$CHK_URL" --check 2>&1)
 [[ $(tail -2 <<<"$out" | head -1) == "ada | WORKING | now: 1.4 | owns: 1.4" && $(tail -1 <<<"$out") == "cy | FREE | now: - | owns: -" ]] &&
 	ok "po-dashboard --check lists the team after the events when a team feed is set" || bad "dashboard check team" "$out"
@@ -3382,7 +4138,7 @@ out=$(PO_DASHBOARD_DECISIONS_URL="$TMP/decisions.json" PO_DASHBOARD_TEAM_URL="$T
 	$(tail -1 <<<"$out") == "legacy | 0.7 | harbor | Accept | waiting for: an acceptance | asked "* && $out == *'team:'* ]] &&
 	ok "po-dashboard --check lists the decisions, oldest asked first, after the events and the team" || bad "dashboard check decisions" "$out"
 out=$(XDG_CONFIG_HOME="$TMP/cfg" python3 -B "$DB" --url "$CHK_URL" --decisions-url "$(dirname "$PO")/../examples/decisions-feed.json" --check 2>&1)
-[[ $(tail -4 <<<"$out" | head -1) == "choice | 0.7 | harbor |"* && $(tail -3 <<<"$out" | head -1) == "action | 2.5 | orchard |"* &&
+[[ $(tail -4 <<<"$out" | head -1) == "choice | 2.6 | orchard |"* && $(tail -3 <<<"$out" | head -1) == "action | 2.5 | orchard |"* &&
 	$(tail -2 <<<"$out" | head -1) == "legacy | 2.3 |"* && $(tail -1 <<<"$out") == "unformatted | 0.8 |"* ]] &&
 	ok "po-dashboard --check prints the kind first, choices, actions, then legacy and unformatted" || bad "dashboard check kinds" "$out"
 mkdir -p "$TMP/cfg/po-dashboard" && echo '{"actions": false}' >"$TMP/cfg/po-dashboard/decisions.json"
@@ -3390,16 +4146,22 @@ out2=$(XDG_CONFIG_HOME="$TMP/cfg" python3 -B "$DB" --url "$CHK_URL" --decisions-
 [[ $out2 == "$out" ]] && ok "po-dashboard --check ignores the Actions filter" || bad "dashboard check filter" "$out2"
 # v0.69: --install-dir / PO_DASHBOARD_INSTALL_DIR; --check prints the Install block after the decisions.
 sha=$(printf '%064d' 0)
-printf '[{"project":"orchard","item":"1.9.39","title":"Look","waiting_for":"a look","asked_at":"2026-10-29T10:00:00Z","kind":"action","id":"i1","machine":"laptop","steps":[{"text":"open it"}],"done_when":"seen","requires":{"package":"a-1-x86_64.pkg.tar.zst","sha256":"%s"}}]\n' "$sha" >"$TMP/install.json"
+# v0.81: a look card is shown (and so makes the block) only when ready: checked, fixtures stated, build installed.
+printf '[{"project":"orchard","item":"1.9.39","title":"Look","waiting_for":"a look","asked_at":"2026-10-29T10:00:00Z","kind":"action","id":"i1","machine":"laptop","steps":[{"text":"open the Bookmarks menu","expect":"three bookmarks"}],"done_when":"seen","requires":{"package":"a-1-1-x86_64.pkg.tar.zst","sha256":"%s"},"fixtures":[],"checked_by":"rev","check_sha256":"%s","ready":{"build":"a 1-1","checked_at":"2026-10-29T10:05:00Z"}}]\n' "$sha" "$sha" >"$TMP/install.json"
 out=$(env -u PO_DASHBOARD_INSTALL_DIR python3 -B "$DB" --url "$CHK_URL" --decisions-url "$TMP/install.json" --install-dir /x/pkgs --check 2>&1)
-[[ $(tail -3 <<<"$out") == "install | orchard | a-1-x86_64.pkg.tar.zst
-install | orchard | cd /x/pkgs && sha256sum -c <<< '$sha  a-1-x86_64.pkg.tar.zst'
-install | orchard | sudo pacman -U /x/pkgs/a-1-x86_64.pkg.tar.zst" ]] &&
+[[ $(tail -3 <<<"$out") == "install | orchard | a-1-1-x86_64.pkg.tar.zst
+install | orchard | cd /x/pkgs && sha256sum -c <<< '$sha  a-1-1-x86_64.pkg.tar.zst'
+install | orchard | sudo pacman -U /x/pkgs/a-1-1-x86_64.pkg.tar.zst" ]] &&
 	ok "po-dashboard --check prints the Install block from --install-dir after the decisions" || bad "dashboard check install" "$out"
 out=$(PO_DASHBOARD_INSTALL_DIR=/y python3 -B "$DB" --url "$CHK_URL" --decisions-url "$TMP/install.json" --check 2>&1)
-[[ $(tail -1 <<<"$out") == "install | orchard | sudo pacman -U /y/a-1-x86_64.pkg.tar.zst" ]] && ok "po-dashboard reads PO_DASHBOARD_INSTALL_DIR" || bad "dashboard install env" "$out"
+[[ $(tail -1 <<<"$out") == "install | orchard | sudo pacman -U /y/a-1-1-x86_64.pkg.tar.zst" ]] && ok "po-dashboard reads PO_DASHBOARD_INSTALL_DIR" || bad "dashboard install env" "$out"
 out=$(env -u PO_DASHBOARD_INSTALL_DIR python3 -B "$DB" --url "$CHK_URL" --decisions-url "$TMP/install.json" --check 2>&1)
 [[ $(tail -1 <<<"$out") == "install | orchard | set install_dir" ]] && ok "po-dashboard without install_dir shows set install_dir and no command" || bad "dashboard install unset" "$out"
+# installed is another build: held
+sed -e 's/"item":"1.9.39"/"item":"1.9.40"/' -e 's/"build":"a 1-1"/"build":"a 0-1"/' "$TMP/install.json" >"$TMP/held.json"
+out=$(env -u PO_DASHBOARD_INSTALL_DIR python3 -B "$DB" --url "$CHK_URL" --decisions-url "$TMP/held.json" --install-dir /x/pkgs --check 2>&1)
+[[ $out == *"decisions:"* && $out != *"1.9.40"* && $out != *"install |"* ]] &&
+	ok "po-dashboard --check leaves out a held look card, and its Install block" || bad "dashboard check held" "$out"
 out=$(python3 -B "$DB" --url http://h/x --install-dir pkgs --check 2>&1)
 [[ $? == 1 && $out == *'install_dir is not an absolute plain path'* ]] && ok "po-dashboard refuses a relative --install-dir" || bad "dashboard install relative" "$out"
 out=$(PO_DASHBOARD_DECISIONS_URL="$TMP/none.json" python3 -B "$DB" --url "$CHK_URL" --decisions-url "$TMP/decisions.json" --check 2>&1)
@@ -3498,6 +4260,56 @@ mod.main()
 PY
 		)
 		[[ $out == opened ]] && ok "po-dashboard Projects card activation opens the project screen" || bad "dashboard projects activate" "$out"
+		# v0.83: the release label is the last widget of the card's top row and of the screen header, right-aligned; `no release` is muted.
+		# helper
+		out=$(timeout 60 python3 -I - "$DB" "$SV/events.json" "$(dirname "$PO")/../examples/projects-feed.json" 2>/dev/null <<'PY'
+import http.server, importlib.machinery, importlib.util, os, sys, threading
+sys.dont_write_bytecode = True
+import gi
+gi.require_version("Gtk", "4.0")
+from gi.repository import GLib, Gtk
+db, events, feed = sys.argv[1:4]
+body = open(events, "rb").read()
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def log_message(self, *a): pass
+srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+sys.argv = [db, "--url", "http://127.0.0.1:%d/" % srv.server_address[1], "--projects-url", feed, "--view", "projects", "--project", "harbor"]
+loader = importlib.machinery.SourceFileLoader("po_dashboard", db)
+mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("po_dashboard", loader))
+loader.exec_module(mod)
+n = {"t": 0}
+def walk(w):
+    yield w
+    c = w.get_first_child()
+    while c:
+        yield from walk(c)
+        c = c.get_next_sibling()
+def right(lab):
+    return lab.get_next_sibling() is None and lab.get_halign() == Gtk.Align.END and lab.get_xalign() == 1
+def tick():
+    n["t"] += 1
+    nodes = [x for w in Gtk.Window.list_toplevels() for x in walk(w)]
+    labs = {}
+    for x in nodes:
+        if isinstance(x, Gtk.Label):
+            labs.setdefault(x.get_label(), []).append(x)
+    if "release-3" in labs and "no release" in labs and len(labs["no release"]) >= 2:
+        r3, nr = labs["release-3"][0], labs["no release"]
+        ok = right(r3) and r3.has_css_class("po-text") and not r3.has_css_class("po-muted") and all(right(x) and x.has_css_class("po-muted") for x in nr)
+        print("labels ok" if ok else "labels wrong")
+        sys.stdout.flush()
+        os._exit(0 if ok else 1)
+    if n["t"] > 100:
+        print("no labels"); sys.stdout.flush(); os._exit(1)
+    return True
+GLib.timeout_add(100, tick)
+mod.main()
+PY
+		)
+		[[ $out == 'labels ok' ]] && ok "po-dashboard: the release label sits right-aligned last on the card and the screen header, \`no release\` muted" || bad "dashboard release label" "$out"
 		# v0.58: an unsent answer draft survives the Decisions redraw (the feed refresh) and goes with its entry or its Send.
 		cat >"$TMP/drafts-feed.json" <<'JSON'
 [{"project":"p","item":"1","title":"c","waiting_for":"a ruling","asked_at":"2026-10-24T09:00:00Z","kind":"choice","id":"d-choice","question":"Ok?","options":[{"label":"Yes"},{"label":"No"}]},
@@ -4124,6 +4936,70 @@ printf '{"item":"v1.0.5","title":"Fifth","needs_note":"docs/backlog/v1.md"}\n' >
 out=$(cd "$R2" && "$PO" ready 2>&1)
 [[ $out == *'v1.0.5  Fifth'* ]] &&
 	ok "ready: needs_note that is a file on main keeps the item" || bad "ready: needs_note on main" "$out"
+
+# v0.80: AGENTS.md states the release rule (a pre-release review never holds release N; fixes ship as N.1).
+agents_md="$KITROOT/AGENTS.md"
+grep -q '^## Releases and the pre-release review' "$agents_md" && grep -q 'release-N\.1' "$agents_md" &&
+	grep -q 'never holds release N' "$agents_md" &&
+	ok "AGENTS.md has the 'Releases and the pre-release review' section and release-N.1" || bad "AGENTS.md release rule section"
+
+# ---- po released (v0.83) ---------------------------------------------------
+RL=$TMP/relrepo
+[[ -n ${TMP:?} && -d $TMP && $TMP != "$KITROOT"* ]] || { printf 'released tests: TMP is not a scratch dir: %s\n' "$TMP" >&2; exit 2; }
+git init -q -b main "${RL:?}"
+[[ $(git -C "$RL" rev-parse --show-toplevel 2>/dev/null) == "$RL" ]] || { printf 'released tests: RL is not its own repo: %s\n' "$RL" >&2; exit 2; }
+git -C "$RL" config user.name t
+git -C "$RL" config user.email t@example.invalid
+mkdir -p "$RL/docs/backlog"
+cat >"$RL/docs/BACKLOG.md" <<'EOF'
+# Backlog
+
+| Item | Title | Status | Spec |
+|---|---|---|---|
+| v0.1 | One | DONE | backlog/v0.md |
+| v0.2 | Two | DONE | backlog/v0.md |
+| v0.3 | Three | DONE (no change needed: x) | backlog/v0.md |
+| v0.4 | Four | TODO | backlog/v0.md |
+EOF
+printf '%s' "$GOOD_MANIFEST" >"$RL/po.toml"
+printf '## v0.4 — Four — TODO\n' >"$RL/docs/backlog/v0.md"
+git -C "$RL" add -A && git -C "$RL" commit -qm one && git -C "$RL" tag v0.1 && git -C "$RL" tag release-10
+git -C "$RL" commit -q --allow-empty -m two && git -C "$RL" tag v0.2 && git -C "$RL" tag release-2 && git -C "$RL" tag v0.4
+rel_m() { printf '%s\n[release]\n%s\n' "$GOOD_MANIFEST" "$1" >"$TMP/rel.toml"; }
+rel() { "$PO" -C "$RL" --manifest "$TMP/rel.toml" released "$@"; }
+rel_m 'source = "tag"'
+out=$(rel --json 2>&1)
+[[ $out == '{"source":"tag","release":"release-10","released":["0.1"]}' ]] &&
+	ok "released: source tag takes the newest release tag by version order and lists only its ancestors" || bad "released tag newest" "$out"
+out=$(rel 2>&1)
+[[ $out == $'release: release-10\n0.1' ]] && ok "released: plain output names the release, then one version per line" || bad "released plain" "$out"
+git -C "$RL" tag release-11
+out=$(rel --json 2>&1)
+[[ $out == '{"source":"tag","release":"release-11","released":["0.1","0.2"]}' ]] &&
+	ok "released: a DONE item whose tag is an ancestor is released; a DONE row without a tag and a TODO row are not" || bad "released ancestor" "$out"
+git -C "$RL" tag -d release-11 >/dev/null
+expect "released: --release is refused for source tag" 1 'source "github" only' -- -C "$RL" --manifest "$TMP/rel.toml" released --release release-2
+rel_m $'source = "tag"\npattern = "nothing-*"'
+out=$(rel --json 2>&1)
+[[ $out == '{"source":"tag","release":null,"released":[]}' ]] && ok "released: no tag matching the pattern is release null" || bad "released no match" "$out"
+rel_m 'source = "none"'
+out=$(rel --json 2>&1)
+[[ $out == '{"source":"none","release":null,"released":[]}' ]] && ok "released: source none has no release and nothing released" || bad "released none" "$out"
+expect "released: --release is refused for source none" 1 'source "github" only' -- -C "$RL" --manifest "$TMP/rel.toml" released --release release-2
+printf '%s' "$GOOD_MANIFEST" >"$TMP/rel.toml"
+out=$(rel --json 2>&1)
+[[ $out == '{"source":"none","release":null,"released":[]}' ]] && ok "released: no [release] section means source none" || bad "released default" "$out"
+rel_m 'source = "github"'
+out=$(rel --json --release release-2 2>&1)
+[[ $out == '{"source":"github","release":"release-2","released":["0.1","0.2"]}' ]] &&
+	ok "released: source github takes the tag the producer gives and checks ancestry" || bad "released github" "$out"
+out=$(rel --json 2>&1)
+[[ $out == '{"source":"github","release":null,"released":[]}' ]] && ok "released: source github without --release is release null" || bad "released github none" "$out"
+expect "released: source github with a tag not in the repository is exit 2" 2 "release tag 'v9.9' is not in this repository" -- -C "$RL" --manifest "$TMP/rel.toml" released --release v9.9
+rel_m 'source = "tags"'
+expect "released: a [release] source other than tag, github or none is a manifest error" 2 'source must be "tag", "github" or "none"' -- -C "$RL" --manifest "$TMP/rel.toml" released
+rel_m $'source = "github"\npattern = "release-*"'
+expect "released: [release] pattern without source tag is a manifest error" 2 'pattern applies to source "tag" only' -- -C "$RL" --manifest "$TMP/rel.toml" released
 
 # ---- private test blocks (absent from a public snapshot) -------------------
 for _t in "$KITROOT"/private/tests.d/*.sh; do
