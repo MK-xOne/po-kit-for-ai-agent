@@ -11,6 +11,9 @@ Called by lib/po/setup.sh, never by hand. Subcommands:
   record <state> <item> <steps json file> <now>
                                   write the item's steps as open; confirmed ones are kept.
   list <state> <item or -> <all 0|1> <json 0|1>
+  block <changelog> <N> <write 0|1> <state>
+                                  print the Setup after install block of release N's entry
+                                  (Unreleased when it has no heading yet); write 1 inserts it.
   confirm <state> <item> <n> <by> <now>
                                   exit 0 confirmed, 3 already confirmed (says by whom), 1 no
                                   such step.
@@ -234,6 +237,104 @@ def plan(steps_json):
     return 0
 
 
+ITEM_REF = re.compile(r"\bv(\d+(?:\.\d+)+)\b")
+SETUP_HEAD = re.compile(r"###[ \t]+Setup after install[ \t]*")
+
+
+def cell(text):
+    """One table cell: a | is written \\|, a line break is a space."""
+    return " ".join(str(text).split("\n")).replace("|", "\\|")
+
+
+def code_span(cmd):
+    """The command as a markdown code span whose fence is longer than any backtick run inside it."""
+    longest = max((len(r) for r in re.findall(r"`+", cmd)), default=0)
+    fence = "`" * (longest + 1)
+    pad = " " if cmd.startswith("`") or cmd.endswith("`") else ""
+    return f"{fence}{pad}{cmd}{pad}{fence}"
+
+
+def setup_table(steps):
+    """The block body for the steps: the word None, or the v0.91 table, one row per step."""
+    if not steps:
+        return "None"
+    rows = ["| # | Machine | Command | Who | Check |", "|---|---|---|---|---|"]
+    for i, s in enumerate(steps, 1):
+        cmd = str(s["command"])
+        shown = cell(code_span(cmd)) if cmd != "-" else "-"
+        rows.append(f"| {i} | {cell(s['machine'])} | {shown} (v{s['item']}) | {cell(s['who'])} | {cell(s['check'])} |")
+    return "\n".join(rows)
+
+
+def release_section(lines, n):
+    """(first, last+1, heading is a release) of the entry for release n, else of Unreleased, else None."""
+    want = re.compile(rf"^## Release {re.escape(n)} \(")
+    for pat, is_release in ((want, True), (re.compile(r"^## Unreleased\s*$"), False)):
+        for i, line in enumerate(lines):
+            if pat.match(line):
+                j = i + 1
+                while j < len(lines) and not lines[j].startswith("## "):
+                    j += 1
+                return i, j, is_release
+    return None
+
+
+def existing_block(lines, first, last):
+    """(heading index, end index) of the setup block opening the entry, or None."""
+    i = first + 1
+    while i < last and not lines[i].strip():
+        i += 1
+    if i >= last or not SETUP_HEAD.fullmatch(lines[i]):
+        return None
+    j = i + 1
+    while j < last and not lines[j].strip():
+        j += 1
+    while j < last and lines[j].strip() and not lines[j].startswith("#"):
+        j += 1
+    return i, j
+
+
+def release_block(changelog, n, write, state):
+    """Print the entry's setup block built from the recorded steps of the items it names; with
+    write, insert (or replace) it under the `## Release n` heading. Exit 1 when it cannot."""
+    with open(changelog) as f:
+        text = f.read()
+    lines = text.split("\n")
+    found = release_section(lines, n)
+    if found is None:
+        print(f"po: release: {changelog} has no `## Release {n} (date): ...` or `## Unreleased` section", file=sys.stderr)
+        return 1
+    first, last, is_release = found
+    if write and not is_release:
+        print(f"po: release: {changelog} has no `## Release {n} (date): ...` heading to write under; write it first", file=sys.stderr)
+        return 1
+    old = existing_block(lines, first, last)
+    body_lines = lines[first + 1:last]
+    if old:
+        body_lines = lines[first + 1:old[0]] + lines[old[1]:last]
+    items = list(dict.fromkeys(ITEM_REF.findall("\n".join(body_lines))))
+    steps = [s for s in load(state)["steps"] if s.get("item") in items]
+    steps.sort(key=lambda s: (items.index(s["item"]), s.get("n", 0)))
+    block = ["### Setup after install", "", *setup_table(steps).split("\n")]
+    if not write:
+        print("\n".join(block))
+        return 0
+    if old:
+        out = lines[:old[0]] + block + lines[old[1]:]
+    else:
+        out = lines[:first + 1] + ["", *block] + ([""] if lines[first + 1].strip() else []) + lines[first + 1:]
+    new = "\n".join(out)
+    if new == text:
+        print(f"{changelog}: the Release {n} setup block is already current")
+        return 0
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(changelog)), prefix=".po-changelog.")
+    with os.fdopen(fd, "w") as f:
+        f.write(new)
+    os.replace(tmp, changelog)
+    print(f"{changelog}: wrote the Release {n} setup block ({len(steps)} step(s))")
+    return 0
+
+
 def main(argv):
     cmd = argv[1]
     try:
@@ -248,6 +349,8 @@ def main(argv):
             return list_steps(*argv[2:7])
         if cmd == "confirm":
             return confirm(*argv[2:7])
+        if cmd == "block":
+            return release_block(argv[2], argv[3], argv[4] == "1", argv[5])
     except (OSError, ValueError) as e:
         print(f"po: {e}", file=sys.stderr)
         return 2

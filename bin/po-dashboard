@@ -557,7 +557,7 @@ def main():
                 bar.append(b)
             self.pscreen.append(bar)
             if screen["lost"]:
-                self.pscreen.append(self.label(screen["lost"], "po-muted"))
+                self.pscreen.append(self.label(screen["lost"], "po-muted", wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR, max_width_chars=30))
             rows = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
             for r in screen["rows"]:
                 line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
@@ -623,6 +623,8 @@ def main():
                 child.update_property([Gtk.AccessibleProperty.LABEL], [c["text"]])
                 card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
                 card.add_css_class("po-card")
+                if c["error"]:
+                    card.add_css_class("po-errored")
                 top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
                 top.append(self.label("●", "po-light-%s" % c["light"]))
                 top.append(self.label(c["name"], "po-text", hexpand=True, ellipsize=3))
@@ -634,8 +636,10 @@ def main():
                 card.append(row)
                 if c["setup"]:
                     card.append(self.label(c["setup"], "po-muted"))
+                if c["error"]:
+                    card.append(self.label("feed error", "po-muted"))
                 if c["lost"]:
-                    card.append(self.label(c["lost"], "po-muted", ellipsize=3, max_width_chars=30))
+                    card.append(self.label(c["lost"], "po-muted", wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR, max_width_chars=30))
                 child.set_child(card)
                 child.add_css_class("po-pcard")
                 flow.append(child)
@@ -1194,6 +1198,7 @@ def main():
                     self.fill_answer(expanded, r, key)
                 # collapsed header: click toggles the full waiting_for
                 header = Gtk.Button()
+                header.add_css_class("po-dhead")  # the theme's own colours, never the GTK button strip (v0.108)
                 header.set_child(top)
                 header.connect("clicked", self.on_decision_toggle, expanded, key)
                 card.append(header)
@@ -1495,25 +1500,24 @@ def main():
             """Build the body, stash the draft, POST in a worker thread."""
             kind = r["kind"]
             params = core.answer_params(kind, picks)
-            installed = core.installed_build(r.get("requires")) if r.get("requires") else None
-            body = core.answer_body(r, core.answer_id(), kind=kind, installed=installed, **params)
+            body = core.answer_body(r, core.answer_id(), kind=kind, installed=None, **params)
             self.answers[aid] = {"answer_id": body["answer_id"], "body": body, "display": "sending…",
                                  "requires": r.get("requires")}
             self.drafts.pop(aid, None)
             button.set_sensitive(False)
-            threading.Thread(target=self._send_answer, args=(aid, body), daemon=True).start()
+            threading.Thread(target=self._send_answer, args=(aid, body, r.get("requires")), daemon=True).start()
 
         def on_retry_answer(self, button, aid):
             """Re-post the same body (same answer_id), with the installed build read again (it may have changed)."""
             body = self.answers[aid]["body"]
-            if self.answers[aid].get("requires"):
-                body["installed"] = core.installed_build(self.answers[aid]["requires"])
             self.answers[aid]["display"] = "sending…"
             button.set_sensitive(False)
-            threading.Thread(target=self._send_answer, args=(aid, body), daemon=True).start()
+            threading.Thread(target=self._send_answer, args=(aid, body, self.answers[aid].get("requires")), daemon=True).start()
 
-        def _send_answer(self, aid, body):
-            """Worker thread: POST and queue the state update on the main thread."""
+        def _send_answer(self, aid, body, requires=None):
+            """Worker thread: read the installed build, POST and queue the state update on the main thread."""
+            if requires:
+                body["installed"] = core.installed_build(requires)
             display = core.post_answer(self.answer_url, body, self.answer_token)
             GLib.idle_add(self.on_answer_state, aid, display)
 

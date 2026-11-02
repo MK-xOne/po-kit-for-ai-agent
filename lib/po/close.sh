@@ -4,7 +4,8 @@
 # Pre-flight, read-only, every check before any write:
 #   - every backlog source on main says the item is DOING, and no item's
 #     sources disagree (exit 3);
-#   - its branch is exactly one item-format commit on top of main (6);
+#   - its branch is exactly one item-format commit on top of main, or no
+#     commit at all (a no-change item: its worktree clean too) (6);
 #   - main is an ancestor of the branch, i.e. po fresh passes (5);
 #   - the highest gate-<n>.txt in its worktree names the branch tip, clean
 #     (dirty 0), gate PASS (6);
@@ -16,6 +17,9 @@
 # edits; the admin commit, its author from git's own config; the --next
 # item's branch and worktree at the admin commit; the closed item's stamp
 # files, worktree (`git worktree remove`, never --force) and branch.
+# A no-change item (no commit on the branch, the stamp naming main's tip)
+# skips the fast-forward: the admin commit comes first and the tag goes on it
+# (annotated: "<tag>: <title> (no change needed)").
 # A [hooks] on_close command then runs (exit 7 when it fails; the boundary
 # stands). An optional [close] checklist = ["line", ...] is printed after a
 # complete --commit boundary (before the hook); with --run-checklist each
@@ -85,16 +89,23 @@ po_cmd_close() {
 	local title
 	title=$(po_item_title "$version")
 
-	# The branch: one item commit on main.
+	# The branch: one item commit on main, or none (a no-change item: the
+	# stamp then says the change was not needed, and the tag goes on the
+	# admin commit).
 	tip=$(git rev-parse -q --verify "refs/heads/$branch^{commit}") || po_refuse "no branch $branch"
-	local n subject parents
+	local n subject parents nochange=0
 	n=$(git rev-list --count "$mtip..$tip")
-	((n == 1)) || po_refuse "$branch has $n commits main lacks; one item = one commit"
-	subject=$(git log -1 --format=%s "$tip")
-	parents=$(git log -1 --format=%P "$tip")
-	[[ $parents != *' '* ]] || po_refuse "$branch's commit is a merge"
-	[[ $(po_fresh_item_version "$subject") == "$version" ]] ||
-		po_refuse "$branch's commit is not in item form ($(po_get versioning.item_commit) for $version): $subject"
+	if ((n == 0)); then
+		nochange=1
+		subject='(no commit: no change needed)'
+	else
+		((n == 1)) || po_refuse "$branch has $n commits main lacks; one item = one commit"
+		subject=$(git log -1 --format=%s "$tip")
+		parents=$(git log -1 --format=%P "$tip")
+		[[ $parents != *' '* ]] || po_refuse "$branch's commit is a merge"
+		[[ $(po_fresh_item_version "$subject") == "$version" ]] ||
+			po_refuse "$branch's commit is not in item form ($(po_get versioning.item_commit) for $version): $subject"
+	fi
 
 	# Fresh: main is an ancestor of the branch.
 	local fresh_out fresh_code=0
@@ -125,11 +136,15 @@ po_cmd_close() {
 	[[ $first == "HEAD $tip ($branch)  dirty 0" ]] ||
 		po_refuse "$(po_rel "$stamp") does not stamp the branch tip $tip clean: $first"
 	[[ $second == 'gate PASS: '* ]] || po_refuse "$(po_rel "$stamp") is not a passing gate: $second"
+	if ((nochange)); then
+		x=$(po_stamp_porcelain "$wt" | wc -l)
+		((x == 0)) || po_refuse "$branch has no commit but $(po_rel "$wt") has uncommitted changes ($x); commit them as the item, or discard them"
+	fi
 
 	git show-ref --verify --quiet "refs/tags/$tag" && po_refuse "tag $tag already exists"
 
 	# Setup after install: the spec's section, under [close] require_setup.
-	po_setup_check "$version" "$tag" "$mtip" "$tip"
+	po_setup_check "$version" "$tag" "$mtip" "$tip" "$mtip"
 
 	# --also-done: investigations that close with no merge and no tag.
 	local a ab
@@ -214,14 +229,22 @@ po_cmd_close() {
 	printf '%s\n' "$block" | sed 's/^/          /'
 	po_setup_plan_line
 	printf '\nSTEPS\n'
-	local s=1
-	printf '  %s. fast-forward %s %s -> %s\n' $((s++)) "$main" "$(po_short "$mtip")" "$(po_short "$tip")"
-	if [[ $(po_get versioning.tag_style) == annotated ]]; then
-		printf '  %s. tag %s at %s (annotated, message "%s: %s"; signing follows git config)\n' $((s++)) "$tag" "$(po_short "$tip")" "$tag" "$title"
+	local s=1 tagmsg="$tag: $title" tagat
+	tagat=$(po_short "$tip")
+	if ((nochange)); then
+		tagmsg+=' (no change needed)'
+		tagat='the admin commit'
+		printf '  %s. no change: no fast-forward; backlog edits below, committed on %s as the admin commit\n' $((s++)) "$main"
+		printf '     no change: the tag goes on the admin commit\n'
 	else
-		printf '  %s. tag %s at %s (lightweight; never signed or annotated)\n' $((s++)) "$tag" "$(po_short "$tip")"
+		printf '  %s. fast-forward %s %s -> %s\n' $((s++)) "$main" "$(po_short "$mtip")" "$(po_short "$tip")"
 	fi
-	printf '  %s. backlog edits below, committed on %s as the admin commit\n' $((s++)) "$main"
+	if [[ $(po_get versioning.tag_style) == annotated ]]; then
+		printf '  %s. tag %s at %s (annotated, message "%s"; signing follows git config)\n' $((s++)) "$tag" "$tagat" "$tagmsg"
+	else
+		printf '  %s. tag %s at %s (lightweight; never signed or annotated)\n' $((s++)) "$tag" "$tagat"
+	fi
+	((nochange)) || printf '  %s. backlog edits below, committed on %s as the admin commit\n' $((s++)) "$main"
 	[[ -z $next ]] ||
 		printf '  %s. branch %s + worktree %s at the admin commit\n' $((s++)) \
 			"$(po_fill "$btpl" "$next")" "$(po_rel "$(po_new_worktree_path "$next")")"
@@ -235,7 +258,9 @@ po_cmd_close() {
 	[[ -z ${PO_MANIFEST[hooks.on_close]+x} ]] || hook=${PO_MANIFEST[hooks.on_close]}
 	if [[ -n $hook ]]; then
 		printf '  %s. then run the on_close hook (sh -c in %s, stdin /dev/null, output to stderr); a non-zero exit is a warning and exit 7, the boundary stands\n' $((s++)) "$PO_MAIN_WT"
-		po_close_hook_plan "$hook" "$version" "$tag" "$title" "$tip" "$body_file" "$next"
+		x=$tip
+		((nochange == 0)) || x='(the admin commit, once made: no change)'
+		po_close_hook_plan "$hook" "$version" "$tag" "$title" "$x" "$body_file" "$next"
 	fi
 	[[ -z ${PO_MANIFEST[close.checklist]:-} ]] || po_close_checklist_plan "$runlist"
 	po_print_plan_tail "$msg"
@@ -248,18 +273,19 @@ po_cmd_close() {
 	printf '\n'
 	[[ $(git rev-parse "refs/heads/$main") == "$mtip" ]] || po_die "stopped before any write: $main moved since the plan"
 	[[ $(git rev-parse "refs/heads/$branch") == "$tip" ]] || po_die "stopped before any write: $branch moved since the plan"
-	git -C "$PO_MAIN_CO" merge -q --ff-only "$branch" || po_die "stopped: the fast-forward of $main failed; nothing written"
-	[[ $(git rev-parse "refs/heads/$main") == "$tip" ]] || po_die "stopped: $main is not at $tip after the fast-forward"
-	printf 'fast-forwarded %s to %s\n' "$main" "$(po_short "$tip")"
-	if [[ $(po_get versioning.tag_style) == annotated ]]; then
-		git tag -a -m "$tag: $title" "$tag" "$tip" ||
-			po_die "stopped after the fast-forward: could not create tag $tag (annotated; the tag and the admin commit are owed)"
+	local item_commit=$tip
+	if ((nochange)); then
+		# No change: the admin commit first, then the tag on it.
+		po_write_admin "$msg" " before any tag (no change: the admin commit and the tag $tag are owed)"
+		item_commit=$(git rev-parse "refs/heads/$main")
+		po_close_tag "$tag" "$tagmsg" "$item_commit" "after the admin commit" "the tag is owed"
 	else
-		git update-ref -m "po close: tag $tag" "refs/tags/$tag" "$tip" "" ||
-			po_die "stopped after the fast-forward: could not create tag $tag"
+		git -C "$PO_MAIN_CO" merge -q --ff-only "$branch" || po_die "stopped: the fast-forward of $main failed; nothing written"
+		[[ $(git rev-parse "refs/heads/$main") == "$tip" ]] || po_die "stopped: $main is not at $tip after the fast-forward"
+		printf 'fast-forwarded %s to %s\n' "$main" "$(po_short "$tip")"
+		po_close_tag "$tag" "$tagmsg" "$tip" "after the fast-forward" "the tag and the admin commit are owed"
+		po_write_admin "$msg" " after fast-forwarding $main to $(po_short "$tip") and tagging $tag (the admin commit is owed)"
 	fi
-	printf 'tagged %s at %s\n' "$tag" "$(po_short "$tip")"
-	po_write_admin "$msg" " after fast-forwarding $main to $(po_short "$tip") and tagging $tag (the admin commit is owed)"
 	[[ -z $next ]] || po_make_worktree "$next"
 
 	# The closed item's worktree and branch. The boundary is complete
@@ -297,12 +323,26 @@ po_cmd_close() {
 	fi
 	local ckcode=0
 	[[ -z ${PO_MANIFEST[close.checklist]:-} ]] || po_close_checklist "$runlist" "$version" "$tag" "$title" || ckcode=$?
-	[[ -z $hook ]] || po_close_hook "$hook" "$version" "$tag" "$title" "$tip" "$body_file" "$next" "$block"
+	[[ -z $hook ]] || po_close_hook "$hook" "$version" "$tag" "$title" "$item_commit" "$body_file" "$next" "$block"
 	if ((ckcode != 0)); then
 		printf 'po: warning: %s checklist line(s) failed; the boundary stands, nothing is rolled back\n' "$ckcode" >&2
 		exit 7
 	fi
 	((setupcode == 0)) || exit 7
+}
+
+# po_close_tag <tag> <message> <commit> <where> <owed>: tag <commit> as
+# [versioning] tag_style says (annotated with <message>, or a bare lightweight
+# tag written with update-ref); a failure stops, naming <where> and <owed>.
+po_close_tag() {
+	if [[ $(po_get versioning.tag_style) == annotated ]]; then
+		git tag -a -m "$2" "$1" "$3" ||
+			po_die "stopped $4: could not create tag $1 (annotated; $5)"
+	else
+		git update-ref -m "po close: tag $1" "refs/tags/$1" "$3" "" ||
+			po_die "stopped $4: could not create tag $1 ($5)"
+	fi
+	printf 'tagged %s at %s\n' "$1" "$(po_short "$3")"
 }
 
 # po_close_checklist_plan <run>: the dry run's listing of the [close] checklist.

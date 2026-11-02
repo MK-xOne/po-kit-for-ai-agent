@@ -141,6 +141,7 @@ po_backlog_load() {
 	done < <(git ls-tree -z --name-only "$main" -- "$specs_dir/" | tr '\0' '\n')
 
 	local _tmpdir
+	command -v python3 >/dev/null 2>&1 || po_die "po_batch_read: python3 not found on PATH"
 	_tmpdir=$(mktemp -d)
 	po_batch_read "$main" "$_tmpdir" "${_files[@]}"
 

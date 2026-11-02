@@ -112,8 +112,13 @@ the reviewer's list ship, as the patch release N.1 (then N.2 for a later list); 
 other item waits for release N+1, the next full release.
 
 Each release entry in `CHANGELOG.md` opens with a `### Setup after install` block:
-every setup step of the release's items in order (`1. v0.9 · build host · operator ·
-`command` · check: ...`), or the word `None`.
+every setup step of the release's items in order, or the word `None`. The steps are a
+markdown table with the columns #, Machine, Command, Who, Check: one row per step or per
+group of steps (a row may name its items, e.g. `(v0.74-v0.87)`).
+
+`po release <N> --setup` prints that block from the recorded steps (`po setup list`) of the items the entry names, and `--write` inserts it under the `## Release N` heading of `CHANGELOG.md`; paste nothing by hand.
+
+Where the manifest sets `[release] review = true`, `po release <N>` refuses unless a `test review: ... release-N` row exists; `po release <N> --open-review --commit` adds it.
 
 A patch release is the annotated tag `release-N.1` with a CHANGELOG heading
 `## Release N.1 (YYYY-MM-DD): <theme>` that lists only the reviewer's fixes. Its items

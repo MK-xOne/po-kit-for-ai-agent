@@ -237,6 +237,78 @@ po_stamp_state() {
 PO_PYTEST_ITEM='[0-9]+ (subtests )?(passed|failed|skipped|deselected|xfailed|xpassed|warnings?|errors?|rerun)'
 PO_PYTEST_RE='^(=+ )?(no tests ran|'$PO_PYTEST_ITEM'(, '$PO_PYTEST_ITEM')*) in [0-9.]+s( \([0-9:]+\))?( =+)?$'
 
+# Whether commands run in a transient user scope of their own: empty until
+# the first run decides (1 or 0).
+PO_STAMP_SCOPE=''
+
+# po_stamp_scope_init: decide, once, whether to scope: not when
+# PO_STAMP_NO_SCOPE=1 or [gate] scope = false, and not when systemd-run is
+# absent (said once) or cannot start a user scope here (quietly).
+po_stamp_scope_init() {
+	[[ -z $PO_STAMP_SCOPE ]] || return 0
+	PO_STAMP_SCOPE=0
+	[[ ${PO_STAMP_NO_SCOPE:-} != 1 && ${PO_MANIFEST[gate.scope]:-true} != false ]] || return 0
+	if ! command -v systemd-run >/dev/null 2>&1 || ! command -v systemctl >/dev/null 2>&1; then
+		printf 'po stamp: warning: systemd-run not found; commands run without a scope, so processes they leave behind are not detected\n' >&2
+		return 0
+	fi
+	systemd-run --user --scope --quiet "--unit=po-stamp-probe-$$-$(date +%s%N)" true >/dev/null 2>&1 &&
+		PO_STAMP_SCOPE=1
+	return 0
+}
+
+# po_stamp_live_pids <scope unit>: the unit's live (not zombie) process ids
+# on stdout; nothing when the scope is gone.
+po_stamp_live_pids() {
+	local cg pid st
+	cg=$(systemctl --user show -p ControlGroup --value "$1.scope" 2>/dev/null) || return 0
+	[[ -n $cg && -r /sys/fs/cgroup$cg/cgroup.procs ]] || return 0
+	while read -r pid; do
+		st=$(LC_ALL=C sed -n 's/^State:[[:space:]]*\(.\).*/\1/p' "/proc/$pid/status" 2>/dev/null) || continue
+		[[ -z $st || $st == Z ]] || printf '%s\n' "$pid"
+	done <"/sys/fs/cgroup$cg/cgroup.procs"
+}
+
+# po_stamp_sweep <scope unit>: PO_RUN_LEFT is the number of processes still
+# alive in the scope, PO_RUN_LEFT_COMM their names (the first 10), then the
+# scope is stopped; a child that ignores SIGTERM is killed after 2 seconds.
+po_stamp_sweep() {
+	local pid i comm
+	local -a pids=() comms=()
+	PO_RUN_LEFT=0 PO_RUN_LEFT_COMM=''
+	mapfile -t pids < <(po_stamp_live_pids "$1")
+	((${#pids[@]} > 0)) || return 0
+	PO_RUN_LEFT=${#pids[@]}
+	for pid in "${pids[@]:0:10}"; do
+		comm=$(<"/proc/$pid/comm") 2>/dev/null || comm=$pid
+		comms+=("$comm")
+	done
+	PO_RUN_LEFT_COMM=$(
+		IFS=,
+		printf '%s' "${comms[*]}"
+	)
+	PO_RUN_LEFT_COMM=${PO_RUN_LEFT_COMM//,/, }
+	systemctl --user stop --no-block "$1.scope" >/dev/null 2>&1 || true
+	for i in $(seq 20); do
+		[[ -z $(po_stamp_live_pids "$1") ]] && return 0
+		sleep 0.1
+	done
+	systemctl --user kill --signal=SIGKILL "$1.scope" >/dev/null 2>&1 || true
+	for i in $(seq 20); do
+		[[ -z $(po_stamp_live_pids "$1") ]] && return 0
+		sleep 0.1
+	done
+	return 0
+}
+
+# po_stamp_left <leg label> <leg index or -1>: fail the stamp when the last
+# run left processes behind. Called once the run is recorded.
+po_stamp_left() {
+	((PO_RUN_LEFT == 0)) && return 0
+	PO_STAMP_FAILING=$2
+	po_stamp_fail "$PO_RUN_LEFT process(es) left behind by $1: $PO_RUN_LEFT_COMM"
+}
+
 # po_stamp_run <dir> <command> [<capture file> <label>]: run <command> with
 # sh in <dir>, its output going to stderr as it happens, and, given a capture
 # file, to that file too, recorded with <label> in the run's list. Sets
@@ -246,31 +318,76 @@ PO_PYTEST_RE='^(=+ )?(no tests ran|'$PO_PYTEST_ITEM'(, '$PO_PYTEST_ITEM')*) in [
 # apart: PO_RUN_ENDED is the number of "RUN-END ..." lines the output had and
 # PO_RUN_ABORTED the number of "RUN-ABORTED" lines (a runner that finishes
 # prints the first; one that dies any other way prints the second).
+#
+# The output is read until the command itself exits, then for [gate]
+# drain_secs more (default 5): a process the command left behind that holds
+# the output open cannot keep the stamp waiting. With a scope (see
+# po_stamp_scope_init) the command runs in its own transient user scope;
+# once it has exited, what is still alive there is counted into PO_RUN_LEFT
+# (names in PO_RUN_LEFT_COMM) and the scope is stopped.
 po_stamp_run() {
-	local out pytest=0 cap=/dev/null
+	local out pytest=0 cap=/dev/null tmp unit='' drain
 	[[ ${PO_MANIFEST[gate.test_format]:-libtest} != pytest ]] || pytest=1
 	[[ -z ${3:-} || -z $PO_STAMP_TMP ]] || cap=$PO_STAMP_TMP/$3
-	# Command substitution does not inherit errexit, so PIPESTATUS survives.
-	# Lines are copied to stderr through the inherited descriptor: reopening
-	# it (tee /dev/stderr) would truncate a log file stderr points at.
+	drain=${PO_MANIFEST[gate.drain_secs]:-5}
+	po_stamp_scope_init
+	local -a runner=(sh -c "$2")
+	if ((PO_STAMP_SCOPE)); then
+		unit=po-stamp-$$-$(date +%s%N)
+		runner=(systemd-run --user --scope --quiet "--unit=$unit" sh -c "$2")
+	fi
+	tmp=$(mktemp -d "${TMPDIR:-/tmp}/po-run.XXXXXX") || po_die "could not make a temporary directory"
+	mkfifo "$tmp/pipe" || po_die "could not make a pipe in $tmp"
+	# The command runs in the background with its output on a fifo; its
+	# status lands in $tmp/code. Command substitution does not inherit
+	# errexit. Lines are copied to stderr through the inherited descriptor:
+	# reopening it (tee /dev/stderr) would truncate a log file stderr points at.
 	out=$(
-		(cd "$1" && exec sh -c "$2") </dev/null 2>&1 | {
-			while IFS= read -r line || [[ -n $line ]]; do
-				printf '%s\n' "$line" >&2
-				printf '%s\n' "$line" >&3
-				if [[ $line == 'RUN-END '* ]]; then
-					printf '\001end\n'
-				elif [[ $line == RUN-ABORTED* ]]; then
-					printf '\001aborted\n'
-				elif ((pytest)); then
-					if [[ $line =~ $PO_PYTEST_RE ]]; then printf '%s\n' "$line"; fi
-				elif [[ $line == 'test result: '* ]]; then
-					printf '%s\n' "$line"
+		{
+			(cd "$1" && exec "${runner[@]}") </dev/null >"$tmp/pipe" 2>&1
+			echo $? >"$tmp/code"
+		} &
+		cmdpid=$!
+		exec 4<"$tmp/pipe"
+		emit() {
+			printf '%s\n' "$1" >&2
+			printf '%s\n' "$1" >&3
+			if [[ $1 == 'RUN-END '* ]]; then
+				printf '\001end\n'
+			elif [[ $1 == RUN-ABORTED* ]]; then
+				printf '\001aborted\n'
+			elif ((pytest)); then
+				if [[ $1 =~ $PO_PYTEST_RE ]]; then printf '%s\n' "$1"; fi
+			elif [[ $1 == 'test result: '* ]]; then
+				printf '%s\n' "$1"
+			fi
+		}
+		{
+			buf='' deadline=0
+			while :; do
+				line=''
+				if IFS= read -r -t 0.2 -u 4 line; then
+					emit "$buf$line"
+					buf=''
+				else
+					rc=$?
+					buf+=$line
+					((rc > 128)) || break
+				fi
+				if [[ -e $tmp/code ]]; then
+					now=$(date +%s%N)
+					((deadline)) || deadline=$((now + drain * 1000000000))
+					((now < deadline)) || break
 				fi
 			done
+			# A last line without a newline is still output.
+			if [[ -n $buf ]]; then emit "$buf"; fi
 		} 3>"$cap"
-		printf 'po-stamp-exit %s\n' "${PIPESTATUS[0]}"
+		wait "$cmdpid" 2>/dev/null
+		code=$(<"$tmp/code") 2>/dev/null
+		printf 'po-stamp-exit %s\n' "${code:-1}"
 	)
+	rm -rf -- "$tmp"
 	PO_RUN_CODE=${out##*po-stamp-exit }
 	PO_RUN_RESULTS=${out%po-stamp-exit *}
 	PO_RUN_RESULTS=${PO_RUN_RESULTS%$'\n'}
@@ -286,6 +403,8 @@ po_stamp_run() {
 		done <<<"$PO_RUN_RESULTS"
 		PO_RUN_RESULTS=$kept
 	fi
+	PO_RUN_LEFT=0 PO_RUN_LEFT_COMM=''
+	[[ -z $unit ]] || po_stamp_sweep "$unit"
 	if [[ $cap != /dev/null ]]; then
 		printf '%s %s %s\n' "$3" "$PO_RUN_CODE" "$4" >>"$PO_STAMP_TMP/ran"
 	fi
@@ -390,7 +509,7 @@ po_cmd_stamp() {
 	[[ -n $diffstat ]] || diffstat='no changes'
 
 	printf 'po stamp: gate in %s at %s\n' "$wt" "$head" >&2
-	local gate_sum=0 gate_lines=0 off=0 leg_start
+	local gate_sum=0 gate_lines=0 test_sum=0 test_lines=0 off=0 leg_start
 	PO_STAMP_ITEM=$(po_unfill "$(po_get layout.branch)" "$branch" 2>/dev/null) || PO_STAMP_ITEM=-
 	PO_STAMP_NAMES=()
 	((${#prep[@]} == 0)) || PO_STAMP_NAMES=(prepare) off=1
@@ -413,6 +532,7 @@ po_cmd_stamp() {
 			[[ -z $PO_STAMP_TMP ]] || cat -- "$PO_STAMP_TMP/out-prep-$i" >>"$PO_STAMP_TMP/out-0" 2>/dev/null
 			[[ $PO_RUN_CODE == 0 ]] ||
 				po_stamp_fail "prepare line '${prep[i]}' exited $PO_RUN_CODE"
+			po_stamp_left "prepare: ${prep[i]}" 0
 		done
 		PO_STAMP_FAILING=-1
 		PO_STAMP_RES[0]=pass
@@ -432,11 +552,13 @@ po_cmd_stamp() {
 			po_stamp_fail "gate leg '${names[i]}' (${cmds[i]}) exited $PO_RUN_CODE"
 		((PO_RUN_ABORTED == 0)) ||
 			po_stamp_fail "gate leg '${names[i]}' (${cmds[i]}) printed RUN-ABORTED: the runner died before its last block"
+		po_stamp_left "leg ${names[i]}" $((i + off))
 		$sumfn "$PO_RUN_RESULTS" "gate leg '${names[i]}'"
 		PO_STAMP_FAILING=-1
 		PO_STAMP_RES[i + off]=pass
 		gate_sum=$((gate_sum + PO_SUM))
 		gate_lines=$((gate_lines + PO_SUM_LINES))
+		((i != test_leg)) || test_sum=$PO_SUM test_lines=$PO_SUM_LINES
 	done
 
 	local count_run=$count_cmd
@@ -446,6 +568,9 @@ po_cmd_stamp() {
 		count_run="cat $saved"
 		[[ -z $count_cmd ]] || count_run="cat $saved | { $count_cmd; }"
 		count_cmd=${count_cmd:-"the test leg's output"}
+		# The count comes from the test leg alone: so does the sum it is
+		# checked against; other legs' summaries (doc, integration) are theirs.
+		gate_sum=$test_sum gate_lines=$test_lines
 	fi
 	printf 'po stamp: test count: %s\n' "$count_cmd" >&2
 	po_stamp_run "$wt" "$count_run" out-count "test count: $count_cmd"
@@ -454,6 +579,7 @@ po_cmd_stamp() {
 		po_stamp_fail "test_count_cmd ($count_cmd) printed RUN-ABORTED: the runner died before its last block, so no count is taken"
 	[[ -z ${PO_MANIFEST[gate.run_sentinel]:-} || $PO_RUN_ENDED -gt 0 ]] ||
 		po_stamp_fail "test_count_cmd ($count_cmd) printed no RUN-END sentinel: the run did not finish, so no count is taken"
+	po_stamp_left "the test count" -1
 	$sumfn "$PO_RUN_RESULTS" "test_count_cmd"
 	((PO_SUM_LINES > 0)) || po_stamp_fail "test_count_cmd ($count_cmd) printed no $summary"
 	local tests=$PO_SUM

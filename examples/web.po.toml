@@ -1,0 +1,10 @@
+# Example [serve.web] section for `po serve`'s phone-ready page at /app/ (see README). Add it to your po.toml.
+# Each key names one feed URL; a view whose feed is not named is hidden. Without events_url the Events view
+# shows po serve's own events. Without answer_url the Decisions view is read-only.
+[serve.web]
+decisions_url = "http://127.0.0.1:8790/decisions.json"
+projects_url = "http://127.0.0.1:8790/projects.json"
+team_url = "http://127.0.0.1:8790/team.json"
+#events_url = "http://127.0.0.1:8790/events.json"
+#answer_url = "http://127.0.0.1:8791/answers"
+#stall_minutes = 30   # a DOING line on a Projects card is amber when its last event is older (minutes)

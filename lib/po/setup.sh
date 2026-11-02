@@ -53,12 +53,14 @@ po_setup_mode() {
 	rm -f -- "$tmp"
 }
 
-# po_setup_spec <version> <rev>: find and parse the item's section at <rev>.
+# po_setup_spec <version> <rev> [backlog_rev]: find and parse the item's section at <rev>.
 # PO_SETUP_KIND = absent | none | steps | bad; PO_SETUP_WHERE = file:line;
 # PO_SETUP_ERR the reason for bad; PO_SETUP_STEPS the steps as JSON;
 # PO_SETUP_LOOKED the places searched.
+# backlog_rev (default rev) is where the item's backlog row (line number) is read from.
 po_setup_spec() {
 	local v=$1 rev=$2 rec file first last out backlog where row p
+	local backlog_rev=${3:-$rev}
 	local -a files=()
 	PO_SETUP_KIND=absent PO_SETUP_WHERE='' PO_SETUP_ERR='' PO_SETUP_STEPS='[]' PO_SETUP_LOOKED=''
 	po_kickoff_sections "$v" "$rev"
@@ -74,13 +76,17 @@ po_setup_spec() {
 		[[ ${rec%%$'\t'*} == "$v" ]] || continue
 		where=${rec##*$'\t'}
 		[[ ${where%:*} == "$backlog" ]] || continue
-		row=$(git show "$rev:$backlog" 2>/dev/null | sed -n "${where##*:}p")
+		row=$(git show "$backlog_rev:$backlog" 2>/dev/null | sed -n "${where##*:}p")
+		# guard: the row must carry the item's tag/id
+		[[ "$row" == *"$v"* ]] || continue
 		# shellcheck disable=SC2016 # backticks, not an expansion
 		while IFS= read -r p; do
 			[[ -n $p ]] && files+=("$p")
 		done < <(grep -oE '`[^`]+\.md`' <<<"$row" | tr -d '`')
 	done
 	for file in "${files[@]}"; do
+		# skip files that are not item specs
+		case "$file" in CHANGELOG.md|README.md|AGENTS.md) continue ;; esac
 		[[ $(git cat-file -t "$rev:$file" 2>/dev/null) == blob ]] || continue
 		[[ ", $PO_SETUP_LOOKED, " == *", $file, "* ]] && continue
 		PO_SETUP_LOOKED+="${PO_SETUP_LOOKED:+, }$file"
@@ -117,10 +123,11 @@ po_setup_count() {
 # Leaves PO_SETUP_MODE and, when a section is used, PO_SETUP_KIND/STEPS.
 po_setup_check() {
 	local v=$1 tag=$2 mtip=$3 rev=$4
+	local backlog_rev=${5:-$rev}
 	PO_SETUP_KIND=absent PO_SETUP_STEPS='[]' PO_SETUP_WHERE=''
 	po_setup_mode "$v" "$mtip"
 	[[ $PO_SETUP_MODE != off ]] || return 0
-	po_setup_spec "$v" "$rev"
+	po_setup_spec "$v" "$rev" "$backlog_rev"
 	if [[ $PO_SETUP_MODE == on ]]; then
 		[[ $PO_SETUP_KIND != absent ]] ||
 			po_refuse "$tag's spec has no \"Setup after install\" section (looked in: ${PO_SETUP_LOOKED:-no spec section found}); write its steps, or the word None"

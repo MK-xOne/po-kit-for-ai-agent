@@ -93,6 +93,7 @@ po [-C <repo>] [--manifest <file>] kickoff <version>
 po [-C <repo>] [--manifest <file>] setup list [--item <version>] [--all] [--json]
 po [-C <repo>] [--manifest <file>] setup confirm <version> <n> --by <who>
 po [-C <repo>] [--manifest <file>] setup record <version> [--commit]
+po [-C <repo>] [--manifest <file>] release <N> --setup | --write
 po [-C <repo>] [--manifest <file>] team [--json]
 po [-C <repo>] [--manifest <file>] serve [--bind <addr>] [--port <n>]
 po version
@@ -164,7 +165,9 @@ the same from any worktree.
   count source and the suite runs once; `test_count_cmd` is then optional and
   only a filter: the saved output is piped to it on stdin, and it never reruns
   the suite (a command that ignores stdin, such as `cargo test 2>&1`, still
-  reruns it, so drop it or turn it into a filter). With no `test` leg,
+  reruns it, so drop it or turn it into a filter). The count is then checked
+  against the `test` leg's own summaries only: another leg that prints one
+  (doc tests, integration) is not added in. With no `test` leg,
   `test_count_cmd` is required and is the counting run, as before. The block is also written to `gate-<n>.txt` at the
   worktree root, `<n>` one past the highest there; nothing is ever
   overwritten. All or nothing: a failing leg (named), a missing or
@@ -205,6 +208,20 @@ the same from any worktree.
   has no `RUN-END ...` line (a test runner prints it last but for its summary).
   A count command that pipes the runner should keep the runner's exit code
   (`bash -o pipefail -c '...'`).
+
+  A command that leaves a process behind cannot hang the stamp. Each command
+  (every leg, every `[stamp] prepare` line and the count command) is read
+  until it exits itself; the output is then given `[gate] drain_secs` more
+  (default 5) to arrive, and reading stops. When `systemd-run` and a user
+  systemd are available, the command also runs in a transient user scope
+  (`po-stamp-<pid>-<ns>`); once it exits, the processes still alive in that
+  scope are listed and the scope is stopped (a process that ignores SIGTERM
+  is killed after 2 seconds), and the stamp fails with `po stamp: <n>
+  process(es) left behind by <leg>: <names, first 10>`, nothing written, the
+  command's real exit code and output in the log. A command that leaves
+  nothing behaves as before. Without `systemd-run` the commands run unscoped
+  and one warning says leftovers are not detected; `PO_STAMP_NO_SCOPE=1` or
+  `[gate] scope = false` turns the scope off (the grace stays).
 - `po fresh <version>` — the item branch (`[layout] branch`) against the
   local main: ahead/behind, the merge-base, and every main commit since
   it, oldest first, classed ADMIN (`admin_prefix`), ITEM vX
@@ -232,7 +249,13 @@ the same from any worktree.
   reported when it holds ignored files) and branch. `--next` takes a TODO
   item DOING, or with `--next-title` founds a new number (same law as
   `po open`); `--also-done` closes an investigation (DOING, no commits)
-  in the same commit, with no merge and no tag.
+  in the same commit, with no merge and no tag. A no-change item (its
+  branch has no commit main lacks, its worktree is clean, and the newest
+  stamp names that tip clean and passing: the claim "no change needed" is
+  stamped, not typed) closes with no fast-forward: the admin commit is
+  written first and the tag goes on it (annotated message `<tag>: <title>
+  (no change needed)`); the dry run says "no change: the tag goes on the
+  admin commit", and the hook's `PO_ITEM_COMMIT` is the admin commit.
 - `[hooks] on_close` — an optional manifest command (`sh -c`) that
   `po close --commit` runs once the whole boundary is complete (ff, tag,
   admin, `--next`, prune), in the main worktree with stdin `/dev/null` and
@@ -378,6 +401,14 @@ the same from any worktree.
   warning and exit 7; the boundary stands, and `po setup record <version>
   --commit` writes them again from the item's tag, keeping confirmed steps).
   An exempt item with a well-formed section still has its steps recorded.
+- `po release <N> --setup` prints the `### Setup after install` block of `CHANGELOG.md`'s
+  `## Release N` entry (else `## Unreleased`), built from the recorded steps of the items the entry
+  names (every `vX.Y` in it, ignoring a block already there): the word `None`, or the table
+  `| # | Machine | Command | Who | Check |`, one row per step in item then step order, the item
+  after the command (`(v0.9)`). A `|` in a cell is written `\|`; a command with backticks gets a
+  longer code fence. `--write` inserts it right under the `## Release N` heading, or replaces the
+  block there (idempotent); recorded steps are never edited. Under `[release] review = true` it
+  refuses (6) without the review row, like `po release <N>`.
 - `po setup list [--item <version>] [--all] [--json]` — read-only: the
   recorded steps still open (`--all` adds the confirmed ones, with who and
   when), one line each (`v0.9 #1  open  build host  operator  <command>`,
@@ -416,6 +447,13 @@ the same from any worktree.
   caller passes with `po released --release <tag>` (a feed producer reads the
   newest GitHub release; the kit never calls GitHub); `none` has no release.
   Another value, or `pattern` without `tag`, is a manifest error (2).
+- `[gate] drain_secs` — an optional integer, seconds (default 5): how long
+  `po stamp` keeps reading a command's output after the command has exited.
+  Anything but an integer is a manifest error (2).
+- `[gate] scope` — an optional `true`/`false` (default `true`): run each stamp
+  command in its own transient user scope to detect processes it leaves
+  behind. `false` (or `PO_STAMP_NO_SCOPE=1`) is for hosts without a user
+  systemd.
 - `[stamp] slow_after` — an optional integer, seconds (default 300): a stamp
   run that took longer is marked `slow` in `po events` and in the
   dashboard. Information only.
@@ -440,27 +478,33 @@ the same from any worktree.
   otherwise); a tag given that is not in the repository is exit 2 (fetch tags
   first). A feed producer uses it to fill the projects feed's `release` and
   `released` fields.
+- `po release <N> [--open-review] [--commit]` — under `[release] review = true` (a bare `true` or `false`; absent is off) it refuses, exit 6, unless the backlog has a TODO, DOING or DONE row titled `test review: ... release-N`; `--open-review` adds that row as an admin commit (a dry run without `--commit`, idempotent); with the key off and no flag it prints nothing.
 - `po team [--json]` — the feed the dashboard Team view reads
   (`--team-url`, below), built from what the kit knows, read-only. The roster is
   the manifest's `[[team.agent]]` tables, in file order: `name` (required,
-  unique, matched without regard to case), optional `model` and `role`. Per
-  agent it prints `{agent, model?, state, now, owns[], free, limit_until?,
-  usage?}` (`--json`: one JSON array; otherwise a table). `state` is
+  unique, matched without regard to case), optional `model` and `role`.
+  Per agent it prints `{agent, model?, state, now, owns[], working_on?, free,
+  limit_until?, usage?}` (`--json`: one JSON array; otherwise a table). `state` is
   `WORKING`, or `idle <time>` (`22m`, `3h`, `2d`; `idle never` with no event)
   from the age of the agent's newest event in the gate event log (`BUZZ_AGENT`
   or the user name is the event's agent). `owns` is the open items (DOING,
   PAUSED, BLOCKED) whose `[layout] owner_column` cell names the agent, by
-  version; without that key nobody owns anything. An agent is `WORKING`, with
-  `now` its lowest-numbered DOING item, while it owns a DOING item and its
-  newest event is under 15 minutes old. `free` is true for an agent that is
-  not WORKING and either owns nothing, or has been idle 15 minutes or more
-  with every owned item held (PAUSED or BLOCKED, waiting on someone else);
-  an agent with a DOING item is never free. Host facts are not probed:
-  `[team] limits_file` (a JSON object, agent to an ISO time or `null`) and
-  `usage_file` (agent to `{five_hour, seven_day}`, numbers) are merged into
-  `limit_until` and `usage` when the files exist; a missing file is ignored,
-  an unreadable one warns on stderr and is left out (both need `python3`;
-  paths are relative to the main worktree). An empty roster is an error (2).
+  version; without that key nobody owns anything. `working_on`, when present,
+  is the agent's current item: it splits `owns` into `working on:` and
+  `parked:` in the Team view; absent, the whole list is shown as `owns`. An
+  agent is `WORKING`, with `now` its lowest-numbered DOING item, while it owns
+  a DOING item and its newest event is under 15 minutes old. `free` is true
+  for an agent that is not WORKING and either owns nothing, or has been idle
+  15 minutes or more with every owned item held (PAUSED or BLOCKED, waiting
+  on someone else); an agent with a DOING item is never free. An idle agent
+  with owns is marked `idle, owns N items`; a missing or non-array `owns`
+  field is treated as empty. Host facts are
+  not probed: `[team] limits_file` (a JSON object, agent to an ISO time or
+  `null`) and `usage_file` (agent to `{five_hour, seven_day}`, numbers) are
+  merged into `limit_until` and `usage` when the files exist; a missing file
+  is ignored, an unreadable one warns on stderr and is left out (both need
+  `python3`; paths are relative to the main worktree). An empty roster is an
+  error (2).
   `po serve` exposes the same array at `/team.json`. `examples/team.po.toml`
   is a sample roster.
 - `po dispatch --plan | --commit` — gives the ready items to the free eligible
@@ -495,7 +539,7 @@ the same from any worktree.
   300), time, and a note icon when the event has a
   detail (its tooltip and aria-label are the detail, then, for a failed
   stamp, the failing leg's tail and the log's path); each row links to `/all`,
-  the full list, in the same layout; `/events.json` is the same data as JSON (live events only), `/archive.json` the archive in the same shape (`po events --archived --json`, read-only, on the same loopback rule), and `/team.json` is `po team --json`. The pages poll it every
+  the full list, in the same layout; `/events.json` is the same data as JSON (live events only; it answers with an `ETag`, a hash of the whole feed, and `304 Not Modified` with no body to a matching `If-None-Match`; `?since=<time>` returns only the events at or after that time, and those with no time, marked `X-Po-Since: partial`, while a request without it is marked `X-Po-Since: full`, so `po-dashboard` fetches it conditionally and incrementally), `/archive.json` the archive in the same shape (`po events --archived --json`, read-only, on the same loopback rule), and `/team.json` is `po team --json`. The pages poll it every
   few seconds and redraw in place; times are UTC in the data and shown in the
   browser's local time. Every field is HTML-escaped. It reads events only by
   running `po events --json` (so it needs a po that has `po events`) and needs
@@ -505,6 +549,56 @@ the same from any worktree.
   interface's. There is no login, so bind only to an address whose reachers you
   trust. It prints `po serve: listening on http://<addr>:<port>/` and runs until
   stopped; `--port 0` picks a free port.
+
+  **The web view, `/app/`.** The same server also serves a phone-ready page: one HTML, one CSS and two
+  JavaScript files from `share/po-web/` (no framework, no build step, no CDN, no external request; it
+  works from its own files). It opens on **Decisions**, with a toggle Decisions, Events, Projects, Team
+  and a count on each (`Decisions (2)`, `Events (5 today)`, `Projects (3)`, `Team (1 working)`); the
+  chosen view is kept in the address (`#team`) so a reload returns to it. A decision card shows its kind,
+  title, who waits and `asked 12m ago`, collapsed to that header until tapped, with a choice's options
+  listed and the recommended one marked. It lays out for a 360 px
+  screen (44 px tap targets, no sideways scroll) and in columns on a wide one, follows the system's light
+  or dark scheme, refreshes every 10 s with `If-None-Match` (a hidden tab pauses), and when a fetch fails
+  keeps what it has and shows `not updated 5m ago`. Feed text is only ever written as text, never as markup.
+  The page reads the feeds through `po serve` itself (`GET /app/feeds/<name>.json`, same origin, GET only),
+  forwarding to the one URL `po.toml` names for each:
+
+  ```toml
+  [serve.web]
+  decisions_url = "http://127.0.0.1:8790/decisions.json"   # each optional; no URL hides that view
+  projects_url = "http://127.0.0.1:8790/projects.json"
+  team_url = "http://127.0.0.1:8790/team.json"
+  events_url = "http://127.0.0.1:8790/events.json"         # none: po serve's own events
+  answer_url = "http://127.0.0.1:8791/answers"             # only its origin is added to the page's policy
+  ```
+
+  (`examples/web.po.toml`). Only `If-None-Match` goes up to a feed, and `?since=` on events; the upstream's
+  `ETag`, `X-Po-Since` and 304 come back, and an unreachable or non-JSON feed is a 502 with `{"error": ...}`.
+  `/app/config.json` lists the feeds and `answer_url` for the page. Every `/app/` answer carries a
+  `Content-Security-Policy` that allows only the page's own files and the one `answer_url` origin,
+  `Referrer-Policy: no-referrer` and `nosniff`; any method but GET is 405. The page's files are served from the
+  `share/po-web/` of the checkout running `po serve`, with an `ETag` and 304. `/`, `/all` and the JSON feeds are
+  unchanged. There is still no login: bind to an address whose reachers you trust.
+
+  **Answering from the page.** With `answer_url` set, an expanded Choice card gets its options as a stacked
+  radio group (long labels wrap) and an `or write your own` box, an Action card Pass or Failed (with the step
+  it failed at) and a note, and a Send button that stays in view at the bottom of a small screen. Send posts
+  the same JSON body as the desktop viewer's (see "Answering decisions" below; `client` is `po-dashboard`) to
+  `answer_url`, with the device token as `Authorization: Bearer`. The token is entered once with the header's
+  `Set device token` button and kept in the browser's storage for the page's origin; the page shows only
+  `device token set`, never the token, and sends it nowhere but `answer_url`. A draft (the pick and the text)
+  is kept per card across refreshes and reloads; while the pick is unchanged a new Send reuses the same
+  `answer_id`, so a retry after a lost reply posts nothing twice. Send is disabled from the tap until the
+  reply. The card then shows `sent 3:41 PM` and leaves the list with the next feed; `already answered` (409),
+  `no longer waiting` (404), `not sent: refused (401), check the device token`, `not sent: rate limit` (429),
+  or `not sent: <class>` when the sink cannot be reached (the draft is kept). A browser cannot tell an
+  unreachable sink from one that refused its preflight, so that case reads `not sent: unreachable or refused`.
+  A look card (an action with `requires`) is shown, and so answerable, only when its ready check passes, as in
+  the desktop viewer; its answer names the build the install machine reported. Cards with no answer form
+  (unformatted) say to answer in their thread. The page and the sink are two origins: the sink must answer
+  the browser's `OPTIONS` preflight for the page's origin (`Access-Control-Allow-Origin` that origin,
+  `Allow-Methods: POST`, `Allow-Headers: Authorization, Content-Type`) and expose `X-Reason`, and must refuse
+  any other origin.
 - `po-dashboard [--url <url>] [--archive-url <url>] [--team-url <url>] [--decisions-url <url>] [--projects-url <url>] [--view events|team|decisions|projects|reports] [--project <name>] [--theme auto|light|dark] [--all] [--size WxH] [--check] [--screenshot <png>] [--screenshot-delay <s>]`
   (`bin/po-dashboard`, not a `po` subcommand) — a desktop window for the same
   events: the last 10 as soft raised single-line cards (result, item, project,
@@ -541,16 +635,24 @@ the same from any worktree.
   them); the logic is `lib/po/dashboard_core.py`, which needs neither.
   `--team-url` or `PO_DASHBOARD_TEAM_URL` (no default; `--team-url` wins) adds a
   Team view, a header toggle Events | Team: one line per agent from a JSON
-  array of `{agent, model?, state, now, owns[], free, limit_until?, usage?}`
+  array of `{agent, model?, state, now, owns[], working_on?, free, limit_until?, usage?}`
   (name, then the optional `model` string in muted text, nothing when absent;
-  one Status column, then the `now` item and the `owns` items). Status is
+  one Status column, then the `now` item and the `owns` items). `working_on`,
+  when present, splits the owns list into `working on:` and `parked:`; absent,
+  the whole list is shown as `owns`. Status is
   `LIMIT until <time>` (in the viewer's local time, with the date when not
   today; red; it wins over the rest) while `limit_until`, an ISO time, is still
   ahead (null, absent, past or unparseable is no limit); else `state` as given
   with a live dot when it starts with WORKING; else a FREE badge when `free`;
-  else `state` in muted text (`idle 22m`). `usage` is
+  else `state` in muted text (`idle 22m`). An idle agent that still owns
+  items gets a warning card (amber border, ⚠️, "idle, owns 3 items"); missing
+  or non-array `owns` counts as empty, and warning agents sort to the top of
+  the Team view. `usage` is
   `{five_hour, seven_day}`, each 0-1, shown after the status as muted
-  percentages (`5h 42% · 7d 18%`), only the parts present; old feeds without
+  percentages (`5h 42% · 7d 18%`), only the parts present; values above 1 are
+  shown as-is (`130%`), and non-numeric values, `NaN`, and `null` are left out
+  (never shown as `NaN%`). The guard is `Number.isFinite`. The same words are
+  repeated in the card's accessible label (`aria-label`). Old feeds without
   `limit_until` or `usage` show as before. It is refreshed with the events; a failed fetch keeps the last
   team data and says so. The feed is an http(s) URL or a file
   (`examples/team-feed.json` is a sample); without the option there is no
@@ -634,8 +736,8 @@ window. `--check` prints the rows the window would show, without a
   `--projects-url` or `PO_DASHBOARD_PROJECTS_URL` (no default; `--projects-url`
   wins; an http(s) URL or a file, like the team feed) reads the projects feed, refreshed
   with the events; a failed fetch keeps the last projects data and says so. The feed is
-  a JSON array of `{project, last_event?, release?, items: [{item, title?, status, agents: [], released?, setup_open?}]}`:
-  `last_event` is an ISO time or null; `status` is the item's po status word: TODO,
+  a JSON array of `{project, error?, last_event?, release?, items: [{item, title?, status, agents: [], released?, setup_open?, last_event?}]}`:
+  `last_event` is an ISO time or null; an item's own `last_event` (optional, the time of that item's newest event, left out when it has none) feeds the web Projects card; `status` is the item's po status word: TODO,
   DOING and DONE, with PAUSED and BLOCKED counted as DOING, and any other word (HELD)
   listed under All only and counted nowhere; `agents` are the names tied to the item,
   in order, filled by the producer of the feed: for TODO the agents that could take it,
@@ -650,6 +752,19 @@ window. `--check` prints the rows the window would show, without a
   Any other item with steps open shows a muted `setup 2 open` badge on its row, and a
   project card a muted `setup open N` line (all its items' open steps); `--check` then adds
   ` | setup open N` to the project's line.
+  The web Projects card (`/app/`, `#projects`) shows the release label, the count line, the muted `setup open N`
+  and wrapped `n not in a filter: ...` lines as the desktop card does, then one line per DOING item (PAUSED and
+  BLOCKED count as DOING): `v0.99 - budy - 2m ago` (item, its first agent, the age of that item's own `last_event`;
+  the owner is left out when there is none), at most 5 and then `+n more`. A line is amber when that event is
+  older than `stall_minutes` (`[serve.web] stall_minutes` in po.toml, an integer, default 30; `/app/config.json`
+  carries it), and an item without a readable `last_event` reads `no events` in amber. A card with an `error` is
+  greyed and shows its last good lines.
+  `error` is an optional one-line string: the producer sets it when it could not read
+  that project this time and sends the last good data instead (items, release,
+  last_event), so a project never vanishes from the feed. A card with an `error` is
+  greyed (muted text, no light colour), says `feed error`, carries the error in its
+  tooltip, still opens and shows the last good items; counts and the light come from that
+  data. A non-string or empty `error` reads as absent; `--check` adds ` | feed error: <text>`.
   The kit defines the shape only; the producer is yours.
   `examples/projects-feed.json` is a sample, and `examples/events-demo-server.py`
   serves it at `/projects.json` with fresh times. `--check` prints
@@ -799,7 +914,7 @@ window. `--check` prints the rows the window would show, without a
 
 ## Development
 
-Tests: `tests/run.sh` (throwaway repos in a temp dir). The runner fails loudly when a block dies: it ends with a `RUN-END` line (or prints `RUN-ABORTED` and exits non-zero), and `[gate] run_sentinel = "required"` makes `po stamp` refuse a test count from a run that has no `RUN-END`. Lint:
+Tests: `tests/run.sh` (throwaway repos in a temp dir). The web page in a real browser (a draft kept across a reload, Send against a stub sink, 390 px screenshots) is a separate run, as it needs a Chromium: `PO_WEB_CHROME=<chrome> node tests/web-browser.test.js <out dir>`. The runner fails loudly when a block dies: it ends with a `RUN-END` line (or prints `RUN-ABORTED` and exits non-zero), and `[gate] run_sentinel = "required"` makes `po stamp` refuse a test count from a run that has no `RUN-END`. Lint:
 `shellcheck -x bin/po bin/po-install lib/po/*.sh tests/run.sh`.
 `AGENTS.md` is a short guide for coding agents that use po;
 `CHANGELOG.md` lists what each release changed. A pre-release review never holds a release; its fixes ship as `release-N.1` (see `AGENTS.md`, "Releases and the pre-release review").

@@ -8,8 +8,39 @@
 #   github  the tag the caller passes with --release (a feed producer reads
 #           the newest GitHub release; the kit never calls GitHub)
 #   none    no releases (the default when [release] is absent)
-# An item is released when its item tag ([versioning] tag filled) is an
-# ancestor of the release tag. A DONE row without an item tag is not.
+# A DONE item is released by one of two rules:
+#   tagged    its item tag ([versioning] tag filled) exists: released when
+#             that tag is an ancestor of the release tag. A tag that exists
+#             but is not an ancestor is not released; the rule below is not
+#             tried.
+#   untagged  no item tag is filled in or the tag is absent from the
+#             repository: the DONE commit decides. That is the newest commit
+#             on the main branch whose subject starts `admin: <v> DONE` (<v>
+#             as the backlog writes it, with or without a leading `v`, up to
+#             the following space), else the newest commit that changed the
+#             item's row in the backlog. Released when that commit is an
+#             ancestor of the release tag; no such commit means not released.
+
+# po_released_done_commit <version>: the DONE commit of an untagged item, or
+# nothing. See the rules in the header.
+po_released_done_commit() {
+	local v=$1 main backlog sha subj tpl cell re cand
+	main=$(po_get layout.main)
+	backlog=$(po_get layout.backlog)
+	for cand in "v$v" "$v"; do
+		while IFS=' ' read -r sha subj; do
+			[[ $subj == "admin: $cand DONE"* ]] || continue
+			[[ -z ${subj#"admin: $cand DONE"} || ${subj#"admin: $cand DONE"} == [[:space:]]* ]] || continue
+			printf '%s' "$sha"
+			return 0
+		done < <(git log "$main" --format='%H %s' --fixed-strings --grep="admin: $cand DONE" 2>/dev/null)
+	done
+	tpl=$(po_get versioning.tag)
+	cell=$(po_fill "$tpl" "$v")
+	[[ -n $cell ]] || cell=$v
+	re=$(printf '%s' "$cell" | sed 's/[][\.*^$]/\\&/g')
+	git log "$main" -1 --format=%H -G"^[|] *$re *[|]" -- "$backlog" 2>/dev/null
+}
 
 po_cmd_released() {
 	local json=0 given='' have_given=0
@@ -47,17 +78,26 @@ po_cmd_released() {
 	local -a released=()
 	if [[ -n $release ]]; then
 		po_backlog_load
-		local rec v st tpl tag
+		local rec v st tpl tag done_commit
 		declare -A seen=()
 		tpl=$(po_get versioning.tag)
 		for rec in "${PO_ITEMS[@]}"; do
 			IFS=$'\t' read -r v st _ <<<"$rec"
 			[[ -z ${seen[$v]+x} ]] || continue
 			seen[$v]=1
-			[[ ${st%% *} == DONE ]] || continue
+			# Adopt the dashboard's status_word rule (first word, upper-cased,
+			# trailing punctuation stripped) so DONE:, DONE. and done count.
+			_word=${st%% *}; _word=${_word^^}
+			while [[ $_word == *[[:punct:]] ]]; do _word=${_word%?}; done
+			[[ $_word == DONE ]] || continue
 			tag=$(po_fill "$tpl" "$v")
-			git rev-parse -q --verify "refs/tags/$tag^{commit}" >/dev/null || continue
-			git merge-base --is-ancestor "refs/tags/$tag" "refs/tags/$release" && released+=("$v")
+			if [[ -n $tag ]] && git rev-parse -q --verify "refs/tags/$tag^{commit}" >/dev/null; then
+				git merge-base --is-ancestor "refs/tags/$tag" "refs/tags/$release" && released+=("$v")
+				continue
+			fi
+			done_commit=$(po_released_done_commit "$v")
+			[[ -n $done_commit ]] || continue
+			git merge-base --is-ancestor "$done_commit" "refs/tags/$release" && released+=("$v")
 		done
 	fi
 

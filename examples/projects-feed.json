@@ -5,7 +5,7 @@
     "release": "release-3",
     "items": [
       {"item": "3.1", "title": "Plant", "status": "TODO", "agents": ["ana", "ben"]},
-      {"item": "3.2", "title": "Water", "status": "DOING", "agents": ["cy"]},
+      {"item": "3.2", "title": "Water", "status": "DOING", "agents": ["cy"], "last_event": "2026-11-01T14:58:00Z"},
       {"item": "3.3", "title": "Harvest", "status": "DONE", "agents": ["dee", "cy", "ana"], "setup_open": 2}
     ]
   },
@@ -14,12 +14,24 @@
     "last_event": "2026-10-25T20:00:00Z",
     "release": null,
     "items": [
-      {"item": "1.4", "title": "Dock", "status": "PAUSED", "agents": ["ben"]},
-      {"item": "1.5", "title": "Sail", "status": "HELD", "agents": []}
+      {"item": "1.1", "title": "Dock", "status": "PAUSED", "agents": ["ben"]},
+      {"item": "1.2", "title": "Sail", "status": "HELD", "agents": []},
+      {"item": "1.3", "title": "Anchor", "status": "HELD", "agents": []},
+      {"item": "1.4", "title": "Moor", "status": "HELD", "agents": []},
+      {"item": "1.5", "title": "Chart", "status": "HELD", "agents": []},
+      {"item": "1.6", "title": "Knot", "status": "HELD", "agents": []},
+      {"item": "1.7", "title": "Buoy", "status": "HELD", "agents": []},
+      {"item": "1.8", "title": "Fathom", "status": "HELD", "agents": []},
+      {"item": "1.9", "title": "Stern", "status": "HELD", "agents": []},
+      {"item": "1.10", "title": "Bow", "status": "HELD", "agents": []},
+      {"item": "1.11", "title": "Port", "status": "HELD", "agents": []},
+      {"item": "1.12", "title": "Starboard", "status": "HELD", "agents": []},
+      {"item": "1.13", "title": "Keel", "status": "HELD", "agents": []}
     ]
   },
   {
     "project": "meadow",
+    "error": "po released --json: exit 1",
     "last_event": "2026-10-20T00:00:00Z",
     "release": "v2.1",
     "items": [

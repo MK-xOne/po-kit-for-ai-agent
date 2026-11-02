@@ -10,10 +10,127 @@ Each item's notes say what changed, what agents must now do (**Agents**), and
 which optional manifest keys a project may turn on (**Adopt**, by its PO's
 admin commit). At each item close they go under **Unreleased**; at a release,
 Unreleased becomes `## Release N (YYYY-MM-DD): <theme>`. Each release entry opens with a
-`### Setup after install` block: every setup step of the release's items in
-order, or `None`.
+`### Setup after install` block: every setup step of the release's items in order, or
+`None`. The steps are a markdown table with the columns #, Machine, Command, Who, Check:
+one row per step or per group of steps.
 
 ## Unreleased
+
+## Release 23 (2026-11-02): web dashboard on the phone, release counting by DONE commit, stamp drain
+
+### Setup after install
+
+| # | Machine | Command | Who | Check |
+|---|---|---|---|---|
+| 1 | the build host (private host glue; nothing in the public kit) | `install the host glue && systemctl --user daemon-reload && systemctl --user enable --now` the timers it added (v0.102, v0.103, v0.107, v0.132) | the session on that host | `systemctl --user list-timers` lists each added timer with a next run |
+| 2 | the machine that shows the dashboard | install the release package (`pacman -Q` shows the release build), then restart `po-dashboard` (v0.97 look-card freshness, no `pacman` on the GTK thread) | the session on that machine | `po-dashboard --check` prints one line per project |
+| 3 | the host where `po serve` runs | restart `po-serve` so `/app/` is served and `/events.json` answers ETag/304 and `?since=` (v0.93, v0.112-v0.116) | the session on that host | `curl -sI <serve-url>/app/` answers 200 |
+
+**Agents:** `po released` now counts an untagged DONE row as released when its DONE commit is an ancestor of the release tag (v0.134); `po stamp` no longer hangs on a test that leaks a process holding the output (v0.128, `[gate] drain_secs`); `po release <N> --setup` prints the Setup block from recorded steps (v0.106) and `po release <N> --open-review` opens the pre-release review (v0.105); `po close` closes a no-change item (v0.100). **Adopt:** `po serve` serves the phone page at `/app/` and answers ETag/304 and `?since=` (v0.93, v0.112-v0.116; its auth design is `docs/design/web-dashboard-auth.md`, v0.111). Items: v0.90-v0.116, v0.128, v0.131, v0.132, v0.134 (the entries below; v0.90, v0.94, v0.101, v0.131 and v0.132 touch only private files).
+
+### `po released` counts untagged DONE rows by their DONE commit (v0.134, 2026-11-02)
+
+A DONE row whose item tag does not exist (none filled in `[versioning] tag`, or absent from the repository) is released when its DONE commit is an ancestor of the release tag. The DONE commit is the newest commit on the main branch whose subject starts `admin: <v> DONE`, else the newest commit that changed the item's row in the backlog; none found means not released. A tag that exists keeps the old rule (ancestor of the release tag) and the DONE commit is not tried. Output shape is unchanged; the `released` list has more members. **Agents**: nothing. **Adopt**: nothing. Setup after install: in a project with `[release] source = "tag"`, run `po released --json` and check older untagged DONE rows are listed.
+
+### `po stamp` no longer hangs on leaked test processes (v0.128, 2026-11-02)
+
+`po stamp` reads a command's output only until the command exits plus `[gate] drain_secs` (default 5), so a process the test left holding the output cannot keep the stamp waiting. Each command also runs in a transient user scope (`systemd-run --user --scope`); processes still alive there afterwards fail the stamp with `po stamp: <n> process(es) left behind by <leg>: <names>`, and the scope is stopped (killed after 2 seconds if it ignores SIGTERM). Applies to every leg, `[stamp] prepare` line and the count command. **Agents**: a gate whose run leaves processes now fails; clean them up in the test. **Adopt**: optionally `drain_secs` and `scope = false` under `[gate]`; `PO_STAMP_NO_SCOPE=1` turns the scope off. Setup after install: on a machine running gates with browser tests, run one gate whose test leaves a background process and check `po stamp` ends with the leftover line.
+
+### The dashboard feed server versioned and fixed (v0.104, 2026-11-02)
+
+`serve-all.py` and `po-dashboard.service` are now in `private/hostglue/` (`bin/`, `units/`), tracked by `install --check` and covered by `--rollback`. Defects fixed: `/archive.json` crashed (`load_all` took no `cmd`); one malformed `channel-repos.json` entry hid every project but one; feeds were rebuilt inside the request (projects-feed ~18 s against a 5 s timeout, 1998 BrokenPipe tracebacks in 24 h), now a TTL cache per feed rebuilt by its own background thread; team, decisions and projects answer an ETag and 304; `/looks.json` is served (one `mk-queue` run feeds both); a feed failing, recovering, a repo left out and a producer's stderr are logged once per change; the unit runs the installed copy and has `CacheDirectory=projects-feed`. A broken feed degrades to its own 502 while the others answer. **Agents**: nothing. **Adopt**: nothing. Setup after install: on the build host run `private/hostglue/install` then `systemctl --user restart po-dashboard`; check `curl -s -D - -o /dev/null http://100.106.128.3:8790/projects.json` returns 200 with an ETag in well under 1 s, `/looks.json` returns 200, and `install --check` lists neither file.
+
+### Web dashboard 5/5: answering from the phone (v0.116, 2026-11-02)
+
+The page's Decisions view now answers a card exactly as the desktop does (same body and kind): choice radios with wrapping labels, a write-in box, Pass/Failed with a step for actions, Send always in view and disabled until the sink replies, a draft kept per card across reloads and refreshes, `sent <time>` or `not sent: <class>`; look cards stay held unless ready. The sink (`answer-receiver`) gains the device layer of `docs/design/web-dashboard-auth.md`: a per-device bearer token bound to its tailnet node, an Origin allow-list, a content-type and size cap, a per-device rate limit, replay and closed-card refusal, an audit line, and a start-up refusal of a wildcard or non-tailnet `--bind`. New `answer-device` command: `issue`, `list`, `revoke` (token stored as sha256 only, revocation effective on the next request). **Agents**: nothing. **Adopt**: set `answer_url` under `[serve.web]` once the sink is installed. Setup after install: on the build host run `private/hostglue/install`, issue a device token with `answer-device issue`, restart `answer-receiver` and `po serve`, install the token on the phone (the host session, the owner); check a test card can be answered from the phone over Tailscale and a revoked token is refused.
+
+### `sleep-cycle` and its watchdog versioned and fixed (v0.103, 2026-11-02)
+
+`private/hostglue/bin/sleep-cycle` and the units `sleep-cycle.service`, `sleep-cycle.timer`, `sleep-cycle-watchdog.service`, `sleep-cycle-watchdog.timer` are now in `private/hostglue/`, tracked by `install --check` and covered by `--rollback`. Defects fixed: a failed hand-over no longer keeps the state file (every later 1 AM run refused); a unit is saved to the state before its stop; any error inside a run wakes everyone at once; the 7 AM watchdog stops a still-running cycle first; a unit that fails to start on wake stays in the state for retry and the owner is told once; run and wake share a flock; a failing 3 AM alert post is logged; `--dry-run` rehearses the wake; the watchdog timer is `Persistent=true`. **Agents:** nothing. **Adopt:** nothing. Setup: on the build host run `private/hostglue/install` then `systemctl daemon-reload` (never during the 1 AM window); check `install --check` is silent on the five files and `systemctl list-timers sleep-cycle.timer sleep-cycle-watchdog.timer` shows the next runs unchanged.
+
+### Web dashboard 3/5: Projects overview names the DOING items with their last-event age (v0.114, 2026-11-02)
+
+The web Projects card now matches the GTK card (release label, count line, `setup open N`, wrapped `n not in a filter`, greyed `feed error`) and lists its DOING items one per line as `v0.99 - budy - 2m ago`, amber when the item's own last event is older than `[serve.web] stall_minutes` (default 30) or absent (`no events`); at most 5 lines, then `+n more`. `private/hostglue/bin/projects-feed` fills an optional per-item `last_event` (ISO time) and `parse_projects` accepts it. **Agents**: nothing. **Adopt**: optionally `stall_minutes` under `[serve.web]` (see `examples/web.po.toml`). Setup after install: on the build host run `private/hostglue/install`, then check that `curl -s <projects-feed-url> | grep -c last_event` is not 0.
+
+### Web dashboard 4/5: the Team view in words (v0.115, 2026-11-01)
+
+The Team view now shows each agent's usage in words (`5h 42% · weekly 61% · limit until 5:46 PM`, parts left out when missing or non-numeric), splits what an agent works on from what it merely owns (`working_on?` in the shared team feed), and puts agents that are idle while owning items first, in amber with a warning mark (`team_sort`). The usage words are the card's accessible label. **Agents**: nothing. **Adopt**: none. Setup after install: reload `/app/`.
+
+### Web dashboard 2/5: the Events view (v0.113, 2026-11-01)
+
+The page's Events view now groups consecutive events of the same project and item into one card (newest first, at most 50 groups), shows each card's age as a viewer-local relative time (absolute time as the line's tooltip), and has a project filter bar (All plus one chip per project) kept in `localStorage`; the view stays in the URL hash. On a phone (under 800 px) a group shows its header line only until tapped. Decisions, Projects and Team are unchanged. **Agents**: nothing. **Adopt**: none. Setup after install: reload `/app/`.
+
+### Web dashboard 1/5: the page at /app/ and the Decisions home view (v0.112, 2026-11-01)
+
+`po serve` now also serves a phone-ready page at `/app/` (four fixed files from `share/po-web/`, ETag and 304, a Content-Security-Policy and `Referrer-Policy: no-referrer` on every `/app` answer), `/app/config.json`, and read-only same-origin proxies `/app/feeds/<name>.json` of the feeds named in the manifest's `[serve.web]` section (`decisions_url`, `projects_url`, `team_url`, `events_url`, `answer_url`; see `examples/web.po.toml`). A feed URL is fetched as configured and never follows a redirect. The page opens on Decisions with a count on every toggle, keeps the chosen view in the URL hash, refreshes every 10 s, shows a banner when a fetch fails, and pauses in a hidden tab; feed text is only ever rendered as text. Events, Projects and Team are minimal until the next items. **Agents**: nothing. **Adopt**: add `[serve.web]` to a project's manifest to turn the page's views on. Setup after install: restart `po serve` where it runs and open `/app/`; the page is read-only until answering is added.
+
+### A failing project stays in the projects feed (v0.109, 2026-11-01)
+
+When one repository fails while the projects feed is built, the producer now keeps its entry with an `error` line and its last good data (kept in `<cache dir>/projects-last-good.json`) instead of dropping it; a failing `po ready` sets `error: "ready list: ..."`. The dashboard accepts the optional `error` string and shows that project's card greyed with `feed error`, still opening with its last good items. A failure in the release or setup lookup stays non-fatal and sets no `error`. **Agents**: nothing. **Adopt**: none. Setup after install: `private/hostglue/install` on the producing host, then `install --check` is silent; restart `po-dashboard` where it is shown.
+
+### report-sweep re-pings unprocessed REPORTs and idle-owner DOING items (v0.107, 2026-11-01)
+
+`private/hostglue/bin/report-sweep` with `report-sweep.service` and `.timer` (every 15 minutes) re-pings the PO once, in the thread, for a developer REPORT, COMMIT or BLOCKED older than 30 minutes with no later PO message, and once for a DOING item whose owner has been idle 45 minutes; one escalation line after 2 hours; a state file keeps it to once per stall and re-arms it when the cause is gone; `--dry-run` posts nothing. **Agents**: nothing. **Adopt**: none. Setup after install: `private/hostglue/install`, then `systemctl --user enable --now report-sweep.timer`, check `systemctl --user list-timers report-sweep.timer` (the host session). The first run posts about 13 pings for the items already idle.
+
+### `po release` assembles the Setup block (v0.106, 2026-11-01)
+
+New `po release <N> --setup` prints the entry's `### Setup after install` block from the recorded steps (`po setup list`) of the items the `## Release N` entry names (else `## Unreleased`): `None`, or the five-column table, one row per step, the item after the command. `--write` inserts it under the `## Release N` heading and replaces a block already there (idempotent). A `|` is escaped `\|`, a command with backticks gets a longer fence. **Agents**: write the entry's notes first, then run `po release <N> --write` instead of hand-writing the block. **Adopt**: none. Setup after install: None.
+
+### Dashboard: the whole fetch is unconditional, a short body is a note (v0.92, 2026-11-01)
+
+The dashboard's periodic whole fetch no longer sends `If-None-Match`, so a 304 cannot keep events the server has archived; a server that does not offer `?since=` keeps the plain conditional fetch. A short or malformed HTTP body is now a "not updated" note instead of an unhandled error. **Agents**: nothing. **Adopt**: none. Setup after install: restart `po-dashboard` on the machine that shows it.
+
+### `po release` opens the pre-release review (v0.105, 2026-11-01)
+
+New `po release <N> [--open-review] [--commit]`. With `[release] review = true` in the manifest it refuses (exit 6) unless the backlog has a TODO, DOING or DONE row titled `test review: ... release-N`; `--open-review` adds that row as one admin commit (a dry run without `--commit`; idempotent). With the key absent or false and no flag it prints nothing. **Agents**: nothing. **Adopt**: `[release] review = true` turns the refusal on (a project's PO decides). Setup after install: None.
+
+### Projects: the not-in-a-filter line wraps (v0.110, 2026-11-01)
+
+The `n not in a filter` line on a Projects card and on the project screen of `po-dashboard` is a wrapping label with the full text (no ellipsis), growing the card in height only. **Agents**: nothing. **Adopt**: none. Setup after install: restart `po-dashboard` on the machine that shows it.
+
+### Web dashboard auth design accepted (v0.111, 2026-11-01)
+
+`docs/design/web-dashboard-auth.md` fixes how the phone dashboard is served and how its answers are authorised (two listeners, per-device token bound to its tailnet node, plain HTTP inside the tailnet, rate limit). Design only; v0.112 to v0.116 build on it. **Agents**: nothing. **Adopt**: none. Setup after install: None.
+
+### po status without python3, one DONE rule, row CB words (v0.99, 2026-11-01)
+
+`po status` without `python3` on PATH now stops with one line naming python3 and leaves no temp dir (the guard runs before `mktemp -d`). `po released` and the dashboard share one status-word rule: `DONE`, `DONE:`, `done` and `DONE (tag x)` all count as released. Row CB (v0.84) now says the setup-steps key is off by default and the state file is `<git common dir>/po-setup-steps.json`. **Agents**: nothing. **Adopt**: none. Setup after install: None.
+
+### Decisions view: collapsed Action cards readable in dark (v0.108, 2026-11-01)
+
+The collapsed header row of a decision card in `po-dashboard` takes the theme's own base and text colours (class `po-dhead`) instead of the GTK button strip, so it meets WCAG AA (4.5:1) in light and dark. `contrast` in `dashboard_core` is now `contrast_ratio`; the header pairs are in `CONTRAST_PAIRS`. **Agents**: nothing. **Adopt**: none. Setup after install: restart `po-dashboard` on the machine that shows it.
+
+### Setup block is one table format; `the release announcer` accepts it (v0.91, 2026-11-01)
+
+A release entry's `### Setup after install` block is the word `None` or a markdown table with the columns #, Machine, Command, Who, Check (one row per step or group of steps). `the release announcer` checks that table (and refuses prose or the old numbered lines), and its cross-check against `po setup list` is stated in table terms. **Agents:** nothing. **Adopt:** nothing. Setup after install: on the build host, install the host glue (as v0.89); `the release announcer release-22` (dry run) exits 0.
+
+### Test-browser reaper versioned (v0.102, 2026-11-01)
+
+`private/hostglue/bin/reap-test-browsers` and the units `test-reaper.service` / `test-reaper.timer` are now in `private/hostglue/`, tracked by `install --check` and covered by `--rollback`. Defects fixed: only this user's processes match, a `bwrap` matches only when it wraps webkitgtk, SIGKILL goes only to pids that still match after the 10 s wait, the log directory is created. **Agents:** nothing. **Adopt:** nothing. Setup: on the build host run `private/hostglue/install`, `systemctl --user daemon-reload`, `systemctl --user enable --now test-reaper.timer`; check `install --check` is silent on the three and `systemctl --user list-timers test-reaper.timer` lists it.
+
+### Dashboard look card: freshness bound, no `pacman` on the GTK thread, doc time format (v0.97, 2026-11-01)
+
+`look_ready` now holds a look card whose `ready.checked_at` is older than 15 minutes (`stale`) or more than 1 minute ahead of the clock (`in the future`); `now` is injectable and defaults to the current UTC time. The installed build is read in the answer worker thread, so Send and Retry never block the window on `pacman -Q`. `docs/design/look-ready.md` quotes the time as the code prints it. **Agents:** nothing. **Adopt:** nothing. Setup after install: on the machine that shows the dashboard, install the release package and restart `po-dashboard`; `pacman -Q` shows the release build.
+
+### look-prep removes a refused snapshot (v0.98, 2026-11-01)
+
+The the laptop `look-prep` helper re-checks a snapshot's size once after 1 s when it differs, and if it still differs removes the copy (`rmtree`) and returns the same refusal reason, so no `*-data-snapshot-*` directory is left behind; a stable copy is kept as before. **Agents:** nothing. **Adopt:** nothing. Setup after install: on the laptop, install the host glue (as the v0.81 look-prep step); `grep -c rmtree` on the installed look-prep must be at least 2.
+
+### `po close` closes a no-change item (v0.100, 2026-11-01)
+
+An item whose branch has no commit main lacks, whose worktree is clean and whose newest stamp names that tip clean and passing now closes: no fast-forward, the admin commit is written first and the tag goes on it (annotated: `<tag>: <title> (no change needed)`). The dry run says "no change: the tag goes on the admin commit", and the `on_close` hook's `PO_ITEM_COMMIT` is the admin commit. A branch with no commit but an uncommitted worktree is refused; an item with one commit closes as before. **Agents:** nothing. **Adopt:** nothing.
+
+### `po setup` rule 2 reads the row it numbered (v0.95, 2026-11-01)
+
+The backlog row that names an item's spec files is now read from the same revision its line number came from, so an item branch that shifts lines in the backlog no longer parses another row; a row that does not carry the item's id is skipped, and files that are not item specs (`CHANGELOG.md`, `README.md`, `AGENTS.md`) are skipped, so a row naming `CHANGELOG.md` resolves to its real spec file. **Agents:** nothing. **Adopt:** nothing.
+
+### `po stamp` compares the test leg with its own count (v0.96, 2026-11-01)
+
+With a leg named `test`, the count taken from its output is now checked against that leg's own summaries, not the sum of every leg: a second leg that prints a summary (doc tests, integration) no longer fails with "the gate passed 5 tests but test_count_cmd counted 3". With no `test` leg the comparison stays the sum of all legs; the printed total is unchanged. **Agents:** nothing. **Adopt:** nothing.
+
+### `po serve` answers ETag/304 and `?since=` on `/events.json` (v0.93, 2026-11-01)
+
+`/events.json` of `po serve` now carries an `ETag` (a quoted hash of the whole feed) and answers a matching `If-None-Match` with `304 Not Modified` and no body; that check comes first, so a `?since=` request is 304 too while the feed is unchanged. `?since=<time>` returns only the events at or after that time (and any event with no time), marked `X-Po-Since: partial`; a request without it is marked `X-Po-Since: full`. A 502 error carries no `ETag`. HEAD stays refused (405), so release 22's setup check (`curl -sI`) is replaced by the one below. **Agents:** nothing. **Adopt:** restart `po serve` where it runs. **Setup after install:** 1. the host where `po serve` runs, restart `po-serve`, the session on that host, check `curl -s -D - -o /dev/null <serve-url>/events.json` shows an `ETag` header.
 
 ## Release 22 (2026-11-01): faster po, RELEASED status, ready look cards, Setup after install
 

@@ -7,6 +7,8 @@
 #   - `[section]` headers (lowercase letters, digits, `_`), each at most once
 #   - one sub-table, `[gate.legs]`, whose keys are free leg names and whose
 #     values are shell commands, kept in file order
+#   - one more sub-table, `[serve.web]`, with the fixed string keys of the
+#     web view's feed URLs (see PO_SCHEMA)
 #   - `key = "basic string"` or `key = 123`, optionally followed by a
 #     `# comment`; the only escapes are \" and \\
 #   - `[[team.agent]]`, repeatable: one roster entry each, with the string keys
@@ -26,6 +28,8 @@ declare -gA PO_SCHEMA=(
 	[gate.test_count_cmd]=0
 	[gate.test_format]=0
 	[gate.run_sentinel]=0
+	[gate.drain_secs]=0
+	[gate.scope]=0
 	[versioning.scheme]=0
 	[versioning.tag]=1
 	[versioning.item_commit]=0
@@ -49,12 +53,19 @@ declare -gA PO_SCHEMA=(
 	[events.live_days]=0
 	[release.source]=0
 	[release.pattern]=0
+	[release.review]=0
 	[project.name]=0
 	[team.limits_file]=0
 	[team.usage_file]=0
 	[ready.file]=0
 	[dispatch.order]=0
 	[dispatch.notify]=0
+	[serve.web.decisions_url]=0
+	[serve.web.projects_url]=0
+	[serve.web.team_url]=0
+	[serve.web.events_url]=0
+	[serve.web.answer_url]=0
+	[serve.web.stall_minutes]=0
 )
 
 # The keys whose value is an array of strings, not a string or an integer.
@@ -68,6 +79,8 @@ declare -gA PO_ARRAYS=(
 # The keys whose value is a bare true or false (no quotes).
 declare -gA PO_BOOLS=(
 	[close.require_setup]=1
+	[release.review]=1
+	[gate.scope]=1
 )
 
 # Defaults for optional keys the kit reads.
@@ -75,6 +88,7 @@ declare -gA PO_DEFAULTS=(
 	[layout.main]=main
 	[versioning.tag_style]=light
 	[stamp.slow_after]=300
+	[gate.drain_secs]=5
 	[events.live_days]=10
 	[release.source]=none
 	[release.pattern]=release-*
@@ -118,7 +132,7 @@ po_manifest_load() {
 			PO_TEAM_NAME+=("") PO_TEAM_MODEL+=("") PO_TEAM_ROLE+=("")
 			continue
 		fi
-		if [[ $line =~ ^\[([a-z0-9_]+|gate\.legs)\]$ ]]; then
+		if [[ $line =~ ^\[([a-z0-9_]+|gate\.legs|serve\.web)\]$ ]]; then
 			in_agent=0
 			section=${BASH_REMATCH[1]}
 			[[ -n ${seen_sections[$section]:-} ]] &&
@@ -185,6 +199,8 @@ po_manifest_load() {
 		po_die "$file: [hooks] on_close needs a non-empty \"command\""
 	[[ -z ${PO_MANIFEST[layout.owner_column]+x} || -n ${PO_MANIFEST[layout.owner_column]} ]] ||
 		po_die "$file: [layout] owner_column needs a non-empty \"column name\""
+	[[ -z ${PO_MANIFEST[serve.web.stall_minutes]+x} || ${PO_MANIFEST[serve.web.stall_minutes]} =~ ^[0-9]+$ ]] ||
+		po_die "$file: [serve.web] stall_minutes must be an integer (minutes): ${PO_MANIFEST[serve.web.stall_minutes]}"
 	[[ -z ${PO_MANIFEST[stamp.slow_after]+x} || ${PO_MANIFEST[stamp.slow_after]} =~ ^[0-9]+$ ]] ||
 		po_die "$file: [stamp] slow_after must be an integer (seconds): ${PO_MANIFEST[stamp.slow_after]}"
 	[[ -z ${PO_MANIFEST[events.live_days]+x} || ${PO_MANIFEST[events.live_days]} =~ ^[0-9]+$ ]] ||
@@ -201,6 +217,8 @@ po_manifest_load() {
 		po_die "$file: [gate] test_format must be \"libtest\" or \"pytest\": ${PO_MANIFEST[gate.test_format]}"
 	[[ -z ${PO_MANIFEST[gate.run_sentinel]+x} || ${PO_MANIFEST[gate.run_sentinel]} == required ]] ||
 		po_die "$file: [gate] run_sentinel must be \"required\": ${PO_MANIFEST[gate.run_sentinel]}"
+	[[ -z ${PO_MANIFEST[gate.drain_secs]+x} || ${PO_MANIFEST[gate.drain_secs]} =~ ^[0-9]+$ ]] ||
+		po_die "$file: [gate] drain_secs must be an integer (seconds): ${PO_MANIFEST[gate.drain_secs]}"
 	local i j
 	for i in "${!PO_TEAM_NAME[@]}"; do
 		[[ -n ${PO_TEAM_NAME[i]} ]] || po_die "$file: [[team.agent]] number $((i + 1)) needs a non-empty \"name\""
@@ -221,7 +239,7 @@ po_manifest_known_section() {
 	local k
 	[[ $1 == gate.legs ]] && return 0
 	for k in "${!PO_SCHEMA[@]}"; do
-		[[ ${k%%.*} == "$1" ]] && return 0
+		[[ ${k%.*} == "$1" ]] && return 0
 	done
 	return 1
 }

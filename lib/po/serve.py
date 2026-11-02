@@ -6,6 +6,7 @@ JSON array); the log file is never read here. GET only, standard library only.
 Run through lib/po/serve.sh, which has already worked out the repository.
 """
 import argparse
+import hashlib
 import html
 import http.server
 import ipaddress
@@ -14,6 +15,9 @@ import os
 import socket
 import subprocess
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 
 LAST = 10
 COLUMNS = ("result", "item", "project", "kind", "checks", "agent", "took", "time", "note")
@@ -29,6 +33,17 @@ NEW_TEXT = {"light": {"text": "#222222", "muted": "#333333", "pass": "#06471a", 
 PO_CMD = ("po", "events", "--all", "--json")
 PO_ARCHIVE_CMD = ("po", "events", "--archived", "--json")
 TEAM_CMD = ("po", "team", "--json")
+WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "share", "po-web")
+WEB_FILES = {  # the only files /app/ serves: path -> (file, Content-Type)
+    "/app/": ("index.html", "text/html; charset=utf-8"),
+    "/app/index.html": ("index.html", "text/html; charset=utf-8"),
+    "/app/core.js": ("core.js", "text/javascript; charset=utf-8"),
+    "/app/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/app/style.css": ("style.css", "text/css; charset=utf-8"),
+}
+DEFAULT_STALL_MINUTES = 30  # an item whose last event is older than this is amber on a web Projects card
+FEED_NAMES = ("decisions", "projects", "team", "events")  # the order the page shows them in config.json
+FEED_TIMEOUT = 15
 
 
 def die(msg, code=1):
@@ -353,6 +368,27 @@ def page(events, error, full):
     )
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None  # a feed URL is fetched as configured: a redirect is an error, never a new target
+
+
+NO_REDIRECT = urllib.request.build_opener(_NoRedirect)
+
+
+def origin_of(url):
+    p = urllib.parse.urlsplit(url)
+    return "%s://%s" % (p.scheme, p.netloc)
+
+
+def web_url(value, flag):
+    """A feed or sink URL from the manifest or a flag: http(s) with a host, else exit 1."""
+    p = urllib.parse.urlsplit(value)
+    if p.scheme not in ("http", "https") or not p.hostname:
+        die("%s must be an http(s) URL with a host: %r" % (flag, value))
+    return value
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "po-serve"
     sys_version = ""
@@ -366,11 +402,102 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         for k, v in extra:
             self.send_header(k, v)
+        self.app_headers()
         self.end_headers()
         self.wfile.write(body)
 
+    def app_headers(self):
+        """Every /app/* answer carries the page's CSP (docs/design/web-dashboard-auth.md 2.3)."""
+        if not self.path.split("?", 1)[0].startswith("/app"):
+            return
+        sink = origin_of(self.server.answer_url) if self.server.answer_url else ""
+        self.send_header("Content-Security-Policy",
+                         "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; "
+                         "connect-src 'self'%s; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+                         % (" " + sink if sink else ""))
+        self.send_header("Referrer-Policy", "no-referrer")
+
+    def not_modified(self, etag, extra=()):
+        self.send_response(304)
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", "no-store")
+        for k, v in extra:
+            self.send_header(k, v)
+        self.app_headers()
+        self.end_headers()
+
+    def matches(self, etag):
+        return etag in (t.strip() for t in self.headers.get("If-None-Match", "").split(","))
+
+    def do_app(self, path):
+        if path == "/app":
+            return self.send(301, "text/plain; charset=utf-8", "", [("Location", "/app/")])
+        if path in WEB_FILES:
+            name, ctype = WEB_FILES[path]
+            try:
+                with open(os.path.join(WEB_DIR, name), "rb") as f:
+                    body = f.read().decode("utf-8")
+            except OSError:
+                return self.send(404, "text/plain; charset=utf-8", "not found\n")
+            etag = '"%s"' % hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
+            if self.matches(etag):
+                return self.not_modified(etag)
+            return self.send(200, ctype, body, [("ETag", etag)])
+        if path == "/app/config.json":
+            return self.send(200, "application/json", json.dumps(
+                {"feeds": [n for n in FEED_NAMES if self.feed_url(n) or n == "events"],
+                 "answer_url": self.server.answer_url or None,
+                 "stall_minutes": self.server.stall_minutes}))
+        m = path.startswith("/app/feeds/") and path.endswith(".json") and path[len("/app/feeds/"):-len(".json")]
+        if m in FEED_NAMES:
+            return self.do_feed(m)
+        return self.send(404, "text/plain; charset=utf-8", "not found\n")
+
+    def feed_url(self, name):
+        return self.server.feeds.get(name)
+
+    def do_feed(self, name):
+        """GET /app/feeds/<name>.json: the one URL configured for <name>, nothing else; only If-None-Match goes
+        up, only ?since= on events. With no events_url, events are this server's own."""
+        url = self.feed_url(name)
+        if not url:
+            if name != "events":
+                return self.send(404, "application/json", json.dumps({"error": "feed %s is not configured" % name}))
+            try:
+                return self.send_events(load_events(self.server.repo))
+            except RuntimeError as e:
+                return self.send(502, "application/json", json.dumps({"error": str(e)}))
+        if name == "events":
+            since = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("since", [""])[0]
+            if since:
+                url += ("&" if "?" in url else "?") + urllib.parse.urlencode({"since": since})
+        req = urllib.request.Request(url, method="GET")
+        inm = self.headers.get("If-None-Match")
+        if inm:
+            req.add_header("If-None-Match", inm)
+        try:
+            with NO_REDIRECT.open(req, timeout=FEED_TIMEOUT) as r:
+                code, hdr, body = r.status, r.headers, r.read()
+        except urllib.error.HTTPError as e:
+            code, hdr, body = e.code, e.headers, b""
+        except (OSError, ValueError) as e:
+            return self.send(502, "application/json", json.dumps({"error": "cannot reach the %s feed: %s" % (name, e)}))
+        extra = [(k, hdr[k]) for k in ("ETag", "X-Po-Since") if hdr.get(k)]
+        if code == 304 and hdr.get("ETag"):
+            return self.not_modified(hdr["ETag"], [e for e in extra if e[0] != "ETag"])
+        if code != 200:
+            return self.send(502, "application/json", json.dumps({"error": "the %s feed answered %d" % (name, code)}))
+        try:
+            text_body = body.decode("utf-8")
+            json.loads(text_body)
+        except ValueError:
+            return self.send(502, "application/json", json.dumps({"error": "the %s feed is not JSON" % name}))
+        return self.send(200, "application/json", text_body, extra)
+
     def do_GET(self):
         path = self.path.split("?", 1)[0].split("#", 1)[0]
+        if path == "/app" or path.startswith("/app/"):
+            return self.do_app(path)
         if path == "/team.json":
             try:
                 return self.send(200, "application/json", json.dumps(load_team(self.server.repo)))
@@ -390,8 +517,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/events.json":
             if error:
                 return self.send(502, "application/json", json.dumps({"error": error}))
-            return self.send(200, "application/json", json.dumps(events))
+            return self.send_events(events)
         self.send(200, "text/html; charset=utf-8", page(events, error, path == "/all"))
+
+    def send_events(self, events):
+        """/events.json: an ETag of the whole feed, 304 on a matching If-None-Match (checked first, so a
+        ?since= request is 304 too while the feed is unchanged), and ?since=<time>: only the events at or
+        after it (an event with no string time is always kept), marked X-Po-Since: partial; full without."""
+        body = json.dumps(events)
+        etag = '"%s"' % hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
+        if self.matches(etag):
+            return self.not_modified(etag)
+        since = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("since", [""])[0]
+        if since:
+            body = json.dumps([e for e in events if not isinstance(e.get("time"), str) or e["time"] >= since])
+        self.send(200, "application/json", body, [("ETag", etag), ("X-Po-Since", "partial" if since else "full")])
 
     def refuse(self):
         self.send(405, "text/plain; charset=utf-8", "read-only: GET only\n", [("Allow", "GET")])
@@ -405,9 +545,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 class Server(http.server.ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, addr, repo):
+    def __init__(self, addr, repo, feeds=None, answer_url=None, stall_minutes=None):
         self.address_family = socket.AF_INET6 if ":" in addr[0] else socket.AF_INET
         self.repo = repo
+        self.feeds = feeds or {}
+        self.answer_url = answer_url
+        self.stall_minutes = DEFAULT_STALL_MINUTES if stall_minutes is None else stall_minutes
         super().__init__(addr, Handler)
 
 
@@ -416,6 +559,9 @@ def main():
     ap.add_argument("--bind", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--repo", required=True)
+    ap.add_argument("--stall-minutes", type=int, default=DEFAULT_STALL_MINUTES)
+    for n in FEED_NAMES + ("answer",):
+        ap.add_argument("--%s-url" % n)
     try:
         a = ap.parse_args()
     except SystemExit:
@@ -426,7 +572,9 @@ def main():
     if not 0 <= a.port <= 65535:
         die("--port must be 0..65535")
     try:
-        srv = Server((a.bind.strip("[]"), a.port), a.repo)
+        feeds = {n: web_url(getattr(a, n + "_url"), "--%s-url" % n) for n in FEED_NAMES if getattr(a, n + "_url")}
+        answer = web_url(a.answer_url, "--answer-url") if a.answer_url else None
+        srv = Server((a.bind.strip("[]"), a.port), a.repo, feeds, answer, a.stall_minutes)
     except OSError as e:
         die("cannot listen on %s:%d: %s" % (a.bind, a.port, e), 2)
     host, port = srv.server_address[:2]

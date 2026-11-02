@@ -1,0 +1,82 @@
+/* po web view. Colours are variables so both schemes are one table; the tests check each text/background
+   pair against WCAG AA (4.5:1). */
+:root {
+  --bg: #ffffff; --card: #f3f4f6; --text: #1a1a1a; --muted: #4b5563; --line: #c7cbd1;
+  --accent: #0b5cad; --on-accent: #ffffff; --warn: #8a4b00; --ok: #11602b; --bad: #a3180e;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14161a; --card: #1f2329; --text: #eceef1; --muted: #aab1bb; --line: #3a4048;
+    --accent: #7db8f2; --on-accent: #0b1a2b; --warn: #f0c25e; --ok: #7fdc9c; --bad: #ff9a92;
+  }
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; overflow-x: hidden; }
+header { position: sticky; top: 0; background: var(--bg); border-bottom: 1px solid var(--line); z-index: 1; }
+#views { display: flex; flex-wrap: wrap; gap: 4px; padding: 6px; }
+#views button { flex: 1 1 auto; min-height: 44px; padding: 0 10px; font: inherit; color: var(--text);
+  background: var(--card); border: 1px solid var(--line); border-radius: 8px; cursor: pointer; }
+#views button[aria-current="page"] { background: var(--accent); color: var(--on-accent); border-color: var(--accent); font-weight: 600; }
+#event-filters { display: none; padding: 0 6px 6px; gap: 4px; flex-wrap: wrap; }
+#event-filters .chip { min-height: 44px; padding: 0 10px; font: inherit; color: var(--text);
+  background: var(--card); border: 1px solid var(--line); border-radius: 8px; cursor: pointer; }
+#event-filters .chip.on { background: var(--accent); color: var(--on-accent); border-color: var(--accent); font-weight: 600; }
+#banner { margin: 0; padding: 8px 12px; color: var(--warn); border-top: 1px solid var(--line); font-weight: 600; }
+main { padding: 10px; display: grid; gap: 10px; grid-template-columns: 1fr; max-width: 100%; }
+@media (min-width: 800px) { main { grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); align-items: start; } }
+.empty { color: var(--muted); padding: 12px; grid-column: 1 / -1; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; overflow-wrap: anywhere; }
+.card > button.head { display: block; width: 100%; min-height: 44px; padding: 10px 12px; text-align: left; font: inherit;
+  color: inherit; background: none; border: 0; cursor: pointer; }
+.card > button.event-head { display: flex; justify-content: space-between; gap: 8px; width: 100%; min-height: 44px;
+  padding: 10px 12px; text-align: left; font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
+.card .event-lines { display: contents; }
+@media (max-width: 799px) {
+  .card .event-lines { display: none; }
+  .card[data-expanded="true"] .event-lines { display: contents; }
+}
+.card h2 { margin: 0; font-size: 1rem; }
+.card .meta { color: var(--muted); font-size: .875rem; }
+.card .kind { display: inline-block; padding: 0 6px; margin-right: 6px; border: 1px solid var(--line); border-radius: 6px;
+  font-size: .75rem; text-transform: uppercase; letter-spacing: .03em; color: var(--muted); }
+.card .body { padding: 0 12px 12px; }
+.card .body p { margin: 6px 0; }
+.card ul { margin: 6px 0 0; padding: 0; list-style: none; }
+.card li { padding: 8px 0; border-top: 1px solid var(--line); min-height: 44px; }
+.card li .rec { color: var(--ok); font-weight: 600; }
+.card.warn { border-color: var(--warn); }
+.warn-text { color: var(--warn); font-weight: 600; }
+.card.grey { opacity: .75; }
+.card .state-working { color: var(--ok); font-weight: 600; }
+.card li.stalled { color: var(--warn); font-weight: 600; }
+.card ul.doing li { min-height: 0; padding: 4px 12px; }
+.stat-bad { color: var(--bad); font-weight: 600; }
+.row { padding: 8px 12px; border-top: 1px solid var(--line); }
+.row:first-child { border-top: 0; }
+.event-line { display: flex; justify-content: space-between; gap: 8px; }
+.event-line .meta { color: var(--muted); font-size: .875rem; }
+/* answering (v0.116): stacked controls, long labels wrap, Send stays in view at the bottom of the screen */
+#settings-toggle { min-height: 44px; margin: 0 6px 6px; padding: 0 12px; font: inherit; color: var(--text);
+  background: var(--card); border: 1px solid var(--line); border-radius: 8px; cursor: pointer; }
+#settings { padding: 0 12px 10px; }
+#settings input { width: 100%; min-height: 44px; font: inherit; color: var(--text); background: var(--card);
+  border: 1px solid var(--line); border-radius: 8px; padding: 0 10px; }
+.answer { margin-top: 8px; }
+.answer fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
+.answer legend { padding: 0; margin-bottom: 4px; }
+.pick { display: flex; align-items: flex-start; gap: 10px; min-height: 44px; padding: 10px 0;
+  border-top: 1px solid var(--line); cursor: pointer; }
+.pick input { flex: none; width: 22px; height: 22px; margin: 0; accent-color: var(--accent); }
+.pick-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.pick-desc { display: block; }
+.writein textarea { display: block; width: 100%; min-height: 44px; margin-top: 8px; padding: 8px 10px; font: inherit;
+  color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; resize: vertical; }
+.counter { text-align: right; }
+.send-row { position: sticky; bottom: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+  padding: 8px 0; background: var(--card); }
+.send-row button { min-height: 44px; min-width: 96px; padding: 0 16px; font: inherit; font-weight: 600; border-radius: 8px;
+  color: var(--on-accent); background: var(--accent); border: 1px solid var(--accent); cursor: pointer; }
+.send-row button:disabled { color: var(--muted); background: var(--card); border-color: var(--line); cursor: default; }
+.answer-state.sent { color: var(--ok); font-weight: 600; }

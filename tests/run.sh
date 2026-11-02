@@ -26,6 +26,7 @@ PO="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)/bin/po"
 TMP=$(mktemp -d)
 RUN_DONE=0
 trap 'rc=$?; rm -rf "$TMP"; if ((RUN_DONE == 0)); then printf "RUN-ABORTED\n"; exit "$((rc == 0 ? 1 : rc))"; fi' EXIT
+export PROJECTS_FEED_CACHE_DIR="$TMP/pf-cache" # projects-feed state never lands in a real cache dir
 pass=0 fail=0 nblocks=0
 
 ok() {
@@ -391,6 +392,8 @@ stamp_manifest() {
 		printf '[gate]\ntest_count_cmd = "%s"\n' "${COUNT_CMD:-sh ./fake-test.sh 2>&1}"
 		[[ -z ${SENTINEL:-} ]] || printf 'run_sentinel = "required"\n'
 		[[ -z ${TEST_FORMAT:-} ]] || printf 'test_format = "%s"\n' "$TEST_FORMAT"
+		[[ -z ${DRAIN:-} ]] || printf 'drain_secs = %s\n' "$DRAIN"
+		[[ -z ${SCOPE:-} ]] || printf 'scope = %s\n' "$SCOPE"
 		printf '[gate.legs]\n'
 		for leg; do printf '%s = "%s"\n' "${leg%%=*}" "${leg#*=}"; done
 	} >"$TMP/s.toml"
@@ -459,6 +462,89 @@ COUNT_CMD="echo 'test result: FAILED. 1 passed; 1 failed;'" stamp_manifest check
 stamp_fails "a summary that is not ok fails" 'printed a summary that is not ok'
 COUNT_CMD="sh ./fake-test.sh; exit 101" stamp_manifest check=true
 stamp_fails "a count command that exits non-zero fails" 'exited 101'
+# A command that leaves a process holding its output must not hang the stamp.
+# LEAK_SLEEP names the leftover (unique, so pgrep finds only ours); the leaker
+# prints a good summary, so the leftover is the only fault.
+LEAK_SLEEP=3171 LEAK_TERM_SLEEP=3172
+printf '%s\n' "sleep $LEAK_SLEEP &" 'echo "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"' >"$TMP/z-leak.sh"
+printf '%s\n' "( trap '' TERM; exec sleep $LEAK_TERM_SLEEP ) &" 'echo "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"' >"$TMP/z-leak-term.sh"
+now_ms() { echo $(($(date +%s%N) / 1000000)); }
+leak_gone() { ! pgrep -f "sleep $1" >/dev/null; }
+rm -f "$W"/gate-*.txt
+if systemd-run --user --scope --quiet true >/dev/null 2>&1 && command -v pgrep >/dev/null; then
+	DRAIN=1 COUNT_CMD=cat stamp_manifest "test=sh $TMP/z-leak.sh"
+	t0=$(now_ms)
+	out=$("$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>&1)
+	code=$? ms=$(($(now_ms) - t0))
+	[[ $code == 4 ]] && grep -q 'po stamp: FAIL: 1 process(es) left behind by leg test: sleep' <<<"$out" &&
+		ok "leftover: a leaked process fails the stamp and is named" || bad "leftover fails (exit $code)" "$out"
+	((ms < 4000)) && ok "leftover: the stamp ends within the grace plus the sweep (${ms} ms)" || bad "leftover time ${ms} ms" "$out"
+	leak_gone "$LEAK_SLEEP" && ok "leftover: the leaked process is gone afterward" || bad "leftover still alive" "$(pgrep -af "sleep $LEAK_SLEEP")"
+	zlog=$(sed -n 's/^po stamp: the full output is in //p' <<<"$out")
+	[[ -f $zlog ]] && grep -q '^== leg test: .* (exit 0)$' "$zlog" && grep -q '^test result: ok. 5 passed' "$zlog" &&
+		! compgen -G "$W/gate-*.txt" >/dev/null &&
+		ok "leftover: the log keeps the command's real exit code and result line; no stamp file" || bad "leftover log" "$zlog"
+	pkill -f "sleep $LEAK_SLEEP" 2>/dev/null
+
+	# Nested: the stamp itself already runs in a scope of its own.
+	t0=$(now_ms)
+	out=$(systemd-run --user --scope --quiet "$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>&1)
+	code=$? ms=$(($(now_ms) - t0))
+	[[ $code == 4 ]] && grep -q 'left behind by leg test: sleep' <<<"$out" && ((ms < 4000)) && leak_gone "$LEAK_SLEEP" &&
+		ok "leftover: works when the stamp already runs in a scope" || bad "leftover nested (exit $code, ${ms} ms)" "$out"
+	pkill -f "sleep $LEAK_SLEEP" 2>/dev/null
+	COUNT_CMD="sh ./fake-test.sh 2>&1" stamp_manifest "${STD_LEGS[@]}"
+	out=$(systemd-run --user --scope --quiet "$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>&1)
+	code=$?
+	[[ $code == 0 ]] && ! grep -q 'left behind' <<<"$out" && grep -qx 'gate PASS: check/test/clippy/fmt   tests 5 passed' <<<"$out" &&
+		ok "leftover: a clean gate in a nested scope passes with no leftover line" || bad "clean nested" "$out"
+	rm -f "$W"/gate-*.txt
+
+	# A child that ignores SIGTERM is killed by the fallback, not waited for.
+	DRAIN=1 COUNT_CMD=cat stamp_manifest "test=sh $TMP/z-leak-term.sh"
+	t0=$(now_ms)
+	out=$("$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>&1)
+	code=$? ms=$(($(now_ms) - t0))
+	[[ $code == 4 ]] && grep -q 'left behind by leg test: sleep' <<<"$out" && ((ms < 8000)) && leak_gone "$LEAK_TERM_SLEEP" &&
+		ok "leftover: a SIGTERM-ignoring child is killed within a few seconds (${ms} ms)" || bad "sigterm child (exit $code, ${ms} ms)" "$out"
+	pkill -f "sleep $LEAK_TERM_SLEEP" 2>/dev/null
+else
+	ok "SKIPPED: leftover scope tests (systemctl --user or pgrep unusable here)"
+fi
+
+# The grace alone, with no scope: PO_STAMP_NO_SCOPE=1 and [gate] scope = false
+# keep the old result (the leak is not detected) but the stamp does not hang.
+for how in env key; do
+	rm -f "$W"/gate-*.txt
+	if [[ $how == env ]]; then
+		DRAIN=1 COUNT_CMD=cat stamp_manifest "test=sh $TMP/z-leak.sh"
+	else
+		SCOPE=false DRAIN=1 COUNT_CMD=cat stamp_manifest "test=sh $TMP/z-leak.sh"
+	fi
+	t0=$(now_ms)
+	out=$(PO_STAMP_NO_SCOPE=$([[ $how == env ]] && echo 1) "$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>&1)
+	code=$? ms=$(($(now_ms) - t0))
+	[[ $code == 0 && -f $W/gate-1.txt ]] && ! grep -q 'left behind' <<<"$out" && ((ms < 3000)) &&
+		ok "no scope ($how): the stamp passes within the grace and does not hang (${ms} ms)" || bad "no scope $how (exit $code, ${ms} ms)" "$out"
+	pkill -f "sleep $LEAK_SLEEP" 2>/dev/null
+done
+rm -f "$W"/gate-*.txt
+
+# systemd-run absent: a PATH without it; the legs run unscoped, one warning.
+NOSD=$TMP/nosd
+mkdir "$NOSD"
+for f in /usr/bin/*; do [[ ${f##*/} == systemd-run ]] || ln -s "$f" "$NOSD/${f##*/}"; done
+COUNT_CMD="sh ./fake-test.sh 2>&1" stamp_manifest "${STD_LEGS[@]}"
+out=$(PATH=$NOSD "$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>&1)
+code=$?
+[[ $code == 0 && $(grep -c 'warning: systemd-run not found' <<<"$out") == 1 ]] &&
+	grep -qx 'gate PASS: check/test/clippy/fmt   tests 5 passed' <<<"$out" &&
+	ok "systemd-run absent: the gate runs unscoped and warns once" || bad "systemd-run absent (exit $code)" "$out"
+rm -f "$W"/gate-*.txt
+DRAIN='"x"' stamp_manifest "${STD_LEGS[@]}"
+expect "drain_secs must be an integer" 2 'drain_secs must be an integer' -- -C "$W" --manifest "$TMP/s.toml" stamp
+rm -f "$W"/gate-*.txt
+
 # The test leg's saved output is the count: the suite runs once (a runner that
 # logs each invocation), test_count_cmd is only a filter over that output.
 RUNS=$TMP/suite-runs
@@ -493,6 +579,27 @@ printf 'command = "%s"\n' "$SUITE" >>"$TMP/s.toml"
 "$PO" -C "$W" --manifest "$TMP/s.toml" stamp >/dev/null 2>&1
 [[ $(count_runs) == 2 ]] && ok "with no test leg test_count_cmd still reruns the suite" || bad "no test leg" "runs $(count_runs)"
 rm -f "$W"/gate-*.txt "$RUNS"
+# The count taken from the test leg is checked against that leg's own summary:
+# another leg printing one (doc, integration) adds nothing to the comparison.
+UNIT2="unit=echo 'test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s'"
+TEST3="test=echo 'test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s'"
+stamp_manifest "$UNIT2" "$TEST3"
+sed -i '/test_count_cmd/d' "$TMP/s.toml"
+out=$("$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>&1)
+code=$?
+[[ $code == 0 ]] && grep -qx 'gate PASS: unit/test   tests 3 passed' <<<"$out" &&
+	ok "legs unit and test with no test_count_cmd: the test leg's own count, 3" ||
+	bad "unit + test legs, no count cmd (exit $code)" "$out"
+rm -f "$W"/gate-*.txt
+COUNT_CMD="cat" stamp_manifest "$UNIT2" "$TEST3"
+out=$("$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>&1)
+code=$?
+[[ $code == 0 ]] && grep -qx 'gate PASS: unit/test   tests 3 passed' <<<"$out" &&
+	ok "legs unit and test with a filtering test_count_cmd: the test leg's own count, 3" ||
+	bad "unit + test legs, filter (exit $code)" "$out"
+rm -f "$W"/gate-*.txt
+COUNT_CMD="sed s/3/4/" stamp_manifest "$UNIT2" "$TEST3"
+stamp_fails "a filter counting other than the test leg still fails beside another leg" 'the gate passed 3 tests but test_count_cmd counted 4'
 stamp_manifest "${STD_LEGS[@]}"
 
 stamp_manifest "${STD_LEGS[@]}" "touchy=echo z >>new.txt"
@@ -562,6 +669,7 @@ py_stamp "an unfinished summary is not a summary" '3 passed' "printed no pytest 
 py_stamp "a gate leg's summary agreeing with the count" '3 passed in 0.1s' 3 "test=echo '== 3 passed in 0.1s =='"
 py_stamp "a gate leg's disagreeing summary" '3 passed in 0.1s' 'the gate passed 4 tests but test_count_cmd counted 3' "test=echo '4 passed in 0.1s'"
 py_stamp "two gate legs' summaries add up" '5 passed in 0.1s' 5 "unit=echo '2 passed in 0.1s'" "integ=echo '3 passed in 0.1s'"
+py_stamp "a test leg is compared with its own summary, not another leg's" '3 passed in 0.1s' 3 "unit=echo '2 passed in 0.1s'" "test=echo '3 passed in 0.1s'"
 py_stamp "a gate leg without a summary is not counted" '3 passed in 0.1s' 3 "lint=echo all good"
 py_stamp "a gate leg printing a failed summary fails" '3 passed in 0.1s' "gate leg 'test' printed a pytest summary that is not ok" "test=echo '1 failed in 0.1s'"
 # libtest is untouched: the default, and the explicit value.
@@ -1004,6 +1112,63 @@ expect "the new item is fresh" 0 '^FRESH: item-v1\.0\.5' -- -C "$B" --manifest "
 expect "status agrees with the boundary" 0 'DOING \(1\)' -- -C "$B" --manifest "$BM" status
 expect "a second close of the same item is refused" 6 'v1\.0\.3 is DONE, not DOING' -- -C "$B" --manifest "$BM" close 1.0.3
 
+# A no-change item (v0.100): the branch has no commit main lacks, the stamp
+# names main's tip; the tag goes on the admin commit.
+make_nochange() { # <dir>: a boundary repo whose v1.0.3 branch is main's tip, stamped
+	make_brepo "$1"
+	git -C "$1/.wt/item-v1.0.3" reset -q --hard main
+	rm -f "$1/.wt/item-v1.0.3"/gate-*.txt
+	"$PO" -C "$1/.wt/item-v1.0.3" --manifest "$BM" stamp >/dev/null 2>&1
+}
+N=$TMP/nc1
+make_nochange "$N"
+before=$(bsnap "$N")
+out=$("$PO" -C "$N" --manifest "$BM" close 1.0.3 2>&1)
+code=$?
+[[ $code == 0 && $(bsnap "$N") == "$before" ]] && grep -q 'DRY RUN' <<<"$out" &&
+	grep -q 'no change: the tag goes on the admin commit' <<<"$out" && ! grep -q 'fast-forward main' <<<"$out" &&
+	ok "a no-change close's dry run shows the plan and writes nothing" || bad "no-change dry run (exit $code)" "$out"
+mv "$N/.wt/item-v1.0.3/gate-1.txt" "$TMP/nc-gate-1.txt"
+expect "a no-change item with no stamp is refused" 6 'no po stamp evidence' -- -C "$N" --manifest "$BM" close 1.0.3
+cp "$TMP/nc-gate-1.txt" "$N/.wt/item-v1.0.3/gate-1.txt"
+sed '2s/.*/gate FAIL/' "$TMP/nc-gate-1.txt" >"$N/.wt/item-v1.0.3/gate-2.txt"
+expect "a no-change item with a failing stamp is refused" 6 'gate-2.txt is not a passing gate' -- -C "$N" --manifest "$BM" close 1.0.3
+rm -f "$N/.wt/item-v1.0.3/gate-2.txt"
+echo dirt >>"$N/.wt/item-v1.0.3/docs/BACKLOG.md"
+expect "a no-change item with uncommitted changes is refused" 6 'has no commit but .* has uncommitted changes \(1\)' -- -C "$N" --manifest "$BM" close 1.0.3
+git -C "$N/.wt/item-v1.0.3" checkout -q -- docs/BACKLOG.md
+git -C "$N" commit -q --allow-empty -m "admin: main moves on"
+git -C "$N/.wt/item-v1.0.3" reset -q --hard main
+expect "a no-change stamp of an earlier tip is refused" 6 'does not stamp the branch tip' -- -C "$N" --manifest "$BM" close 1.0.3
+rm -f "$N/.wt/item-v1.0.3"/gate-*.txt
+"$PO" -C "$N/.wt/item-v1.0.3" --manifest "$BM" stamp >/dev/null 2>&1
+old=$(git -C "$N" rev-parse main)
+out=$("$PO" -C "$N" --manifest "$BM" close 1.0.3 --commit 2>&1)
+code=$?
+admin=$(git -C "$N" rev-parse main)
+[[ $code == 0 && $(git -C "$N" rev-list --count "$old..main") == 1 && $(git -C "$N" rev-parse main^) == "$old" ]] &&
+	ok "a no-change close --commit exits 0 and adds exactly one commit to main" || bad "no-change commit (exit $code)" "$out"
+[[ $(git -C "$N" cat-file -t v1.0.3) == commit && $(git -C "$N" rev-parse v1.0.3) == "$admin" && $admin != "$old" ]] &&
+	ok "the no-change tag is lightweight and sits at the admin commit, not the old main tip" || bad "no-change tag" "$(git -C "$N" log --oneline -2 --decorate main)"
+[[ $(git -C "$N" log -1 --format=%s main) == 'admin: v1.0.3 DONE (tag v1.0.3)' ]] &&
+	grep -qxF '| v1.0.3 | Third | DONE |' "$N/docs/BACKLOG.md" && grep -qF 'v1.0.3 DONE (tag v1.0.3)' "$N/docs/BACKLOG.md" &&
+	git -C "$N" log -1 --format=%B main | grep -qx "HEAD $old (item-v1.0.3)  dirty 0" &&
+	ok "the no-change admin commit flips the row to DONE (tag …) and carries the evidence" || bad "no-change admin" "$(git -C "$N" show main)"
+[[ ! -e $N/.wt/item-v1.0.3 ]] && ! git -C "$N" show-ref -q refs/heads/item-v1.0.3 &&
+	ok "the no-change item's worktree and branch are gone" || bad "no-change clean-up" "$out"
+expect "po status reads the tag on an admin commit as the latest tag" 0 '^tag       v1\.0\.3 ' -- -C "$N" --manifest "$BM" status
+expect "a second no-change close is refused" 6 'v1\.0\.3 is DONE, not DOING' -- -C "$N" --manifest "$BM" close 1.0.3
+N=$TMP/nc-annotated
+make_nochange "$N"
+out=$("$PO" -C "$N" --manifest "$TMP/style-annotated.toml" close 1.0.3 2>&1)
+grep -q 'tag v1.0.3 at the admin commit (annotated, message "v1.0.3: Third (no change needed)"' <<<"$out" &&
+	ok "the no-change dry run names the annotated tag on the admin commit" || bad "no-change annotated dry run" "$out"
+out=$("$PO" -C "$N" --manifest "$TMP/style-annotated.toml" close 1.0.3 --commit 2>&1)
+code=$?
+[[ $code == 0 && $(git -C "$N" cat-file -t v1.0.3) == tag && $(git -C "$N" rev-parse "v1.0.3^{commit}") == "$(git -C "$N" rev-parse main)" &&
+	$(git -C "$N" tag -l --format='%(contents:subject)' v1.0.3) == 'v1.0.3: Third (no change needed)' ]] &&
+	ok "a no-change annotated tag sits at the admin commit with the no-change message" || bad "no-change annotated (exit $code)" "$out"
+
 # --commit refuses a main checkout it cannot write in, before any write.
 B=$TMP/b3
 make_brepo "$B"
@@ -1077,6 +1242,114 @@ ev=$(henv PO_EVIDENCE)
 [[ $ev == */po-evidence.* && ! -e $ev ]] && ok "PO_EVIDENCE is a temporary file, removed after the hook" || bad "evidence file" "$ev"
 grep -qx 'hook-stdout' "$TMP/hook.err" && ! grep -q 'hook-stdout' <<<"$out" &&
 	ok "the hook's stdout is passed through to stderr" || bad "hook output" "$out / $(cat "$TMP/hook.err")"
+# po release <N> (v0.105): the pre-release review row.
+RV=$TMP/rv
+make_brepo "$RV"
+RM=$TMP/rv.toml
+{ cat "$BM"; printf '\n[release]\nreview = true\n'; } >"$RM"
+rvsnap() { git -C "$RV" rev-parse main; git -C "$RV" status --porcelain --untracked-files=all; cat "$RV/docs/BACKLOG.md"; }
+before=$(rvsnap)
+base=$(git -C "$RV" rev-parse main)
+expect "release: review = true refuses without a review row" 6 'refused: release-7 has no pre-release review row' -- -C "$RV" --manifest "$RM" release 7
+[[ $(rvsnap) == "$before" ]] && ok "release: the refusal changes nothing" || bad "release refusal wrote"
+expect "release: the dry run of --open-review names the row it would add" 0 '^review    v1\.0\.6  test review: release-7  \(new row, TODO\)$' -- -C "$RV" --manifest "$RM" release 7 --open-review
+[[ $(rvsnap) == "$before" ]] && ok "release: --open-review without --commit changes nothing" || bad "release dry run wrote"
+out=$("$PO" -C "$RV" --manifest "$RM" release 7 --open-review --commit 2>&1)
+code=$?
+[[ $code == 0 && $(git -C "$RV" rev-list --count "$base..main") == 1 && $(grep -c 'test review: release-7' "$RV/docs/BACKLOG.md") == 1 ]] &&
+	grep -qF '| v1.0.6 | test review: release-7 | TODO |' "$RV/docs/BACKLOG.md" &&
+	[[ $(git -C "$RV" log -1 --format=%s) == 'admin: v1.0.6 test review: release-7 founded TODO' ]] &&
+	ok "release: --open-review --commit writes exactly one row in one admin commit" || bad "release open-review (exit $code)" "$out"
+after=$(rvsnap)
+out=$("$PO" -C "$RV" --manifest "$RM" release 7 --open-review --commit 2>&1)
+code=$?
+[[ $code == 0 && $(rvsnap) == "$after" ]] && grep -q 'review row v1.0.6 exists (TODO)' <<<"$out" &&
+	ok "release: --open-review is idempotent and says the row exists" || bad "release idempotent (exit $code)" "$out"
+expect "release: accepted once the row exists" 0 '^release-7: review row v1\.0\.6 exists \(TODO\)$' -- -C "$RV" --manifest "$RM" release 7
+expect "release: a row for release-7 does not satisfy release-77" 6 'release-77 has no' -- -C "$RV" --manifest "$RM" release 77
+expect "release: release-7.1 is not covered by the release-7 row" 6 'release-7\.1 has no' -- -C "$RV" --manifest "$RM" release 7.1
+before=$(rvsnap)
+out=$("$PO" -C "$RV" --manifest "$BM" release 99 2>&1)
+code=$?
+[[ $code == 0 && -z $out && $(rvsnap) == "$before" ]] && ok "release: with the key absent it prints nothing, exits 0 and changes nothing" || bad "release key absent (exit $code)" "$out"
+{ cat "$BM"; printf '\n[release]\nreview = false\n'; } >"$TMP/rv-off.toml"
+out=$("$PO" -C "$RV" --manifest "$TMP/rv-off.toml" release 99 2>&1)
+code=$?
+[[ $code == 0 && -z $out && $(rvsnap) == "$before" ]] && ok "release: review = false behaves as the key absent" || bad "release key false (exit $code)" "$out"
+# po release <N> --setup / --write (v0.106): the Setup after install block from the recorded steps.
+RLS=$TMP/rls
+make_brepo "$RLS"
+rs_set() {
+	# helper
+	python3 -I - "$RLS/.git/po-setup-steps.json" "$@" <<'PY'
+import json, sys
+out, rows = sys.argv[1], sys.argv[2:]
+steps = []
+for r in rows:
+    item, n, machine, command, who, check = r.split("@@")
+    steps.append({"item": item, "n": int(n), "machine": machine, "command": command, "who": who, "check": check, "status": "open"})
+json.dump({"steps": steps}, open(out, "w"))
+PY
+}
+rs_log() { # <entry body>: CHANGELOG with Release 7 whose notes are the given text
+	{ printf '# changelog\n\n## Unreleased\n\n### Later (v0.9, 2026-11-02)\n\nLATER\n\n## Release 7 (2026-11-01): seven\n\n'; printf '%s\n' "$1"; } >"$RLS/CHANGELOG.md"
+}
+rs_log $'### A (v1.0.1, 2026-11-01)\n\nA-NOTE\n\n### B (v1.0.3, 2026-11-01)\n\nB-NOTE\n\n### C (v1.0.4, 2026-11-01)\n\nC-NOTE'
+rs_set
+out=$("$PO" -C "$RLS" --manifest "$BM" release 7 --setup 2>&1)
+[[ $out == $'### Setup after install\n\nNone' ]] && ok "release --setup: no recorded step prints the word None" || bad "release setup none" "$out"
+rs_set "1.0.3@@1@@buildhost@@systemctl --user restart po-serve@@opssession@@curl -sI http://x/events.json shows ETag"
+out=$("$PO" -C "$RLS" --manifest "$BM" release 7 --setup 2>&1)
+want=$'### Setup after install\n\n| # | Machine | Command | Who | Check |\n|---|---|---|---|---|\n| 1 | buildhost | `systemctl --user restart po-serve` (v1.0.3) | opssession | curl -sI http://x/events.json shows ETag |'
+[[ $out == "$want" ]] && ok "release --setup: one recorded step is one table row naming its item" || bad "release setup one" "$out"
+rs_set "1.0.4@@2@@laptop@@second-of-c@@owner@@c2" "1.0.3@@1@@buildhost@@first-of-b@@opssession@@b1" "1.0.1@@1@@nas@@only-of-a@@operator@@a1" "1.0.4@@1@@buildhost@@first-of-c@@owner@@c1" "9.9@@1@@x@@other-item@@x@@x" "0.9@@1@@x@@unreleased-item@@x@@x"
+out=$("$PO" -C "$RLS" --manifest "$BM" release 7 --setup 2>&1)
+# shellcheck disable=SC2016 # backticks in markdown, not expansions
+got=$(grep -o '`[a-z-]*` (v[0-9.]*)' <<<"$out" | tr '\n' ' ')
+# shellcheck disable=SC2016 # backticks in markdown, not expansions
+[[ $got == '`only-of-a` (v1.0.1) `first-of-b` (v1.0.3) `first-of-c` (v1.0.4) `second-of-c` (v1.0.4) ' && $(grep -c '^| [0-9] |' <<<"$out") == 4 ]] &&
+	grep -q '^| 4 | laptop |' <<<"$out" &&
+	ok "release --setup: three or more steps come in item order then step number, and only the entry's items" || bad "release setup order" "$out"
+# shellcheck disable=SC2016 # backticks in markdown, not expansions
+rs_set "1.0.3@@1@@buildhost@@grep 'a|b' file | wc -l@@opssession@@prints 1" '1.0.3@@2@@buildhost@@echo `date` ``x``@@owner@@a|b'
+out=$("$PO" -C "$RLS" --manifest "$BM" release 7 --setup 2>&1)
+# shellcheck disable=SC2016 # backticks in markdown, not expansions
+grep -qF '| 1 | buildhost | `grep '"'"'a\|b'"'"' file \| wc -l` (v1.0.3) | opssession | prints 1 |' <<<"$out" &&
+	grep -qF '| 2 | buildhost | ``` echo `date` ``x`` ``` (v1.0.3) | owner | a\|b |' <<<"$out" &&
+	ok "release --setup: a pipe is escaped and a backtick in a command gets a longer fence" || bad "release setup escapes" "$out"
+before=$(cat "$RLS/CHANGELOG.md")
+out=$("$PO" -C "$RLS" --manifest "$BM" release 7 --setup 2>&1)
+[[ $(cat "$RLS/CHANGELOG.md") == "$before" ]] && ok "release --setup writes nothing" || bad "release setup wrote"
+rs_set "1.0.3@@1@@buildhost@@restart-it@@opssession@@it runs" "1.0.1@@1@@nas@@reload@@operator@@click"
+out=$("$PO" -C "$RLS" --manifest "$BM" release 7 --write 2>&1)
+code=$?
+first=$(sed -n '/^## Release 7/,$p' "$RLS/CHANGELOG.md" | sed -n '3,4p')
+# shellcheck disable=SC2016 # backticks in markdown, not expansions
+[[ $code == 0 && $first == '### Setup after install' ]] && grep -q '^| 1 | nas | `reload` (v1.0.1) | operator | click |$' "$RLS/CHANGELOG.md" &&
+	[[ $(grep -c '^### Setup after install$' "$RLS/CHANGELOG.md") == 1 && $(grep -c '^## Unreleased$' "$RLS/CHANGELOG.md") == 1 ]] &&
+	grep -q '^LATER$' "$RLS/CHANGELOG.md" && grep -q '^C-NOTE$' "$RLS/CHANGELOG.md" &&
+	ok "release --write inserts the block right under the Release heading and leaves the rest" || bad "release write (exit $code)" "$out"
+once=$(cat "$RLS/CHANGELOG.md")
+out=$("$PO" -C "$RLS" --manifest "$BM" release 7 --write 2>&1)
+[[ $? == 0 && $(cat "$RLS/CHANGELOG.md") == "$once" && $out == *'already current'* ]] && ok "release --write is idempotent" || bad "release write twice" "$out"
+rs_set "1.0.3@@1@@buildhost@@restart-it@@opssession@@it runs"
+"$PO" -C "$RLS" --manifest "$BM" release 7 --write >/dev/null 2>&1
+[[ $(grep -c '^### Setup after install$' "$RLS/CHANGELOG.md") == 1 && $(grep -c 'reload' "$RLS/CHANGELOG.md") == 0 && $(grep -c 'restart-it' "$RLS/CHANGELOG.md") == 1 ]] &&
+	ok "release --write replaces a stale block instead of adding a second" || bad "release write replace"
+out=$("$PO" -C "$RLS" --manifest "$BM" release 8 --write 2>&1)
+code=$?
+[[ $code == 1 || $code == 2 ]] && grep -q 'Release 8' <<<"$out" && ok "release --write without a Release heading refuses and says so" || bad "release write no heading (exit $code)" "$out"
+{ cat "$BM"; printf '\n[release]\nreview = true\n'; } >"$RLS/rs.toml"
+expect "release --setup under review = true refuses without the review row" 6 'release-7 has no pre-release review row' -- -C "$RLS" --manifest "$RLS/rs.toml" release 7 --setup
+expect "release --setup does not combine with --open-review" 1 'do not combine' -- -C "$RLS" --manifest "$BM" release 7 --setup --open-review
+# A no-change close hands the hook the admin commit as its item commit (v0.100).
+N=$TMP/nc-hook
+make_nochange "$N"
+rm -f "$HENV"
+out=$("$PO" -C "$N" --manifest "$HM" close 1.0.3 --commit 2>&1)
+code=$?
+[[ $code == 0 && $(henv PO_ITEM_COMMIT) == "$(git -C "$N" rev-parse main)" && $(henv PO_ADMIN_COMMIT) == "$(git -C "$N" rev-parse main)" ]] &&
+	ok "a no-change close runs the hook with the admin commit as PO_ITEM_COMMIT" || bad "no-change hook (exit $code)" "$out"
 hook_manifest "cat \"\$PO_EVIDENCE\" > $TMP/hook.ev; cat > $TMP/hook.in; printf '%s' \"\$PO_NEXT\" > $TMP/hook.next"
 B=$TMP/h2
 make_brepo "$B"
@@ -1351,6 +1624,45 @@ git -C "$SU/.wt/item-v1.0.3" commit -q --amend -m "v1.0.3: Third"
 rm -f "$SU/.wt/item-v1.0.3"/gate-*.txt
 "$PO" -C "$SU/.wt/item-v1.0.3" --manifest "$BM" stamp >/dev/null 2>&1
 expect "the section is found in a file the backlog row names" 0 '^setup     None \(docs/notes/three\.md:5\)$' -- -C "$SU" --manifest "$SM" close 1.0.3
+# The row's line number is read from the revision it was found at: lines inserted at the top of
+# the backlog on the item branch must not make the close read another row (item v0.95).
+SU=$TMP/su3b
+# shellcheck disable=SC2016 # backticks in markdown, not expansions
+BREPO_TABLE='| Item | Title | Status |
+|---|---|---|
+| v1.0.1 | First | DONE |
+| v1.0.3 | Third (`docs/notes/three.md`) | DOING |' make_brepo "$SU"
+SW=$SU/.wt/item-v1.0.3
+mkdir -p "$SW/docs/notes"
+# shellcheck disable=SC2016 # backticks in markdown, not expansions
+printf '# Three\n\n## Setup after install\n\n| # | Machine | Command | Who | Check |\n|---|---|---|---|---|\n| 1 | host | `restart it` | operator | it runs |\n' >"$SW/docs/notes/three.md"
+sed -i '1i filler one\nfiller two\nfiller three' "$SW/docs/BACKLOG.md"
+git -C "$SW" add docs
+git -C "$SW" commit -q --amend -m "v1.0.3: Third"
+rm -f "$SW"/gate-*.txt
+"$PO" -C "$SW" --manifest "$BM" stamp >/dev/null 2>&1
+expect "backlog lines inserted on the item branch: the Setup section is still found" 0 '^setup     1 step\(s\) \(docs/notes/three\.md:3\)$' -- -C "$SU" --manifest "$SM" close 1.0.3
+"$PO" -C "$SU" --manifest "$SM" close 1.0.3 --commit >/dev/null 2>&1
+python3 -I -c 'import json,sys
+d = json.load(open(sys.argv[1]))
+assert [(x["item"], x["n"], x["command"]) for x in d["steps"]] == [("1.0.3", 1, "restart it")], d' "$SU/.git/po-setup-steps.json" &&
+	ok "backlog lines inserted on the item branch: the recorded steps are the item's own" || bad "shifted backlog steps"
+# A row naming CHANGELOG.md and the real spec file resolves to the spec file.
+SU=$TMP/su3c
+# shellcheck disable=SC2016 # backticks in markdown, not expansions
+BREPO_TABLE='| Item | Title | Status |
+|---|---|---|
+| v1.0.1 | First | DONE |
+| v1.0.3 | Third (`CHANGELOG.md`, `docs/notes/three.md`) | DOING |' make_brepo "$SU"
+SW=$SU/.wt/item-v1.0.3
+mkdir -p "$SW/docs/notes"
+printf '# Changelog\n\n## Setup after install\n\nNone\n' >"$SW/CHANGELOG.md"
+printf '# Three\n\nNotes.\n\n## Setup after install\n\nNone\n' >"$SW/docs/notes/three.md"
+git -C "$SW" add docs CHANGELOG.md
+git -C "$SW" commit -q --amend -m "v1.0.3: Third"
+rm -f "$SW"/gate-*.txt
+"$PO" -C "$SW" --manifest "$BM" stamp >/dev/null 2>&1
+expect "a row naming CHANGELOG.md and its spec file resolves to the spec file" 0 '^setup     None \(docs/notes/three\.md:5\)$' -- -C "$SU" --manifest "$SM" close 1.0.3
 # Exempt: founded before the key was on, judged from the manifest at the founding commit.
 SU=$TMP/su4
 make_brepo "$SU"
@@ -2602,6 +2914,87 @@ out=$(sv_req GET /)
 [[ $(head -1 <<<"$out") == 200 && $out == *'id="err">po events --json is not JSON'* ]] && ok "the page shows the error" || bad "page error" "$out"
 sv_stop
 
+# /events.json is conditional and incremental (v0.93): an ETag of the whole feed, 304 on a
+# matching If-None-Match, ?since= at or after a time (X-Po-Since: partial), full without.
+printf '%s\n' \
+	'{"time":"2026-10-23T01:00:00Z","kind":"stamp","item":"1.1","project":"demo","result":"pass","agent":"a","legs":[],"detail":""}' \
+	'{"time":"2026-10-23T02:00:00Z","kind":"stamp","item":"1.2","project":"demo","result":"pass","agent":"a","legs":[],"detail":""}' \
+	'{"time":"2026-10-23T03:00:00Z","kind":"stamp","item":"1.3","project":"demo","result":"pass","agent":"a","legs":[],"detail":""}' \
+	'{"kind":"stamp","item":"1.x","project":"demo","result":"pass","agent":"a","legs":[],"detail":""}' >"$SV/events-cond.json"
+(cd "$SV/repo" && PATH="$SV/bin:$PATH" FAKE_EVENTS="$SV/events-cond.json" exec "$PO" serve --port 0 >"$SV/out" 2>"$SV/err") &
+SV_PID=$!
+SV_URL=
+for _ in $(seq 1 100); do
+	SV_URL=$(sed -nE 's/^po serve: listening on (http:\/\/[^ ]+)\/$/\1/p' "$SV/out")
+	[[ -n $SV_URL ]] && break
+	sleep 0.1
+done
+if [[ -z $SV_URL ]]; then
+	bad "po serve (conditional) starts" "$(cat "$SV/out" "$SV/err")"
+else
+	block serve-conditional python3 -B -I - "$SV_URL" "$(dirname "$PO")/../lib/po" "$SV/events-cond.json" <<'PY'
+import json, sys, urllib.error, urllib.request
+url = sys.argv[1] + "/events.json"
+sys.path.insert(0, sys.argv[2])
+import dashboard_core as c
+
+def check(name, cond, detail=""):
+    print("%s\t%s\t%s" % ("ok" if cond else "FAIL", name, str(detail).replace("\n", " | ")))
+
+def get(u, inm=None):
+    req = urllib.request.Request(u)
+    if inm:
+        req.add_header("If-None-Match", inm)
+    try:
+        r = urllib.request.urlopen(req, timeout=10)
+    except urllib.error.HTTPError as e:
+        r = e
+    return r.status, r.headers, r.read().decode()
+
+s1, h1, b1 = get(url)
+s2, h2, b2 = get(url)
+etag = h1.get("ETag")
+check("po serve: /events.json carries a quoted ETag, stable across two identical requests",
+      s1 == s2 == 200 and etag and etag.startswith('"') and etag.endswith('"') and h2.get("ETag") == etag and b1 == b2, (etag, h2.get("ETag")))
+check("po serve: /events.json without since is X-Po-Since: full, every event", h1.get("X-Po-Since") == "full" and len(json.loads(b1)) == 4, h1.get("X-Po-Since"))
+s, h, b = get(url, etag)
+check("po serve: a matching If-None-Match is 304 with the ETag and no body", s == 304 and b == "" and h.get("ETag") == etag, (s, b))
+s, h, b = get(url + "?since=2026-10-23T01:00:00Z", etag)
+check("po serve: the 304 check comes first and uses the whole feed's ETag (a ?since= request too)", s == 304 and b == "", s)
+s, h, b = get(url, '"other"')
+check("po serve: a stale If-None-Match gets the whole feed", s == 200 and len(json.loads(b)) == 4, s)
+s, h, b = get(url + "?since=2026-10-23T02:00:00Z")
+items = sorted(e["item"] for e in json.loads(b)) if s == 200 else b
+check("po serve: ?since= returns the events at or after it (an event at since itself included) and those with no time, partial",
+      s == 200 and items == ["1.2", "1.3", "1.x"] and h.get("X-Po-Since") == "partial" and h.get("ETag") == etag, (s, items, h.get("X-Po-Since")))
+
+# The dashboard's Feed against po serve: a 304 and a partial.
+f = c.Feed(url)
+whole = f.load(c.parse_events)
+check("po serve: the dashboard Feed takes the whole feed, keeps the ETag and sees ?since= offered", whole[0] and whole[2] is False and f.etag == etag and f.since_ok, (f.etag, f.since_ok))
+check("po serve: the dashboard Feed's second whole fetch does not send If-None-Match and returns 200",
+      f.load(c.parse_events) == (True, whole[1], False))
+with open(sys.argv[3], "a") as fh:
+    fh.write(json.dumps({"time": "2026-10-23T04:00:00Z", "kind": "close", "item": "1.4", "project": "demo", "result": "pass", "agent": "a", "legs": [], "detail": ""}) + "\n")
+f.fetches = 1
+since = f.since_for(whole[1])
+part = f.load(c.parse_events, since)
+check("po serve: the dashboard Feed takes a partial and merges it", since == "2026-10-23T03:00:00Z" and part[0] and part[2] is True
+      and sorted(e["item"] for e in part[1]) == ["1.3", "1.4", "1.x"] and len(c.merge_since(whole[1], part[1])) == 5, (since, part))
+with open(sys.argv[3], "w") as fh:
+    fh.write("not json\n")
+s, h, b = get(url)
+check("po serve: a 502 error body carries no ETag", s == 502 and h.get("ETag") is None and h.get("X-Po-Since") is None, (s, h.get("ETag")))
+print("BLOCK-END serve-conditional")
+PY
+	if command -v curl >/dev/null; then
+		cp "$SV/events.json" "$SV/events-cond.json"
+		out=$(curl -s -D - -o /dev/null "$SV_URL/events.json")
+		grep -qi '^ETag: "' <<<"$out" && ok "the setup check: curl -s -D - -o /dev/null <serve-url>/events.json shows an ETag header" || bad "curl -D - ETag" "$out"
+	fi
+	sv_stop
+fi
+
 # Refusals and usage.
 for a in 0.0.0.0 :: '[::]' 0; do
 	out=$(cd "$SV/repo" && PATH="$SV/bin:$PATH" "$PO" serve --bind "$a" --port 0 2>&1)
@@ -2618,6 +3011,150 @@ expect "serve rejects an unknown argument" 1 "serve: unknown argument" -- -C "$S
 expect "serve --port needs a value" 1 "needs a value" -- -C "$SV/repo" serve --port
 out=$(cd "$SV/repo" && PATH="$SV/bin:$PATH" "$PO" serve --port 99999 2>&1)
 [[ $? == 1 ]] && ok "an out-of-range port is a usage error" || bad "port range" "$out"
+
+# ---- the web view (v0.112): node tests, then /app/ served by a real po serve ----
+if command -v node >/dev/null 2>&1; then
+	block web-core env TZ=UTC node "$(dirname "$PO")/../tests/web-core.test.js"
+else
+	bad "web-core needs node" "node is not installed"
+fi
+WV=$TMP/webview
+mkdir -p "$WV"
+make_repo "$WV/repo"
+block serve-web python3 -B -I - "$PO" "$WV" "$SV/bin" "$SV/events.json" "$SV/archive.json" <<'PY'
+import json, os, re, subprocess, sys, threading, time, urllib.error, urllib.request
+import http.server
+po, wv, fakebin, events, archive = sys.argv[1:6]
+
+def check(name, cond, detail=""):
+    print("%s\t%s\t%s" % ("ok" if cond else "FAIL", name, str(detail).replace("\n", " | ")))
+
+seen = []  # (path, headers) of each upstream request
+class Up(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        seen.append((self.path, dict(self.headers)))
+        if self.path.startswith("/down"):
+            self.send_response(500); self.end_headers(); return
+        if self.path.startswith("/notjson"):
+            self.send_response(200); self.end_headers(); self.wfile.write(b"<html>"); return
+        if self.headers.get("If-None-Match") == '"u1"':
+            self.send_response(304); self.send_header("ETag", '"u1"'); self.end_headers(); return
+        body = json.dumps([{"time": "2026-11-01T10:00:00Z", "item": "9"}]).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json"); self.send_header("ETag", '"u1"')
+        self.send_header("X-Po-Since", "partial" if "since=" in self.path else "full")
+        self.send_header("Set-Cookie", "secret=1"); self.send_header("Content-Length", str(len(body)))
+        self.end_headers(); self.wfile.write(body)
+up = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Up)
+threading.Thread(target=up.serve_forever, daemon=True).start()
+base = "http://127.0.0.1:%d" % up.server_address[1]
+repo = os.path.join(wv, "repo")
+with open(os.path.join(repo, "po.toml"), "a") as f:
+    f.write('\n[serve.web]\ndecisions_url = "%s/dec.json"\nteam_url = "%s/down/team.json"\nprojects_url = "%s/notjson/p.json"\n'
+            'events_url = "%s/ev.json"\nanswer_url = "http://sink.example:9000/answers"\nstall_minutes = 45\n' % (base, base, base, base))
+env = dict(os.environ, PATH=fakebin + ":" + os.environ["PATH"], FAKE_EVENTS=events, FAKE_ARCHIVE=archive)
+proc = subprocess.Popen([po, "serve", "--port", "0"], cwd=repo, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+line = proc.stdout.readline()
+m = re.search(r"listening on (http://\S+)/", line)
+if not m:
+    check("po serve starts with [serve.web]", False, line + proc.stderr.read()); print("BLOCK-END serve-web"); sys.exit(0)
+url = m.group(1)
+
+def get(path, method="GET", hdr=None):
+    req = urllib.request.Request(url + path, method=method, data=b"x" if method in ("POST", "PUT", "PATCH") else None, headers=hdr or {})
+    try:
+        r = urllib.request.urlopen(req, timeout=10)
+    except urllib.error.HTTPError as e:
+        r = e
+    return r.status, r.headers, r.read().decode()
+
+try:
+    check("po serve starts with [serve.web] in po.toml", True)
+    for p, ctype in (("/app/", "text/html"), ("/app/core.js", "text/javascript"), ("/app/app.js", "text/javascript"), ("/app/style.css", "text/css")):
+        s, h, b = get(p)
+        etag = h.get("ETag")
+        s2, h2, b2 = get(p, hdr={"If-None-Match": etag or "-"})
+        check("web: C2 %s is 200 with %s, a quoted ETag, and 304 on a match" % (p, ctype),
+              s == 200 and h.get("Content-Type", "").startswith(ctype) and re.fullmatch(r'"[0-9a-f]{16}"', etag or "") is not None and s2 == 304 and b2 == "", (s, h.get("Content-Type"), etag, s2))
+    s, h, b = get("/app/", hdr={"If-None-Match": '"stale"'})
+    check("web: a stale If-None-Match gets the whole file", s == 200 and "<title>po</title>" in b, s)
+    s, h, b = get("/app"); check("web: /app redirects to /app/", s == 200 and "<title>po</title>" in b, s)
+    s, h, b = get("/app/nope.js"); check("web: an unknown /app/ file is 404", s == 404, s)
+    s, h, b = get("/app/../lib/po/serve.py"); check("web: /app/ does not serve a path outside its four files", s == 404, s)
+    s, h, b = get("/")
+    check("web: C2 / is the gate-events page, unchanged", s == 200 and "Last 10 events" in b and "/app/" not in b, s)
+    s, h, b = get("/all"); check("web: C2 /all is unchanged", s == 200 and "All events" in b, s)
+    bad_methods = [(m_, p) for p in ("/app/", "/app/core.js", "/app/config.json", "/app/feeds/decisions.json") for m_ in ("POST", "PUT", "DELETE", "PATCH", "OPTIONS")
+                   if get(p, m_)[0] != 405]
+    check("web: C2 any non-GET on /app/* is 405", not bad_methods, bad_methods)
+    s, h, b = get("/app/", "HEAD"); check("web: HEAD on /app/ is refused as read-only", s == 405, s)
+    # C4: headers on every /app/ answer
+    miss = []
+    for p, m_ in (("/app/", "GET"), ("/app/core.js", "GET"), ("/app/config.json", "GET"), ("/app/feeds/decisions.json", "GET"), ("/app/feeds/team.json", "GET"), ("/app/nope", "GET"), ("/app/", "POST")):
+        s, h, b = get(p, m_)
+        csp = h.get("Content-Security-Policy", "")
+        if not (csp.startswith("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self' http://sink.example:9000;")
+                and "base-uri 'none'" in csp and "form-action 'none'" in csp and "frame-ancestors 'none'" in csp
+                and h.get("Referrer-Policy") == "no-referrer" and h.get("X-Content-Type-Options") == "nosniff"):
+            miss.append((p, m_))
+    check("web: C4 every /app/* answer carries the CSP (with the sink origin), Referrer-Policy and nosniff", not miss, miss)
+    s, h, b = get("/events.json"); check("web: /events.json carries no CSP (unchanged)", s == 200 and "Content-Security-Policy" not in h, s)
+    # C7
+    s, h, b = get("/app/config.json")
+    cfg = json.loads(b)
+    check("web: C7 config.json lists the configured feeds, answer_url and stall_minutes, nothing else",
+          s == 200 and set(cfg) == {"feeds", "answer_url", "stall_minutes"} and cfg["stall_minutes"] == 45 and cfg["feeds"] == ["decisions", "projects", "team", "events"] and cfg["answer_url"] == "http://sink.example:9000/answers", b)
+    # C3
+    del seen[:]
+    s, h, b = get("/app/feeds/decisions.json?evil=http://x&since=1", hdr={"If-None-Match": '"old"', "Cookie": "a=b", "Authorization": "Bearer t", "X-Other": "1"})
+    p, uh = seen[-1]
+    check("web: C3 a feed is the configured URL's body, ETag and X-Po-Since", s == 200 and json.loads(b)[0]["item"] == "9" and h.get("ETag") == '"u1"' and h.get("X-Po-Since") == "full" and "Set-Cookie" not in h, (s, dict(h)))
+    check("web: C3 only the configured path reaches the upstream, no query on a non-events feed", p == "/dec.json", p)
+    low = {k.lower() for k in uh}
+    check("web: C3 no request header but If-None-Match goes up (no cookie, authorization or custom header)",
+          uh.get("If-None-Match") == '"old"' and not ({"cookie", "authorization", "x-other"} & low), sorted(low))
+    s, h, b = get("/app/feeds/decisions.json", hdr={"If-None-Match": '"u1"'})
+    check("web: C3 an upstream 304 is a 304 with the ETag and no body", s == 304 and b == "" and h.get("ETag") == '"u1"', (s, b))
+    del seen[:]
+    s, h, b = get("/app/feeds/events.json?since=2026-11-01T00:00:00Z&x=1")
+    check("web: C3 only ?since= goes up on events, X-Po-Since comes down", s == 200 and seen[-1][0] == "/ev.json?since=2026-11-01T00%3A00%3A00Z" and h.get("X-Po-Since") == "partial", (seen[-1][0], dict(h)))
+    s, h, b = get("/app/feeds/team.json")
+    check("web: C3 an upstream error is 502 with {error}", s == 502 and "error" in json.loads(b), (s, b))
+    s, h, b = get("/app/feeds/projects.json")
+    check("web: C3 an upstream that is not JSON is 502 with {error}", s == 502 and "error" in json.loads(b), (s, b))
+    s, h, b = get("/app/feeds/other.json"); check("web: C3 an unknown feed name is 404", s == 404, s)
+    s, h, b = get("/app/feeds/decisions.json/../../etc/passwd"); check("web: a feed path with extra segments is 404", s == 404, s)
+finally:
+    proc.terminate(); proc.wait(); up.shutdown()
+
+# a po serve with no [serve.web]: no feeds but its own events, read-only Decisions hidden, CSP without a sink
+repo2 = os.path.join(wv, "repo2")
+subprocess.run(["cp", "-a", repo, repo2], check=True)
+toml = open(os.path.join(repo2, "po.toml")).read().split("\n[serve.web]")[0] + "\n"
+open(os.path.join(repo2, "po.toml"), "w").write(toml)
+proc = subprocess.Popen([po, "serve", "--port", "0"], cwd=repo2, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+m = re.search(r"listening on (http://\S+)/", proc.stdout.readline())
+url = m.group(1)
+try:
+    s, h, b = get("/app/config.json")
+    check("web: with no [serve.web] only the events view is offered and answer_url is null and stall_minutes is 30", json.loads(b) == {"feeds": ["events"], "answer_url": None, "stall_minutes": 30}, b)
+    s, h, b = get("/app/feeds/events.json")
+    check("web: with no events_url, events are po serve's own, with an ETag", s == 200 and len(json.loads(b)) == 12 and h.get("ETag"), (s, len(b)))
+    s, h, b = get("/app/feeds/decisions.json"); check("web: an unconfigured feed is 404", s == 404, s)
+    s, h, b = get("/app/")
+    check("web: without answer_url the CSP is connect-src 'self' alone", "connect-src 'self'; base-uri" in h.get("Content-Security-Policy", ""), h.get("Content-Security-Policy"))
+finally:
+    proc.terminate(); proc.wait()
+print("BLOCK-END serve-web")
+PY
+# a bad URL in [serve.web] is refused at start, and an unknown key is a manifest error
+make_repo "$WV/repo3"
+printf '\n[serve.web]\ndecisions_url = "ftp://x/y"\n' >>"$WV/repo3/po.toml"
+out=$(cd "$WV/repo3" && PATH="$SV/bin:$PATH" "$PO" serve --port 0 2>&1)
+[[ $? == 1 && $out == *"--decisions-url must be an http(s) URL"* ]] && ok "a non-http feed URL is refused at start" || bad "bad feed url" "$out"
+printf '%s\n[serve.web]\nbogus_url = "http://x"\n' "$GOOD_MANIFEST" >"$WV/m2.toml"
+expect "an unknown key in [serve.web] is a manifest error" 2 "unknown key 'bogus_url' in \[serve.web\]" -- -C "$WV/repo" --manifest "$WV/m2.toml" status
 
 # ---- po team, the Team-view feed (item AR) ---------------------------------
 TM=$TMP/team
@@ -2902,7 +3439,7 @@ check("dashboard reports: shapes stay inside the width", all(s[1] >= 0 and s[1] 
 _many = r.closed([_st("2026-10-25T01:00:00Z", kind="close", project="p%d" % i) for i in range(8)], 86400, _n)
 check("dashboard reports: a project past the palette reuses a colour hatched", r.series_colour(0) == (("series", 0), False) and r.series_colour(6) == (("series", 0), True) and len(r.layout_closed(_many, 400)[1]) > 8)
 for _v, _p in sorted(c.PALETTES.items()):
-    _lo = min(c.contrast(x, _p["base"]) for x in _p["series"] + [_p["pass"], _p["fail"]])
+    _lo = min(c.contrast_ratio(x, _p["base"]) for x in _p["series"] + [_p["pass"], _p["fail"]])
     check("dashboard reports %s: chart colours reach 3:1 against the base (%.2f)" % (_v, _lo), _lo >= 3 and len(_p["series"]) == r.SERIES_COLOURS)
 check("dashboard: fewer than 10 events show them all", len(c.visible(ev[:3], False)) == 3)
 
@@ -3250,31 +3787,40 @@ LK = dict(AC, id="lk", project="orchard", item="1.9.70", asked_at="2026-11-01T02
                     {"name": "stream", "kind": "url", "target": "https://example.org/live", "present": True}],
           ready={"build": "orchard 1.9.70-1", "commit": "abc1234", "checked_at": "2026-11-01T03:00:00Z"},
           snapshot="/home/me/orchard-data-snapshot-20261031-2320")
+LKNOW = datetime.datetime(2026, 11, 1, 3, 5, 0, tzinfo=utc)  # five minutes after LK's checked_at
 check("look: package_nvr reads name and ver-rel from a package file name",
       c.package_nvr(PK81) == ("orchard", "1.9.70-1") and c.package_nvr("lib-x-2.0.r3.g1a2b-2-any.pkg.tar.xz") == ("lib-x", "2.0.r3.g1a2b-2"))
 check("look: package_nvr refuses names that are not package files",
       all(c.package_nvr(x) is None for x in ("a-1-x86_64.pkg.tar.zst", "orchard.pkg.tar.zst", "a/b-1-1-any.pkg.tar.zst", "<p>-1-1-any.pkg.tar.zst", None, 3)))
 check("look: matching build shown with the Ready line (local time)",
-      c.look_ready(LK, utc) == (True, "Ready: orchard 1.9.70-1 installed, checked 2026-11-01 03:00:00"))
-_lr = c.decision_row(LK, now, utc)
+      c.look_ready(LK, utc, LKNOW) == (True, "Ready: orchard 1.9.70-1 installed, checked 2026-11-01 03:00:00"))
+_lr = c.decision_row(LK, LKNOW, utc)
 check("look: the row carries the Ready line, each step's expect, the fixtures and the snapshot",
       _lr["ready"] == "Ready: orchard 1.9.70-1 installed, checked 2026-11-01 03:00:00" and [st["expect"] for st in _lr["steps"]] == ["a menu with three bookmarks", "the stream plays"]
       and _lr["fixtures"] == [{"name": "profile", "present": True}, {"name": "stream", "present": True}] and _lr["snapshot"] == LK["snapshot"])
 _wrong = dict(LK, ready=dict(LK["ready"], build="orchard 1.9.69-1"))
-check("look: wrong build held", c.look_ready(_wrong, utc) == (False, "installed is orchard 1.9.69-1, the card needs orchard 1.9.70-1"))
-check("look: hold_looks shows the ready card and holds the wrong build", c.hold_looks([LK, _wrong, CH], utc) == ([LK, CH], 1))
+_lk_at = lambda secs: c.look_ready(LK, utc, LKNOW + datetime.timedelta(seconds=secs))
+check("look: checked_at 20 minutes old is held stale", _lk_at(20 * 60 - 300) == (False, "stale"))
+check("look: checked_at 10 seconds old is ready", _lk_at(10 - 300)[0] is True)
+check("look: checked_at 5 minutes ahead is held in the future", _lk_at(-600) == (False, "in the future"))
+_wall = lambda secs: (datetime.datetime.now(utc) - datetime.timedelta(seconds=secs)).strftime("%Y-%m-%dT%H:%M:%SZ")
+check("look: with no now given the clock is read: 10 s old ready, 1 h old stale",
+      c.look_ready(dict(LK, ready=dict(LK["ready"], checked_at=_wall(10))), utc)[0] is True
+      and c.look_ready(dict(LK, ready=dict(LK["ready"], checked_at=_wall(3600))), utc) == (False, "stale"))
+check("look: wrong build held", c.look_ready(_wrong, utc, LKNOW) == (False, "installed is orchard 1.9.69-1, the card needs orchard 1.9.70-1"))
+check("look: hold_looks shows the ready card and holds the wrong build", c.hold_looks([LK, _wrong, CH], utc, LKNOW) == ([LK, CH], 1))
 check("look: a held card is absent from the check lines once held out",
-      [l.split(" | ")[1] for l in c.decision_check_lines(c.hold_looks([LK, dict(_wrong, item="1.9.69")], utc)[0], now, utc)] == ["1.9.70"])
+      [l.split(" | ")[1] for l in c.decision_check_lines(c.hold_looks([LK, dict(_wrong, item="1.9.69")], utc, LKNOW)[0], LKNOW, utc)] == ["1.9.70"])
 _nr = {k: v for k, v in LK.items() if k != "ready"}
-check("look: no report from the install machine is held", c.look_ready(_nr)[0] is False and c.decision_row(_nr, now)["ready"] == "")
-check("look: an unreadable checked_at is held", c.look_ready(dict(LK, ready=dict(LK["ready"], checked_at="soon")))[0] is False)
-check("look: no step check is held", c.look_ready({k: v for k, v in LK.items() if k != "checked_by"}) == (False, "no step check"))
-check("look: a step check on another build is held", c.look_ready(dict(LK, check_sha256=SHB)) == (False, "the step check ran on another build"))
+check("look: no report from the install machine is held", c.look_ready(_nr, None, LKNOW)[0] is False and c.decision_row(_nr, LKNOW)["ready"] == "")
+check("look: an unreadable checked_at is held", c.look_ready(dict(LK, ready=dict(LK["ready"], checked_at="soon")), None, LKNOW)[0] is False)
+check("look: no step check is held", c.look_ready({k: v for k, v in LK.items() if k != "checked_by"}, None, LKNOW) == (False, "no step check"))
+check("look: a step check on another build is held", c.look_ready(dict(LK, check_sha256=SHB), None, LKNOW) == (False, "the step check ran on another build"))
 check("look: a fixture not present is held",
-      c.look_ready(dict(LK, fixtures=[dict(LK["fixtures"][0], present=False), LK["fixtures"][1]])) == (False, "fixture not in place: profile"))
-check("look: a card without fixtures is held", c.look_ready({k: v for k, v in LK.items() if k != "fixtures"}) == (False, "fixtures missing: list them, or write [] for none"))
-check("look: fixtures [] is a stated none", c.look_ready(dict(LK, fixtures=[]))[0] is True)
-check("look: a vague step is held", c.look_ready(dict(LK, steps=[{"text": "right-click the page and look around", "expect": "a menu"}]))[0] is False)
+      c.look_ready(dict(LK, fixtures=[dict(LK["fixtures"][0], present=False), LK["fixtures"][1]]), None, LKNOW) == (False, "fixture not in place: profile"))
+check("look: a card without fixtures is held", c.look_ready({k: v for k, v in LK.items() if k != "fixtures"}, None, LKNOW) == (False, "fixtures missing: list them, or write [] for none"))
+check("look: fixtures [] is a stated none", c.look_ready(dict(LK, fixtures=[]), None, LKNOW)[0] is True)
+check("look: a vague step is held", c.look_ready(dict(LK, steps=[{"text": "right-click the page and look around", "expect": "a menu"}]), None, LKNOW)[0] is False)
 check("look: a card that is not a look card is not held", c.look_ready(AC) == (True, "") and c.look_ready(CH) == (True, ""))
 check("look: step_problems names a missing expect, a short step and a vague phrase",
       c.step_problems([{"text": "open the Downloads panel"}, {"text": "look", "expect": "x"}, {"text": "right-click the page", "expect": "a menu"}])
@@ -3552,7 +4098,7 @@ del os.environ["PO_SLOW_AFTER"]
 for variant in sorted(c.PALETTES):
     props = c.css_properties(c.css(variant))
     for fg, bg, role in c.CONTRAST_PAIRS:
-        ratio = c.contrast(props[fg]["color"], props[bg]["background-color"])
+        ratio = c.contrast_ratio(props[fg]["color"], props[bg]["background-color"])
         check("dashboard css %s: %s has contrast >= 4.5 (%.2f)" % (variant, role, ratio), ratio >= 4.5)
     check("dashboard css %s: cards and toggle are raised, a pressed toggle is inset" % variant,
           "inset" not in props[".po-card"]["box-shadow"] and "inset" not in props[".po-toggle"]["box-shadow"]
@@ -3580,9 +4126,9 @@ for variant in sorted(c.PALETTES):
     for n in (c.FADE_STEPS, c.FADE_STEPS // 2, 1):
         bg = props[".po-card.po-fade-%d" % n]["background-color"]
         for cls, _key in c.FADE_TEXT:
-            ratio = c.contrast(props[".po-fade-%d .%s" % (n, cls)]["color"], bg)
+            ratio = c.contrast_ratio(props[".po-fade-%d .%s" % (n, cls)]["color"], bg)
             check("dashboard fade css %s: %s keeps contrast >= 4.5 at step %d (%.2f)" % (variant, cls, n, ratio), ratio >= 4.5)
-    worst = min(c.contrast(props[".po-fade-%d .%s" % (n, cls)]["color"], props[".po-card.po-fade-%d" % n]["background-color"])
+    worst = min(c.contrast_ratio(props[".po-fade-%d .%s" % (n, cls)]["color"], props[".po-card.po-fade-%d" % n]["background-color"])
                 for n in range(1, c.FADE_STEPS + 1) for cls, _k in c.FADE_TEXT)
     check("dashboard fade css %s: every step, every text colour is >= 4.5 (%.2f)" % (variant, worst), worst >= 4.5)
 # po serve pages: the same highlight, as a CSS animation with a reduced-motion fallback.
@@ -3608,7 +4154,7 @@ check("serve page: a run over slow_after is marked slow, others are not", pg.cou
 for variant, base, target, normal in (("light", "#ffffff", "#000000", {"text": "#222222", "muted": "#555555"}), ("dark", "#181818", "#ffffff", {"text": "#dddddd", "muted": "#aaaaaa"})):
     start = c.mix(base, target, 0.25)
     for role, col in sv.NEW_TEXT[variant].items():
-        ratio = c.contrast(col, start)
+        ratio = c.contrast_ratio(col, start)
         check("serve page %s: %s text keeps contrast >= 4.5 on the strongest highlight (%.2f)" % (variant, role, ratio), ratio >= 4.5)
         check("serve page %s: %s text is in the page's CSS" % (variant, role), col in pg)
 # sortable columns (item v0.31)
@@ -3633,7 +4179,13 @@ check("dashboard sort: team columns are the line's fields", c.TEAM_COLUMNS == ("
 check("dashboard sort: sorting does not change the list it is given", [e["agent"] for e in tm] == ["b", "A"])
 check("dashboard css: the column header style exists with a focus ring", ".po-colhead" in c.css("light") and ".po-colhead:focus-visible" in c.css("dark"))
 check("dashboard css: the two variants differ", c.css("light") != c.css("dark"))
-check("dashboard: contrast of black on white is 21", round(c.contrast("#000000", "#ffffff")) == 21)
+check("dashboard: contrast of black on white is 21", round(c.contrast_ratio("#000000", "#ffffff")) == 21)
+check("dashboard: the old pale grey on white fails AA (v0.108)", c.contrast_ratio("#aab2bf", "#ffffff") < 4.5)
+for variant in sorted(c.PALETTES):
+    _p = c.PALETTES[variant]
+    _h = c.css_properties(c.css(variant))[".po-dhead"]
+    check("dashboard css %s: the collapsed decision header takes the theme base and text (v0.108)" % variant,
+          _h["background-color"] == _p["base"] and _h["color"] == _p["text"])
 # Projects feed (v0.37): parse, counts, light, filter, failed fetch.
 pr = c.parse_projects('[{"project":"p","items":[{"item":"1","status":"TODO","agents":"x"},{"item":"2","status":"DONE","agents":["a","b"],"title":"T"}]}, 42, "s", {"items":"nope"}, {"project":"q","last_event":null}]')
 check("dashboard projects: a broken entry is skipped, a missing field defaults",
@@ -3688,7 +4240,7 @@ pcl = c.project_check_lines(pf, datetime.datetime(2026, 10, 26, 1, 10, 0, tzinfo
 check("dashboard projects: the example feed has one project per light, items in every status",
       [l.split(" | ")[1] for l in pcl] == ["active", "idle", "inactive"] and {i["status"] for p in pf for i in p["items"]} >= {"TODO", "DOING", "PAUSED", "HELD", "DONE"})
 check("dashboard projects: the example's DONE agents are in order", [i["agents"] for i in pf[0]["items"] if i["status"] == "DONE"] == [["dee", "cy", "ana"]])
-check("dashboard projects: --check prints name, light, todo/doing/done/released, the release and open setup steps", pcl == ["orchard | active | 1/1/1/0 | release-3 | setup open 2", "harbor | idle | 0/1/0/0 | no release", "meadow | inactive | 0/0/1/1 | v2.1 | setup open 1"])
+check("dashboard projects: --check prints name, light, todo/doing/done/released, the release and open setup steps", pcl == ["orchard | active | 1/1/1/0 | release-3 | setup open 2", "harbor | idle | 0/1/0/0 | no release", "meadow | inactive | 0/0/1/1 | v2.1 | setup open 1 | feed error: po released --json: exit 1"])
 _pn = datetime.datetime(2026, 10, 26, 1, 10, 0, tzinfo=utc)
 _st0 = c.project_view_state()
 check("dashboard project screen: the state starts on the overview with no filters", _st0 == {"open": None, "filters": {}})
@@ -3707,7 +4259,7 @@ check("dashboard project screen: no feed yet keeps nothing open", c.project_stat
 _ps = c.project_screen(pf[0], "all", _pn)
 check("dashboard project screen: the header has the name and the light in words", _ps["name"] == "orchard" and _ps["light"] == "active" and "active" in _ps["text"])
 check("dashboard project screen: filter buttons are All, TODO, DOING, DONE, RELEASED with their counts", [(f["label"], f["count"]) for f in _ps["filters"]] == [("All", 3), ("TODO", 1), ("DOING", 1), ("DONE", 1), ("RELEASED", 0)])
-check("dashboard project screen: HELD counts in All only", [(f["label"], f["count"]) for f in c.project_screen(pf[1], "all", _pn)["filters"]] == [("All", 2), ("TODO", 0), ("DOING", 1), ("DONE", 0), ("RELEASED", 0)])
+check("dashboard project screen: HELD counts in All only", [(f["label"], f["count"]) for f in c.project_screen(pf[1], "all", _pn)["filters"]] == [("All", 13), ("TODO", 0), ("DOING", 1), ("DONE", 0), ("RELEASED", 0)])
 check("dashboard project screen: rows are in the feed's order with id, title and status badge", [(r["item"], r["title"], r["status"]) for r in _ps["rows"]] == [("3.1", "Plant", "TODO"), ("3.2", "Water", "DOING"), ("3.3", "Harvest", "DONE")])
 check("dashboard project screen: TODO lists the agents that could take it", _ps["rows"][0]["agents"] == ["ana", "ben"] and not _ps["rows"][0]["live"])
 check("dashboard project screen: DOING marks the current agent live", _ps["rows"][1]["agents"] == ["cy"] and _ps["rows"][1]["live"])
@@ -3715,7 +4267,7 @@ check("dashboard project screen: DONE lists every agent in the feed's order, not
 check("dashboard project screen: no agent is a muted dash", c.project_screen(pf[1], "all", _pn)["rows"][1]["dash"] and not _ps["rows"][0]["dash"])
 check("dashboard project screen: a DOING row with no agent is not live", not c.project_screen({"project": "p", "items": [{"item": "1", "status": "DOING", "agents": []}]}, "all", _pn)["rows"][0]["live"])
 check("dashboard project screen: the filter narrows the rows, counts stay", [r["item"] for r in c.project_screen(pf[0], "done", _pn)["rows"]] == ["3.3"] and c.project_screen(pf[0], "done", _pn)["filters"][0]["count"] == 3)
-check("dashboard project screen: PAUSED shows under DOING", [r["item"] for r in c.project_screen(pf[1], "doing", _pn)["rows"]] == ["1.4"])
+check("dashboard project screen: PAUSED shows under DOING", [r["item"] for r in c.project_screen(pf[1], "doing", _pn)["rows"]] == ["1.1"])
 check("dashboard project screen: a project with no items has no rows", c.project_screen({"project": "p"}, "all", _pn)["rows"] == [] and c.project_screen({"project": "p"}, "all", _pn)["filters"][0]["count"] == 0)
 pdir = tempfile.mkdtemp()
 pfile = os.path.join(pdir, "projects.json")
@@ -3737,7 +4289,19 @@ check("dashboard projects: a card carries name, light and the four counts", _pc[
 _pl = {"project": "p", "last_event": "2026-10-26T11:50:00Z", "items": [{"item": "1", "status": "TODO"}, {"item": "2", "status": "DOING"}, {"item": "3", "status": "DONE"}, {"item": "4", "status": "DONE"}]}
 check("dashboard projects: the card text names the light in words, not only colour", c.project_card(_pl, pnow)["text"] == "p, active, TODO 1, DOING 1, DONE 2, RELEASED 0, no release")
 check("dashboard projects: the card text names an idle and an inactive light too", ", idle," in c.project_card(dict(_pl, last_event="2026-10-26T01:00:00Z"), pnow)["text"] and ", inactive," in c.project_card(dict(_pl, last_event=None), pnow)["text"])
+# v0.109: a feed error greys the card and says so; counts and light come from the last good data in the entry.
+_ep = dict(_pl, error="po released --json: exit 1")
+_ec = c.project_card(c.parse_projects(json.dumps([_ep]))[0], pnow)
+check("v0.109 dashboard projects: parse keeps a string error", c.parse_projects(json.dumps([_ep]))[0]["error"] == "po released --json: exit 1")
+check("v0.109 dashboard projects: parse ignores a non-string, empty or absent error", [e["error"] for e in c.parse_projects(json.dumps([dict(_pl, error=5), dict(_pl, error=["x"]), dict(_pl, error=" "), dict(_pl, error=None), _pl]))] == [None] * 5)
+check("v0.109 dashboard projects: an errored card says feed error in its text and keeps counts and light from the last good data",
+      _ec["error"] == "po released --json: exit 1" and _ec["text"] == "p, active, TODO 1, DOING 1, DONE 2, RELEASED 0, no release, feed error: po released --json: exit 1" and _ec["counts"]["done"] == 2)
+check("v0.109 dashboard projects: a card with no error has error None and the old text", c.project_card(_pl, pnow)["error"] is None and "feed error" not in c.project_card(_pl, pnow)["text"])
+check("v0.109 dashboard projects: --check adds the feed error to the project's line", c.project_check_lines(c.parse_projects(json.dumps([_ep])), pnow)[0].endswith(" | feed error: po released --json: exit 1"))
+check("v0.109 dashboard projects: the example feed carries one error project", [p["project"] for p in pf if p["error"]] == ["meadow"])
 check("dashboard projects: a card for an entry with no items counts zero", c.project_card({"project": "q"}, pnow)["text"] == "q, inactive, TODO 0, DOING 0, DONE 0, RELEASED 0, no release")
+check("dashboard projects: the card lost line carries every item name, no truncation",
+      c.project_card({"project": "p", "items": [{"item": "a1"}, {"item": "b2"}, {"item": "c3"}]}, pnow)["lost"] == "3 not in a filter: a1, b2, c3")
 # v0.83: RELEASED and the release label.
 _rp = c.parse_projects('[{"project":"p","release":"release-2","items":[{"item":"1","status":"DONE","released":true},{"item":"2","status":"DONE","released":true,"setup_open":2},{"item":"3","status":"DONE"},{"item":"4","status":"TODO","released":true},{"item":"5","status":"DONE (no change needed: x)","released":true},{"item":"6","status":"HELD"}]},{"project":"q","release":7,"items":[{"item":"1","status":"DONE","released":"yes","setup_open":"x"}]},{"project":"r","release":""}]')
 check("dashboard released: parse keeps release, released and setup_open", _rp[0]["release"] == "release-2" and _rp[0]["items"][0]["released"] is True and _rp[0]["items"][1]["setup_open"] == 2 and _rp[0]["items"][2]["released"] is False and _rp[0]["items"][2]["setup_open"] == 0)
@@ -4034,18 +4598,78 @@ check("feeds: feed_url_since adds since to the query", c.feed_url_since("http://
 m = c.merge_since(evs, [evs[1], {"time": "2026-11-01T04:00:00Z", "item": "d"}])
 check("feeds: merge_since adds only the events not held", [e["item"] for e in m] == ["a", "b", "c", "d"] and c.merge_since(evs, []) == evs)
 
-# The demo server: ETag, 304, X-Po-Since full and partial, through Feed.
+# The demo server: ETag, X-Po-Since full and partial, through Feed.
 proc = subprocess.Popen([sys.executable, "-I", sys.argv[1] + "/../../examples/events-demo-server.py", "--port", "0", "--every", "999"], stdout=subprocess.PIPE, text=True)
 try:
     port = int(proc.stdout.readline().split("127.0.0.1:")[1].split("/")[0])
     df = c.Feed("http://127.0.0.1:%d/events.json" % port)
     whole = df.load(c.parse_events)
     check("feeds: the demo server's events carry an ETag and X-Po-Since: full", whole[0] and whole[2] is False and df.etag and df.since_ok, df.etag)
-    check("feeds: the demo server answers a matching If-None-Match with 304", df.load(c.parse_events) == (False, None, False))
-    newest = df.since_for(whole[1]) or max(e["time"] for e in whole[1])
-    df.etag = None
-    part = df.load(c.parse_events, newest)
+    check("feeds: the demo server's second whole fetch does not send If-None-Match and returns 200",
+          df.load(c.parse_events) == (True, whole[1], False))
+    # ?since= with no cached ETag returns the events since, marked partial.
+    df2 = c.Feed("http://127.0.0.1:%d/events.json" % port)
+    newest = whole[1][-1]["time"]
+    part = df2.load(c.parse_events, newest)
     check("feeds: the demo server answers ?since= with the events since, marked partial", part[0] and part[2] is True and 0 < len(part[1]) < len(whole[1]) and all(e["time"] >= newest for e in part[1]), len(part[1]))
+    # FULL_EVERY-th fetch: no If-None-Match, 200 whole body.
+    seen_fe = []
+    body_fe = {"v": json.dumps([{"time": "2026-11-01T01:00:00Z", "item": "1"}])}
+    class SinceFeed(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            b = body_fe["v"].encode()
+            tag = '"whole"'
+            seen_fe.append(self.headers.get("If-None-Match"))
+            if self.headers.get("If-None-Match") == tag:
+                self.send_response(304); self.send_header("ETag", tag); self.end_headers(); return
+            self.send_response(200); self.send_header("ETag", tag); self.send_header("X-Po-Since", "full"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+        def log_message(self, *a): pass
+    srv_fe = Srv(("127.0.0.1", 0), SinceFeed)
+    threading.Thread(target=srv_fe.serve_forever, daemon=True).start()
+    try:
+        fe = c.Feed("http://127.0.0.1:%d/events.json" % srv_fe.server_address[1])
+        fe.load(c.parse_events)
+        whole_fe = fe.load(c.parse_events)
+        check("feeds: the whole fetch sends no If-None-Match and returns the full body", whole_fe[0] and whole_fe[2] is False and seen_fe[-1] is None and len(whole_fe[1]) == 1)
+        # A server that never offers ?since= (no X-Po-Since) still gets If-None-Match and 304.
+        seen_no = []
+        class NoSince(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                b = body_fe["v"].encode()
+                tag = '"whole"'
+                seen_no.append(self.headers.get("If-None-Match"))
+                if self.headers.get("If-None-Match") == tag:
+                    self.send_response(304); self.send_header("ETag", tag); self.end_headers(); return
+                self.send_response(200); self.send_header("ETag", tag); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+            def log_message(self, *a): pass
+        srv_ns = Srv(("127.0.0.1", 0), NoSince)
+        threading.Thread(target=srv_ns.serve_forever, daemon=True).start()
+        try:
+            ns = c.Feed("http://127.0.0.1:%d/events.json" % srv_ns.server_address[1])
+            ns.load(c.parse_events)
+            seen_no.clear()
+            ns304 = ns.load(c.parse_events)
+            check("feeds: a server that never offers ?since= still gets If-None-Match and 304", ns304 == (False, None, False) and seen_no[-1] == '"whole"')
+        finally:
+            srv_ns.shutdown()
+    finally:
+        srv_fe.shutdown()
+    # A stub server that writes less than Content-Length makes Feed.load raise DashboardError.
+    class ShortBody(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200); self.send_header("Content-Length", "99"); self.end_headers(); self.wfile.write(b"short")
+        def log_message(self, *a): pass
+    srv_sb = Srv(("127.0.0.1", 0), ShortBody)
+    threading.Thread(target=srv_sb.serve_forever, daemon=True).start()
+    try:
+        sb = c.Feed("http://127.0.0.1:%d/events.json" % srv_sb.server_address[1])
+        try:
+            sb.load(c.parse_events)
+            check("feeds: a short body is a DashboardError", False)
+        except c.DashboardError as e:
+            check("feeds: a short body is a DashboardError", "cannot reach" in str(e))
+    finally:
+        srv_sb.shutdown()
 finally:
     proc.kill()
     proc.wait()
@@ -4147,7 +4771,7 @@ out2=$(XDG_CONFIG_HOME="$TMP/cfg" python3 -B "$DB" --url "$CHK_URL" --decisions-
 # v0.69: --install-dir / PO_DASHBOARD_INSTALL_DIR; --check prints the Install block after the decisions.
 sha=$(printf '%064d' 0)
 # v0.81: a look card is shown (and so makes the block) only when ready: checked, fixtures stated, build installed.
-printf '[{"project":"orchard","item":"1.9.39","title":"Look","waiting_for":"a look","asked_at":"2026-10-29T10:00:00Z","kind":"action","id":"i1","machine":"laptop","steps":[{"text":"open the Bookmarks menu","expect":"three bookmarks"}],"done_when":"seen","requires":{"package":"a-1-1-x86_64.pkg.tar.zst","sha256":"%s"},"fixtures":[],"checked_by":"rev","check_sha256":"%s","ready":{"build":"a 1-1","checked_at":"2026-10-29T10:05:00Z"}}]\n' "$sha" "$sha" >"$TMP/install.json"
+printf '[{"project":"orchard","item":"1.9.39","title":"Look","waiting_for":"a look","asked_at":"2026-10-29T10:00:00Z","kind":"action","id":"i1","machine":"laptop","steps":[{"text":"open the Bookmarks menu","expect":"three bookmarks"}],"done_when":"seen","requires":{"package":"a-1-1-x86_64.pkg.tar.zst","sha256":"%s"},"fixtures":[],"checked_by":"rev","check_sha256":"%s","ready":{"build":"a 1-1","checked_at":"%s"}}]\n' "$sha" "$sha" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$TMP/install.json"
 out=$(env -u PO_DASHBOARD_INSTALL_DIR python3 -B "$DB" --url "$CHK_URL" --decisions-url "$TMP/install.json" --install-dir /x/pkgs --check 2>&1)
 [[ $(tail -3 <<<"$out") == "install | orchard | a-1-1-x86_64.pkg.tar.zst
 install | orchard | cd /x/pkgs && sha256sum -c <<< '$sha  a-1-1-x86_64.pkg.tar.zst'
@@ -4260,6 +4884,55 @@ mod.main()
 PY
 		)
 		[[ $out == opened ]] && ok "po-dashboard Projects card activation opens the project screen" || bad "dashboard projects activate" "$out"
+		# v0.109: the errored project's card is greyed (po-errored) and says `feed error`; the others do not (the example feed's Projects screenshot above shows it).
+		# helper
+		out=$(timeout 60 python3 -I - "$DB" "$SV/events.json" "$(dirname "$PO")/../examples/projects-feed.json" 2>/dev/null <<'PY'
+import http.server, importlib.machinery, importlib.util, os, sys, threading
+sys.dont_write_bytecode = True
+import gi
+gi.require_version("Gtk", "4.0")
+from gi.repository import GLib, Gtk
+db, events, feed = sys.argv[1:4]
+body = open(events, "rb").read()
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def log_message(self, *a): pass
+srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+sys.argv = [db, "--url", "http://127.0.0.1:%d/" % srv.server_address[1], "--projects-url", feed, "--view", "projects"]
+loader = importlib.machinery.SourceFileLoader("po_dashboard", db)
+mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("po_dashboard", loader))
+loader.exec_module(mod)
+n = {"n": 0}
+def walk(w):
+    yield w
+    c = w.get_first_child()
+    while c:
+        yield from walk(c)
+        c = c.get_next_sibling()
+def labels(card):
+    return [x.get_text() for x in walk(card) if isinstance(x, Gtk.Label)]
+def tick():
+    n["n"] += 1
+    nodes = [x for w in Gtk.Window.list_toplevels() for x in walk(w)]
+    cards = [x for x in nodes if isinstance(x, Gtk.FlowBoxChild)]
+    if len(cards) == 3:
+        res = []
+        for ch in cards:
+            card = ch.get_child()
+            res.append((card.has_css_class("po-errored"), "feed error" in labels(card), "feed error" in (ch.get_tooltip_text() or "")))
+        print("errored-only" if res == [(False, False, False), (False, False, False), (True, True, True)] else "wrong %r" % res)
+        sys.stdout.flush()
+        os._exit(0)
+    if n["n"] > 100:
+        print("no cards"); os._exit(1)
+    return True
+GLib.timeout_add(100, tick)
+mod.main()
+PY
+		)
+		[[ $out == errored-only ]] && ok "v0.109 po-dashboard greys only the errored project's card, says feed error and carries it in the tooltip" || bad "v0.109 errored card" "$out"
 		# v0.83: the release label is the last widget of the card's top row and of the screen header, right-aligned; `no release` is muted.
 		# helper
 		out=$(timeout 60 python3 -I - "$DB" "$SV/events.json" "$(dirname "$PO")/../examples/projects-feed.json" 2>/dev/null <<'PY'
@@ -4455,6 +5128,65 @@ PY
 			esac
 			grep -qx "PASS $t" <<<"$out" && ok "po-dashboard draft: $m" || bad "dashboard draft $t" "$out"
 		done
+		# v0.97: Send on a look card reads the installed build in the worker thread; a slow pacman never holds the main loop.
+		mkdir -p "$TMP/slow-bin" && printf '#!/bin/sh\nsleep 3\necho "a 1-1"\n' >"$TMP/slow-bin/pacman" && chmod +x "$TMP/slow-bin/pacman"
+		printf '[{"project":"p","item":"1","title":"Look","waiting_for":"a look","asked_at":"2026-10-29T10:00:00Z","kind":"action","id":"sl1","machine":"laptop","steps":[{"text":"open the Bookmarks menu","expect":"three bookmarks"}],"done_when":"seen","requires":{"package":"a-1-1-x86_64.pkg.tar.zst","sha256":"%s"},"fixtures":[],"checked_by":"rev","check_sha256":"%s","ready":{"build":"a 1-1","checked_at":"%s"}}]\n' "$sha" "$sha" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$TMP/slow-feed.json"
+		# helper
+		out=$(PATH="$TMP/slow-bin:$PATH" XDG_CONFIG_HOME="$TMP/xdg-slow" timeout 60 python3 -I - "$DB" "$SV/events.json" "$TMP/slow-feed.json" 2>&1 <<'PY'
+import gc, http.server, importlib.machinery, importlib.util, os, sys, threading, time
+sys.dont_write_bytecode = True
+import gi
+gi.require_version("Gtk", "4.0")
+from gi.repository import GLib, Gtk
+db, events, feed = sys.argv[1:4]
+body = open(events, "rb").read()
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def do_POST(self):
+        self.send_response(200); self.send_header("Content-Length", "0"); self.end_headers()
+    def log_message(self, *a): pass
+srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+base = "http://127.0.0.1:%d/" % srv.server_address[1]
+sys.argv = [db, "--url", base, "--decisions-url", feed, "--answer-url", base, "--view", "decisions"]
+loader = importlib.machinery.SourceFileLoader("po_dashboard", db)
+mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("po_dashboard", loader))
+loader.exec_module(mod)
+def walk(w):
+    yield w
+    c = w.get_first_child()
+    while c:
+        yield from walk(c)
+        c = c.get_next_sibling()
+res = {"n": 0}
+def finish(code):
+    sys.stdout.flush(); os._exit(code)
+def tick():
+    res["n"] += 1
+    win = next((o for o in gc.get_objects() if type(o).__name__ == "Dashboard" and hasattr(o, "drafts")), None)
+    if win is not None and len(win.decisions) == 1 and win.decisions_list.get_first_child() is not None:
+        GLib.idle_add(run, win)
+        return False
+    if res["n"] > 100:
+        print("FAIL no decisions"); finish(1)
+    return True
+def run(win):
+    try:
+        nodes = list(walk(win.decisions_list))
+        next(n for n in nodes if isinstance(n, Gtk.ToggleButton) and n.get_label() == "Pass").set_active(True)
+        send = next(n for n in nodes if isinstance(n, Gtk.Button) and n.get_label() == "Send")
+        t0 = time.monotonic()
+        send.emit("clicked")
+        GLib.idle_add(lambda: (res.__setitem__("back", time.monotonic() - t0), False)[1])
+        GLib.timeout_add(1000, lambda: (print("PASS offthread" if res.get("back", 9) < 0.5 else "FAIL offthread %r" % res.get("back")), finish(0)))
+    except Exception as e:
+        print("FAIL error %r" % (e,)); finish(0)
+GLib.timeout_add(100, tick)
+mod.main()
+PY
+		)
+		grep -qx "PASS offthread" <<<"$out" && ok "po-dashboard Send on a look card returns to the main loop while a 3 s pacman runs" || bad "dashboard send offthread" "$out"
 		# v0.63: the Decisions toggle hides the choice cards and keeps the action cards; the choice is saved next to the Actions one.
 		cat >"$TMP/toggle-feed.json" <<'JSON'
 [{"project":"p","item":"1","title":"c","waiting_for":"a ruling","asked_at":"2026-10-24T09:00:00Z","kind":"choice","id":"t-choice","question":"Ok?","options":[{"label":"Yes"},{"label":"No"}]},
@@ -4969,14 +5701,14 @@ rel_m() { printf '%s\n[release]\n%s\n' "$GOOD_MANIFEST" "$1" >"$TMP/rel.toml"; }
 rel() { "$PO" -C "$RL" --manifest "$TMP/rel.toml" released "$@"; }
 rel_m 'source = "tag"'
 out=$(rel --json 2>&1)
-[[ $out == '{"source":"tag","release":"release-10","released":["0.1"]}' ]] &&
+[[ $out == '{"source":"tag","release":"release-10","released":["0.1","0.3"]}' ]] &&
 	ok "released: source tag takes the newest release tag by version order and lists only its ancestors" || bad "released tag newest" "$out"
 out=$(rel 2>&1)
-[[ $out == $'release: release-10\n0.1' ]] && ok "released: plain output names the release, then one version per line" || bad "released plain" "$out"
+[[ $out == $'release: release-10\n0.1\n0.3' ]] && ok "released: plain output names the release, then one version per line" || bad "released plain" "$out"
 git -C "$RL" tag release-11
 out=$(rel --json 2>&1)
-[[ $out == '{"source":"tag","release":"release-11","released":["0.1","0.2"]}' ]] &&
-	ok "released: a DONE item whose tag is an ancestor is released; a DONE row without a tag and a TODO row are not" || bad "released ancestor" "$out"
+[[ $out == '{"source":"tag","release":"release-11","released":["0.1","0.2","0.3"]}' ]] &&
+	ok "released: a DONE item whose tag is an ancestor is released; an untagged DONE row last touched before the release is too (v0.134); a TODO row is not" || bad "released ancestor" "$out"
 git -C "$RL" tag -d release-11 >/dev/null
 expect "released: --release is refused for source tag" 1 'source "github" only' -- -C "$RL" --manifest "$TMP/rel.toml" released --release release-2
 rel_m $'source = "tag"\npattern = "nothing-*"'
@@ -4991,7 +5723,7 @@ out=$(rel --json 2>&1)
 [[ $out == '{"source":"none","release":null,"released":[]}' ]] && ok "released: no [release] section means source none" || bad "released default" "$out"
 rel_m 'source = "github"'
 out=$(rel --json --release release-2 2>&1)
-[[ $out == '{"source":"github","release":"release-2","released":["0.1","0.2"]}' ]] &&
+[[ $out == '{"source":"github","release":"release-2","released":["0.1","0.2","0.3"]}' ]] &&
 	ok "released: source github takes the tag the producer gives and checks ancestry" || bad "released github" "$out"
 out=$(rel --json 2>&1)
 [[ $out == '{"source":"github","release":null,"released":[]}' ]] && ok "released: source github without --release is release null" || bad "released github none" "$out"
@@ -5000,6 +5732,74 @@ rel_m 'source = "tags"'
 expect "released: a [release] source other than tag, github or none is a manifest error" 2 'source must be "tag", "github" or "none"' -- -C "$RL" --manifest "$TMP/rel.toml" released
 rel_m $'source = "github"\npattern = "release-*"'
 expect "released: [release] pattern without source tag is a manifest error" 2 'pattern applies to source "tag" only' -- -C "$RL" --manifest "$TMP/rel.toml" released
+
+# v0.99: one DONE rule (first word, upper-cased, trailing punctuation stripped)
+printf '| v0.5 | Five | DONE: shipped | backlog/v0.md |\n| v0.6 | Six | done | backlog/v0.md |\n| v0.7 | Seven | DONE (tag x) | backlog/v0.md |\n' >>"$RL/docs/BACKLOG.md"
+git -C "$RL" commit -qam five && for _v in v0.5 v0.6 v0.7; do git -C "$RL" tag "$_v"; done && git -C "$RL" tag release-99
+rel_m 'source = "github"'
+out=$(rel --json --release release-99 2>&1)
+[[ $out == '{"source":"github","release":"release-99","released":["0.1","0.2","0.3","0.5","0.6","0.7"]}' ]] &&
+	ok "released: rows 'DONE:' and 'done' count as DONE, and 'DONE (tag x)' still does" || bad "released DONE words" "$out"
+
+# ---- po released: untagged DONE rows by their DONE commit (v0.134) ----------
+UR=$TMP/relrepo-untagged
+git init -q -b main "${UR:?}"
+git -C "$UR" config user.name t
+git -C "$UR" config user.email t@example.invalid
+mkdir -p "$UR/docs/backlog"
+printf '## v0.1 — One — TODO\n' >"$UR/docs/backlog/v0.md"
+printf '%s' "$GOOD_MANIFEST" >"$UR/po.toml"
+ur_rows() { printf '# Backlog\n\n| Item | Title | Status | Spec |\n|---|---|---|---|\n%s\n' "$1" >"$UR/docs/BACKLOG.md"; }
+ur() { git -C "$UR" "$@"; }
+urel() { "$PO" -C "$UR" --manifest "$TMP/rel.toml" released "$@"; }
+rel_m 'source = "tag"'
+# T1 tagged and merged; T2 tagged on a side branch the release lacks;
+# 1.9.3 untagged with an admin commit before the release; 2.0 untagged with no
+# admin commit, row last touched before the release.
+ur_rows $'| v1.0 | T1 | TODO | backlog/v0.md |\n| v1.9.3 | Pre | TODO | backlog/v0.md |\n| v1.9.30 | Pre30 | TODO | backlog/v0.md |\n| v2.0 | R1 | TODO | backlog/v0.md |\n| v3.0 | N | TODO | backlog/v0.md |'
+ur add -A && ur commit -qm base
+ur_rows $'| v1.0 | T1 | DONE | backlog/v0.md |\n| v1.9.3 | Pre | DONE | backlog/v0.md |\n| v1.9.30 | Pre30 | TODO | backlog/v0.md |\n| v2.0 | R1 | DONE | backlog/v0.md |\n| v3.0 | N | TODO | backlog/v0.md |'
+ur commit -qam 'rows done'
+ur tag v1.0
+ur commit -q --allow-empty -m 'admin: v1.9.3 DONE'
+ur checkout -q -b side
+ur_rows $'| v1.0 | T1 | DONE | backlog/v0.md |\n| v1.9.3 | Pre | DONE | backlog/v0.md |\n| v1.9.30 | Pre30 | TODO | backlog/v0.md |\n| v2.0 | R1 | DONE | backlog/v0.md |\n| v3.0 | N | TODO | backlog/v0.md |\n| v4.0 | T2 | DONE | backlog/v0.md |'
+ur commit -qam 'side work'
+ur tag v4.0
+ur checkout -q main
+ur tag release-1
+out=$(urel --json 2>&1)
+[[ $out == '{"source":"tag","release":"release-1","released":["1.0","1.9.3","2.0"]}' ]] &&
+	ok "released: tagged and merged is released; an untagged row with an admin: DONE commit, or last touched, before the release is released; 1.9.30 (still TODO) is not matched by the 1.9.3 commit" ||
+	bad "released untagged before" "$out"
+ur_rows $'| v1.0 | T1 | DONE | backlog/v0.md |\n| v1.9.3 | Pre | DONE | backlog/v0.md |\n| v1.9.30 | Pre30 | DONE | backlog/v0.md |\n| v2.0 | R1 | DONE | backlog/v0.md |\n| v3.0 | N | DONE | backlog/v0.md |\n| v4.0 | T2 | DONE | backlog/v0.md |'
+ur commit -qam 'rows after'
+ur commit -q --allow-empty -m 'admin: 1.9.30 DONE'
+out=$(urel --json 2>&1)
+[[ $out == '{"source":"tag","release":"release-1","released":["1.0","1.9.3","2.0"]}' ]] &&
+	ok "released: untagged DONE rows whose DONE commit or last edit comes after the release are not released; a tag not under the release is not released and the DONE commit is not tried" ||
+	bad "released untagged after" "$out"
+ur tag release-2
+out=$(urel --json 2>&1)
+[[ $out == '{"source":"tag","release":"release-2","released":["1.0","1.9.3","1.9.30","2.0","3.0"]}' ]] &&
+	ok "released: the next release takes them; 1.9.3 and 1.9.30 match exactly; --json keeps source, release, released" ||
+	bad "released untagged next" "$out"
+ur_rows $'| v1.0 | T1 | DONE | backlog/v0.md |\n| v7.0 | Absent | TODO | backlog/v0.md |'
+ur commit -qam 'rows reduced'
+out=$(urel 2>&1)
+[[ $out == $'release: release-2\n1.0' ]] && ok "released: a non-DONE row is never listed, and a DONE row that is gone from the backlog is not listed" || bad "released non-done" "$out"
+
+# po status without python3 fails clearly and leaves no temp dir (v0.99)
+NOPY=$TMP/nopy-bin
+NOPYTMP=$TMP/nopy-tmp
+mkdir -p "$NOPY" "$NOPYTMP"
+for _c in bash git sh env dirname basename cat grep sed awk sort tr head tail mktemp rm mkdir date wc cut tee uniq printf readlink ls cp mv sleep id uname find xargs; do
+	_p=$(command -v "$_c" 2>/dev/null) && [[ $_p == /* ]] && ln -sf "$_p" "$NOPY/$_c"
+done
+out=$(PATH=$NOPY TMPDIR=$NOPYTMP "$BASH" "$PO" -C "$RL" --manifest "$TMP/rel.toml" status 2>&1)
+rc=$?
+[[ $rc -ne 0 && $out == *python3* && $(printf '%s\n' "$out" | wc -l) -eq 1 && -z $(ls -A "$NOPYTMP") ]] &&
+	ok "status: no python3 on PATH is a one-line error naming python3 and leaves no temp dir" || bad "status no python3" "rc=$rc out=$out left=$(ls -A "$NOPYTMP")"
 
 # ---- private test blocks (absent from a public snapshot) -------------------
 for _t in "$KITROOT"/private/tests.d/*.sh; do

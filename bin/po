@@ -138,6 +138,17 @@ commands:
                     items the backlog owner column gives it), free, and
                     limit_until / usage merged from the [team] limits_file
                     and usage_file when present (read-only)
+  release <N> --setup | --write
+                    the Setup after install block of CHANGELOG.md's release N
+                    entry (else Unreleased) from the recorded steps of the
+                    items it names: printed, or with --write inserted under
+                    the "## Release N" heading (idempotent)
+  release <N> [--open-review] [--commit]
+                    the pre-release check for release-N: under [release]
+                    review = true, refused (6) unless a TODO/DOING/DONE row
+                    "test review: ... release-N" exists; --open-review adds
+                    that row as an admin commit (dry run without --commit;
+                    idempotent); with the key off and no flag, silent
   released [--json] [--release <tag>]
                     the DONE items the latest release contains: those whose
                     item tag is an ancestor of the release tag; [release]
@@ -243,6 +254,7 @@ main() {
 	ready) po_cmd_ready "$@" ;;
 	events) po_cmd_events "$@" ;;
 	team) po_cmd_team "$@" ;;
+	release) po_cmd_release "$@" ;;
 	released) po_cmd_released "$@" ;;
 	dispatch) po_cmd_dispatch "$@" ;;
 	serve) po_cmd_serve "$@" ;;

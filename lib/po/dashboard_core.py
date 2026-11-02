@@ -178,15 +178,14 @@ class Feed:
         return max((str(e.get("time") or "") for e in events), default="") or None
 
     def load(self, parse, since=None, timeout=5):
-        """One fetch: (changed, data, partial). Sends If-None-Match with the ETag last accepted; a 304 is
-        (False, None, False) and parse is not called. A 200 is (True, parse(body), partial), partial when
-        the server answered a ?since= request with only the events since. The ETag is kept only once parse
-        succeeds, so a body that failed to parse is fetched whole again. Raises DashboardError."""
+        """One fetch: (changed, data, partial). Sends If-None-Match with the ETag last accepted unless
+        `since` is None and `since_ok` (a whole fetch against a server that takes ?since=); a 304
+        is (False, None, False) and parse is not called. A 200 is (True, parse(body), partial), partial when the server answered a ?since= request with only the events since. Raises DashboardError."""
         url = feed_url_since(self.url, since) if since else self.url
         req = urllib.request.Request(url)
-        if self.etag:
-            req.add_header("If-None-Match", self.etag)
         self.fetches += 1
+        if self.etag and not (since is None and self.since_ok):
+            req.add_header("If-None-Match", self.etag)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:  # noqa: S310 (scheme checked in resolve_url)
                 text = r.read().decode("utf-8", "replace")
@@ -196,7 +195,7 @@ class Feed:
             if e.code == 304:
                 return False, None, False
             raise DashboardError("%s answered %d %s" % (url, e.code, e.reason))
-        except (urllib.error.URLError, OSError, ValueError) as e:
+        except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as e:
             raise DashboardError("cannot reach %s: %s" % (url, getattr(e, "reason", e)))
         data = parse(text)
         self.etag = etag or None
@@ -725,8 +724,8 @@ _PROJECT_STATUSES_DOING = {"DOING", "PAUSED", "BLOCKED"}
 
 
 def parse_projects(text):
-    """The projects feed: a JSON array of {project, last_event?, release?, items: [{item, title?, status, agents: [],
-    released?, setup_open?}]}. Tolerant: a wrong-typed optional field reads as absent."""
+    """The projects feed: a JSON array of {project, error?, last_event?, release?, items: [{item, title?, status, agents: [],
+    released?, setup_open?, last_event?}]}. Tolerant: a wrong-typed optional field reads as absent."""
     text = (text or "").strip()
     if not text:
         return []
@@ -761,6 +760,7 @@ def parse_projects(text):
                 "agents": agents,
                 "released": it.get("released") is True,
                 "setup_open": setup_open(it),
+                "last_event": it.get("last_event") if isinstance(it.get("last_event"), str) and it.get("last_event") else None,
             })
         le = entry.get("last_event")
         if le is not None and not isinstance(le, str):
@@ -770,6 +770,7 @@ def parse_projects(text):
             "last_event": le,
             "release": entry.get("release") if isinstance(entry.get("release"), str) and entry.get("release") else None,
             "items": norm_items,
+            "error": " ".join(entry["error"].split()) if isinstance(entry.get("error"), str) and entry["error"].strip() else None,
         })
     return out
 
@@ -885,11 +886,13 @@ def project_check_lines(projects, now=None):
         out.append("%s | %s | %d/%d/%d/%d | %s%s" % (pr["project"], project_light(pr["last_event"], now), c["todo"], c["doing"],
                                                    c["done"], c["released"], release_label(pr)["text"],
                                                    " | setup open %d" % setup if setup else ""))
+        if pr.get("error"):
+            out[-1] += " | feed error: %s" % pr["error"]
     return out
 
 
 def project_card(pr, now=None):
-    """What a Projects card shows: {name, light, counts, text, setup}; text is the tooltip and accessible label, so the
+    """What a Projects card shows: {name, light, counts, text, setup, error}; error is the feed's one-line error or None (the card greys and says `feed error`); text is the tooltip and accessible label, so the
     light is named in words as well as coloured; setup is the muted `setup open N` line ("" when none is open)."""
     light = project_light(pr.get("last_event"), now)
     counts = project_counts(pr.get("items"))
@@ -897,12 +900,15 @@ def project_card(pr, now=None):
     release = release_label(pr)
     setup = project_setup_open(pr)
     setup_line = "setup open %d" % setup if setup else ""
+    error = pr.get("error") or None
     text = "%s, %s, TODO %d, DOING %d, DONE %d, RELEASED %d, %s" % (name, light, counts["todo"], counts["doing"], counts["done"],
                                                                  counts["released"], release["text"])
+    if error:
+        text += ", feed error: %s" % error
     if setup_line:
         text += ", " + setup_line
     return {"name": name, "light": light, "counts": counts, "text": text, "lost": not_in_filter_line(pr.get("items")),
-            "release": release, "setup": setup_line}
+            "release": release, "setup": setup_line, "error": error}
 
 
 def load_projects(url, last=None, feed=None):
@@ -1078,7 +1084,7 @@ def decision_row(entry, now=None, tz=None):
                         for i, st in enumerate(entry["steps"])]
         row["done_when"] = entry["done_when"].strip()
         row["requires"] = requires_of(entry)
-        ok, line = look_ready(entry, tz)
+        ok, line = look_ready(entry, tz, now)
         row["ready"] = line if ok else ""
         fx = entry.get("fixtures") if isinstance(entry.get("fixtures"), list) else []
         row["fixtures"] = [{"name": f["name"].strip(), "present": f.get("present") is True}
@@ -1264,7 +1270,11 @@ def fixture_problems(fixtures):
     return out
 
 
-def look_ready(entry, tz=None):
+LOOK_FRESH_SECONDS = 15 * 60
+LOOK_FUTURE_SECONDS = 60
+
+
+def look_ready(entry, tz=None, now=None):
     """(True, "Ready: <build> installed, checked <local time>") for a look card that passed the three checks,
     else (False, reason). Not a look card: (True, "")."""
     if not is_look(entry):
@@ -1286,15 +1296,21 @@ def look_ready(entry, tz=None):
     ready = entry.get("ready")
     if not isinstance(ready, dict) or not _text(ready.get("build")) or parse_time(ready.get("checked_at")) is None:
         return False, "not checked on the install machine"
+    checked_at = parse_time(ready.get("checked_at"))
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    if (now - checked_at).total_seconds() > LOOK_FRESH_SECONDS:
+        return False, "stale"
+    if (checked_at - now).total_seconds() > LOOK_FUTURE_SECONDS:
+        return False, "in the future"
     build = "%s %s" % nvr
     if ready["build"].strip() != build:
         return False, "installed is %s, the card needs %s" % (ready["build"].strip(), build)
     return True, "Ready: %s installed, checked %s" % (build, local_time(ready["checked_at"], tz))
 
 
-def hold_looks(entries, tz=None):
+def hold_looks(entries, tz=None, now=None):
     """(entries to show, number held): a look card that is not ready is never shown."""
-    shown = [e for e in entries if look_ready(e, tz)[0]]
+    shown = [e for e in entries if look_ready(e, tz, now)[0]]
     return shown, len(entries) - len(shown)
 
 
@@ -1666,7 +1682,7 @@ def card_color(variant, step):
 def readable(fg, bg, variant, need=4.5):
     """fg, moved toward the variant's extreme in small steps until it reaches contrast need on bg."""
     for _ in range(40):
-        if contrast(fg, bg) >= need:
+        if contrast_ratio(fg, bg) >= need:
             break
         fg = mix(fg, fade_target(variant), 0.1)
     return fg
@@ -1741,11 +1757,16 @@ window.po-dashboard { background-color: %(base)s; color: %(text)s; }
 .po-light-active { color: %(pass)s; }
 .po-light-idle { color: %(warn)s; }
 .po-light-inactive { color: %(fail)s; }
+.po-errored .po-text, .po-errored .po-light-active, .po-errored .po-light-idle, .po-errored .po-light-inactive { color: %(muted)s; }
 .po-pcard:focus-visible { outline: 2px solid %(text)s; outline-offset: 2px; }
 .po-view { background-color: %(base)s; background-image: none; color: %(text)s; border: none; border-radius: 14px;
   padding: 8px 16px; box-shadow: 4px 4px 8px %(dark)s, -4px -4px 8px %(light)s; }
 .po-view:checked { box-shadow: inset 4px 4px 8px %(dark)s, inset -4px -4px 8px %(light)s; }
 .po-view:focus-visible { outline: 2px solid %(text)s; outline-offset: 2px; }
+.po-dhead { background-color: %(base)s; background-image: none; color: %(text)s; border: none; border-radius: 10px;
+  box-shadow: none; padding: 0; min-height: 0; }
+.po-dhead:hover { background-color: %(base)s; }
+.po-dhead:focus-visible { outline: 2px solid %(text)s; outline-offset: 2px; }
 .po-subrow { margin: 0 18px 0 18px; }
 .po-small { background-color: %(base)s; background-image: none; color: %(text)s; border: none; border-radius: 10px;
   padding: 2px 12px; min-height: 0; font-size: 12px; box-shadow: 3px 3px 6px %(dark)s, -3px -3px 6px %(light)s; }
@@ -1781,6 +1802,12 @@ CONTRAST_PAIRS = [
     (".po-answered", ".po-card", "answered/sent status"),
     (".po-already", ".po-card", "already answered status"),
     (".po-view", ".po-view", "view toggle label"),
+    (".po-dhead", ".po-dhead", "collapsed decision header"),
+    (".po-text", ".po-dhead", "decision header text"),
+    (".po-muted", ".po-dhead", "decision header detail text"),
+    (".po-kind-choice", ".po-dhead", "decision header choice badge"),
+    (".po-kind-action", ".po-dhead", "decision header action badge"),
+    (".po-kind-unformatted", ".po-dhead", "decision header unformatted badge"),
     (".po-title", ".po-header", "header title"),
     (".po-status", ".po-header", "header status line"),
     (".po-toggle", ".po-toggle", "toggle label"),
@@ -1812,7 +1839,7 @@ def luminance(hexcolor):
     return 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2]
 
 
-def contrast(a, b):
+def contrast_ratio(a, b):
     hi, lo = sorted((luminance(a), luminance(b)), reverse=True)
     return (hi + 0.05) / (lo + 0.05)
 
