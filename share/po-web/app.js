@@ -17,6 +17,8 @@
   var drafts = loadDrafts();  // card id -> {choice, note, result, step, answer_id, sig}; kept across reloads
   var results = {};          // card id -> {text, sent, sending} of the last Send
   var settingsOpen = false;
+  var switches = {};         // project -> {active, at, note, sending}: the last switch flipped here (v0.139)
+  var releases = {};         // project -> the last Release request's result here (v0.140)
 
   function el(tag, cls, text) {
     var e = document.createElement(tag);
@@ -44,6 +46,9 @@
   }
 
   function tokenSet() { return !!localStorage.getItem(TOKEN_KEY); }
+
+  // sinkRequest(body): the one place the token is read for a POST (an answer, or a project switch since v0.139).
+  function sinkRequest(body) { return C.answerRequest(answerUrl, localStorage.getItem(TOKEN_KEY), body); }
 
   function renderNav() {
     var nav = document.getElementById("views");
@@ -118,12 +123,13 @@
     h.appendChild(el("span", "kind", d.kind));
     h.appendChild(document.createTextNode(d.title));
     head.appendChild(h);
-    head.appendChild(el("div", "meta", [d.project && d.item ? d.project + " v" + d.item : d.project, d.waiting, d.asked].filter(Boolean).join(" · ")));
+    head.appendChild(el("div", "meta", [d.project && d.item ? d.project + " " + C.itemRef(d.item) : d.project, d.waiting, d.asked].filter(Boolean).join(" · ")));
     head.addEventListener("click", function () {
       expanded[d.key] = !expanded[d.key];
       render();
     });
     card.appendChild(head);
+    var thread = threadRow(d, kind === "choice" || kind === "action");  // last on the card, open or closed
     if (expanded[d.key]) {
       var body = el("div", "body");
       if (d.question) body.appendChild(el("p", "", d.question));
@@ -141,7 +147,25 @@
       if (answerUrl) body.appendChild(answerForm(c, kind));
       card.appendChild(body);
     }
+    card.appendChild(thread);
     return card;
+  }
+
+  // threadRow (v0.141): every card's "Open thread" link, outside the head button so it is a link of its own; a card
+  // with no answer form says to answer there.
+  function threadRow(d, hasForm) {
+    var row = el("div", "row thread-row");
+    if (d.thread) {
+      var a = el("a", "thread-link", "Open thread");
+      a.href = d.thread;
+      a.target = "_blank";
+      a.rel = "noopener noreferrer";
+      row.appendChild(a);
+    } else {
+      row.appendChild(el("span", "meta", "no thread link in the feed"));
+    }
+    if (!hasForm) row.appendChild(el("span", "meta", "no answer form: answer it in its thread"));
+    return row;
   }
 
   // ---- answering (v0.116): the desktop viewer's controls, stacked for a phone ----
@@ -196,10 +220,7 @@
   function answerForm(c, kind) {
     var id = String(c.id || "");
     var form = el("div", "answer");
-    if (kind !== "choice" && kind !== "action") {
-      form.appendChild(el("p", "meta", "Answer this one in its thread: it has no answer form."));
-      return form;
-    }
+    if (kind !== "choice" && kind !== "action") return form;  // threadRow says to answer in the thread
     var dr = drafts[id] || {};
     var r = results[id];
     var send = el("button", "send", r && r.sending ? "Sending…" : "Send");
@@ -258,7 +279,7 @@
     results[id] = { text: "sending…", sending: true };
     button.disabled = true;
     button.textContent = "Sending…";
-    var req = C.answerRequest(answerUrl, localStorage.getItem(TOKEN_KEY), C.answerBody(c, dr.answer_id, kind, dr, new Date()));
+    var req = sinkRequest(C.answerBody(c, dr.answer_id, kind, dr, new Date()));
     var ctl = new AbortController();
     var timer = setTimeout(function () { ctl.abort(); }, 25000);
     req.init.signal = ctl.signal;
@@ -280,7 +301,9 @@
     var box = document.getElementById("settings");
     var btn = document.getElementById("settings-toggle");
     btn.hidden = !answerUrl;
-    btn.textContent = tokenSet() ? "Device token set" : "Set device token";
+    // v0.142: once set, a small settings link beside the views; a full-size button only while a token is missing
+    btn.textContent = tokenSet() ? "device token set \u00b7 change" : "Set device token";
+    btn.classList.toggle("link", tokenSet());
     box.hidden = !(answerUrl && settingsOpen);
     if (box.hidden) return;
     box.replaceChildren();
@@ -317,10 +340,15 @@
     head.type = "button";
     head.setAttribute("aria-expanded", expanded[key] ? "true" : "false");
     var label = C.item_label(g, eventsFilter);
-    head.appendChild(el("strong", "", label));
     var newest = g.events[0];
+    var cue = C.eventHead(newest);  // v0.141: the newest event's result (mark and word) and kind on the head
+    var what = el("span", "event-what");
+    what.appendChild(el("strong", "", label));
+    if (cue.word) what.appendChild(el("span", "result" + (cue.cls ? " " + cue.cls : ""), [cue.mark, cue.word].filter(Boolean).join(" ")));
+    if (cue.kind) what.appendChild(el("span", "meta", cue.kind));
+    head.appendChild(what);
     var age = C.relative_time(newest.time, new Date());
-    if (age) head.appendChild(document.createTextNode(" · " + age));
+    if (age) head.appendChild(el("span", "meta", age));
     head.addEventListener("click", function () {
       expanded[key] = !expanded[key];
       render();
@@ -342,13 +370,170 @@
     return card;
   }
 
+  // The project switch (v0.139): a button with role switch; it posts on the answer path and keeps the new position
+  // while the (cached) feed catches up. Off without a sink or a token, and while its POST is out.
+  function switchRow(d) {
+    var nowMs = Date.now();
+    var sw = switches[d.name];
+    // done: a refusal's note stays for the hold, a switch that went through until the feed shows it
+    if (sw && !sw.sending && (sw.note ? nowMs - sw.at >= C.SWITCH_HOLD_MS : C.switchSettled(d.active, sw, nowMs))) {
+      delete switches[d.name];
+      sw = null;
+    }
+    var shown = C.switchShown(d.active, sw && !sw.note ? sw : null, nowMs);
+    var row = el("div", "row switch-row");
+    row.setAttribute("data-shown", shown ? "true" : "false");
+    var b = el("button", "switch");
+    b.type = "button";
+    b.setAttribute("role", "switch");
+    b.setAttribute("aria-checked", shown ? "true" : "false");
+    b.setAttribute("aria-label", d.name + " active");
+    b.appendChild(el("span", "knob"));
+    b.appendChild(el("span", "", shown ? "active" : "off"));
+    b.disabled = !answerUrl || !tokenSet() || !!(sw && sw.sending);
+    b.addEventListener("click", function () { flipProject(d.name, !shown); });
+    row.appendChild(b);
+    var why = !answerUrl ? "read-only: no answer URL" : !tokenSet() ? "set the device token to switch" : sw && sw.sending ? "switching\u2026" : sw && sw.note ? sw.note : "";
+    if (why) row.appendChild(el("span", sw && sw.note && !sw.sending ? "stat-bad" : "meta", why));
+    return row;
+  }
+
+  function flipProject(name, active) {
+    var sw = switches[name] = { active: active, at: Date.now(), note: "", sending: true };
+    render();
+    var body = C.projectActiveBody(name, active, C.newAnswerId(crypto.getRandomValues(new Uint8Array(16))), new Date());
+    var req = sinkRequest(body);
+    var ctl = new AbortController();
+    var timer = setTimeout(function () { ctl.abort(); }, 25000);
+    req.init.signal = ctl.signal;
+    fetch(req.url, req.init).then(function (resp) {
+      return C.switchResult(resp.status, resp.headers.get("X-Reason"));
+    }, function (e) {
+      return C.switchResult(0, e && e.name === "AbortError" ? "timeout" : "unreachable or refused");
+    }).then(function (note) {
+      clearTimeout(timer);
+      sw.sending = false;
+      sw.note = note;
+      sw.at = Date.now();
+      render();
+    });
+  }
+
+  // The Release button (v0.140): it opens the confirm dialog; off, saying why, at N = 0, without a sink or a token.
+  function releaseRow(p) {
+    var rv = C.releaseView(p, !!answerUrl);
+    var name = String(p.project || "");
+    var row = el("div", "row release-row");
+    var b = el("button", "release", "Release");
+    b.type = "button";
+    b.setAttribute("aria-label", "Release " + name);
+    var why = rv.why || (!tokenSet() ? "set the device token to release" : "");
+    b.disabled = !!why;
+    b.addEventListener("click", function () { openRelease(p); });
+    row.appendChild(b);
+    var said = why || releases[name] || "";
+    if (said) row.appendChild(el("span", said.indexOf("not sent") === 0 ? "stat-bad" : "meta", said));
+    return row;
+  }
+
+  // One dialog for every card, outside <main> so a re-render never closes it. Its answer_id is made when it opens and
+  // kept for a Retry with the same note (the sink answers a replay 200 and never posts twice).
+  function openRelease(p) {
+    var rv = C.releaseView(p, !!answerUrl);
+    if (!rv.enabled || !tokenSet()) return;
+    var name = String(p.project || "");
+    var dlg = document.getElementById("release-dialog");
+    if (dlg) dlg.remove();
+    dlg = el("dialog", "release-dialog");
+    dlg.id = "release-dialog";
+    dlg.setAttribute("aria-labelledby", "release-title");
+    var title = el("p", "release-title", rv.title);
+    title.id = "release-title";
+    dlg.appendChild(title);
+    dlg.appendChild(el("p", "meta", "This asks the PO to cut the release now; nothing is tagged or pushed from here."));
+    var box = el("textarea", "");
+    box.rows = 4;
+    box.placeholder = "Note for the release (optional)";
+    box.setAttribute("aria-label", "Note for the release");
+    dlg.appendChild(box);
+    var counter = el("div", "counter meta", "");
+    dlg.appendChild(counter);
+    var state = el("div", "release-state meta", "");
+    state.setAttribute("role", "status");
+    dlg.appendChild(state);
+    var foot = el("div", "row send-row");
+    var cancel = el("button", "cancel", "Cancel");
+    cancel.type = "button";
+    var go = el("button", "", "Release");
+    go.type = "button";
+    foot.appendChild(cancel);
+    foot.appendChild(go);
+    dlg.appendChild(foot);
+    var sent = { aid: C.newAnswerId(crypto.getRandomValues(new Uint8Array(16))), note: null, sending: false };
+    function ready() {
+      var n = box.value.trim().length;
+      counter.textContent = n + " / " + C.RELEASE_NOTE_MAX;
+      counter.className = "counter " + (n > C.RELEASE_NOTE_MAX ? "stat-bad" : "meta");
+      go.disabled = sent.sending || !C.releaseReady(box.value);
+    }
+    box.addEventListener("input", ready);
+    box.addEventListener("keydown", function (e) {
+      if (!C.releaseKeySends(e)) return;
+      e.preventDefault();
+      go.click();  // a disabled or sending Release ignores it, as a click would
+    });
+    cancel.addEventListener("click", function () { dlg.close(); });
+    dlg.addEventListener("close", function () { dlg.remove(); });
+    go.addEventListener("click", function () {
+      if (sent.sending || !C.releaseReady(box.value)) return;
+      if (sent.note !== null && sent.note !== box.value) sent.aid = C.newAnswerId(crypto.getRandomValues(new Uint8Array(16)));
+      sent.note = box.value;
+      sent.sending = true;
+      go.textContent = "Releasing\u2026";
+      state.textContent = "sending\u2026";
+      state.className = "release-state meta";
+      ready();
+      var req = sinkRequest(C.releaseBody(name, box.value, sent.aid, new Date()));
+      var ctl = new AbortController();
+      var timer = setTimeout(function () { ctl.abort(); }, 25000);
+      req.init.signal = ctl.signal;
+      fetch(req.url, req.init).then(function (resp) {
+        return C.releaseResult(resp.status, resp.headers.get("X-Reason"));
+      }, function (e) {
+        return C.releaseResult(0, e && e.name === "AbortError" ? "timeout" : "unreachable or refused");
+      }).then(function (res) {
+        clearTimeout(timer);
+        sent.sending = false;
+        releases[name] = res;
+        if (res === C.RELEASE_SENT) {
+          dlg.close();
+        } else {
+          state.textContent = res;
+          state.className = "release-state stat-bad";
+          go.textContent = "Retry";
+          ready();
+        }
+        render();
+      });
+    });
+    ready();
+    document.body.appendChild(dlg);
+    if (typeof dlg.showModal === "function") dlg.showModal(); else dlg.setAttribute("open", "");
+    box.focus();
+  }
+
   function projectCard(p) {
     var d = C.projectCard(p, new Date(), stallMinutes);
     var card = el("article", "card" + (d.grey ? " grey" : ""));
     var top = el("div", "row");
     top.appendChild(el("strong", "", d.name));
+    var row = d.active !== null ? switchRow(d) : null;
+    // the badge follows the switch, so a switch still on its way shows at once
+    var badge = row ? (row.getAttribute("data-shown") === "false" ? "inactive" : "") : d.badge;
+    if (badge) top.appendChild(el("span", "badge", badge));
     top.appendChild(el("div", d.releaseMuted ? "meta" : "", d.release));
     card.appendChild(top);
+    if (row) card.appendChild(row);
     var body = el("div", "row");
     body.appendChild(el("div", "meta", d.countLine));
     [d.setup, d.error, d.lost].forEach(function (t) { if (t) body.appendChild(el("div", "meta", t)); });
@@ -359,26 +544,29 @@
       if (d.doing.more) ul.appendChild(el("li", "meta", "+" + d.doing.more + " more"));
       card.appendChild(ul);
     }
+    card.appendChild(releaseRow(p));
     return card;
   }
 
-  function teamCard(a) {
-    var warning = C.team_warning(a);
+  function teamCard(a, shared) {
+    var now = new Date();
+    var warning = C.team_warning(a, now);
     var card = el("article", "card" + (warning ? " warn" : ""));
     var row = el("div", "row");
     row.appendChild(el("strong", "", String(a.agent || "?")));
-    var stateLine = [a.state, a.now ? "on v" + a.now : ""].filter(Boolean).join(" · ");
+    // a live limit replaces the feed's own state text: one line, the dashboard's one time format (v0.142)
+    var stateLine = [C.limitText(a, now) || a.state, a.now ? "on " + C.itemRef(a.now) : ""].filter(Boolean).join(" · ");
     row.appendChild(el("div", C.isWorking(a) ? "meta state-working" : "meta", stateLine));
     var split = C.split_owns(a.owns || [], a.working_on || null);
     if (split.working_on && split.working_on.length) {
-      var label = "working on: v" + split.working_on.join(", ");
-      if (split.parked && split.parked.length) label += " · parked: v" + split.parked.join(", ");
+      var label = "working on: " + split.working_on.map(C.itemRef).join(", ");
+      if (split.parked && split.parked.length) label += " · parked: " + split.parked.map(C.itemRef).join(", ");
       row.appendChild(el("div", "meta", label));
     } else if (split.all && split.all.length) {
-      row.appendChild(el("div", "meta", "owns v" + split.all.join(", ")));
+      row.appendChild(el("div", "meta", "owns " + split.all.map(C.itemRef).join(", ")));
     }
-    var usageText = C.usage_words(a.usage || null, a.limit_until || null, new Date());
-    if (usageText) {
+    var usageText = C.usage_words(a.usage || null);
+    if (usageText && usageText !== shared) {  // a shared subscription's usage is said once, above the cards
       row.appendChild(el("div", "meta", usageText));
     }
     var labelParts = [String(a.agent || "?")];
@@ -415,9 +603,14 @@
     }
     var data = s.data;
     if (view === "team") {
-      data = C.team_sort(data);
+      data = C.team_sort(data, new Date());
+      var shared = C.teamUsage(data);
+      if (shared) main.appendChild(el("p", "meta team-head", "Subscription: " + shared));
+      if (!data.length) main.appendChild(el("p", "empty", EMPTY[view]));
+      data.forEach(function (x) { main.appendChild(teamCard(x, shared)); });
+      return;
     }
-    if (view === "decisions") data = feedsNow().decisions;
+    if (view === "decisions") data = C.sortDecisions(feedsNow().decisions);  // the desktop viewer's order (v0.141)
     if (!data.length) main.appendChild(el("p", "empty", EMPTY[view]));
     data.forEach(function (x) { main.appendChild(DRAW[view](x)); });
   }

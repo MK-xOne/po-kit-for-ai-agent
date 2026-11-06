@@ -26,7 +26,7 @@ INTERVAL_MS = 5000
 # (placeholders until the charts exist) shown when the range holds events.
 REPORT_RANGES = (("24 h", 86400), ("7 d", 7 * 86400), ("30 d", 30 * 86400))
 REPORT_DEFAULT = 1
-REPORT_CHARTS = ("Gate runs per agent", "First-try pass rate per agent", "Items closed per day, by project",
+REPORT_CHARTS = ("Fail rate of gate runs", "First-try pass rate per agent", "Items closed per day, by project",
                  "Item cycle time per agent", "Failed legs by kind over time")
 REPORT_EMPTY = "no events in this range"
 REPORT_LIVE_SECONDS = 10 * 86400  # the kit's live window (po.toml [events] live_days, default 10); a longer range needs the archive
@@ -463,6 +463,21 @@ def local_time(iso, tz=None):
     return d.astimezone(tz).strftime("%Y-%m-%d %H:%M:%S")
 
 
+MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def clock_text(when, now=None, tz=None):
+    """The one time format of the dashboard (v0.142, web and desktop): `7:00 PM EST`, then ` Nov 30` when the day is
+    not today (and ` 2027` when not this year), in tz (default: the viewer's zone). when and now are aware datetimes."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    t, today = when.astimezone(tz), now.astimezone(tz).date()
+    zone = t.strftime("%Z") or t.strftime("%z")
+    text = "%d:%02d %s %s" % (t.hour % 12 or 12, t.minute, "PM" if t.hour >= 12 else "AM", zone)
+    if t.date() == today:
+        return text
+    return "%s %s %d" % (text, MONTHS[t.month - 1], t.day) + ("" if t.year == today.year else " %d" % t.year)
+
+
 SLOW_ENV = "PO_SLOW_AFTER"  # seconds; a run over it is marked slow (po.toml [stamp] slow_after, default 300)
 SLOW_DEFAULT = 300
 
@@ -636,15 +651,25 @@ def team_usage(entry):
 
 
 def limit_text(entry, now=None, tz=None):
-    """'LIMIT until <local time>' while limit_until is a time still ahead; '' otherwise.
-
-    The time is in tz (default: the viewer's zone), with the date when it is not today."""
+    """'LIMIT until 7:00 PM EST Nov 30' (clock_text) while limit_until is a time still ahead; '' otherwise."""
     until = parse_time(entry.get("limit_until"))
     now = now or datetime.datetime.now(datetime.timezone.utc)
     if until is None or until <= now:
         return ""
-    until, today = until.astimezone(tz), now.astimezone(tz).date()
-    return "LIMIT until " + until.strftime("%H:%M" if until.date() == today else "%Y-%m-%d %H:%M")
+    return "LIMIT until " + clock_text(until, now, tz)
+
+
+def team_shared_usage(rows):
+    """The usage text every agent with one shows (one subscription), said once in the Team header (v0.142); ""
+    when no agent has usage or the agents' usages differ (then each line keeps its own)."""
+    seen = {r["usage"] for r in rows if r.get("usage")}
+    return seen.pop() if len(seen) == 1 else ""
+
+
+def team_status(rows, shared=None):
+    """The Team header's status line: `13 agents`, then ` · subscription 5h 22% · 7d 64%` when one usage is shared."""
+    shared = team_shared_usage(rows) if shared is None else shared
+    return "%d agent%s" % (len(rows), "" if len(rows) == 1 else "s") + (" \u00b7 subscription " + shared if shared else "")
 
 
 def team_row(entry, now=None, tz=None):
@@ -761,6 +786,7 @@ def parse_projects(text):
                 "released": it.get("released") is True,
                 "setup_open": setup_open(it),
                 "last_event": it.get("last_event") if isinstance(it.get("last_event"), str) and it.get("last_event") else None,
+                "idle_hours": idle_hours(it),
             })
         le = entry.get("last_event")
         if le is not None and not isinstance(le, str):
@@ -771,6 +797,7 @@ def parse_projects(text):
             "release": entry.get("release") if isinstance(entry.get("release"), str) and entry.get("release") else None,
             "items": norm_items,
             "error": " ".join(entry["error"].split()) if isinstance(entry.get("error"), str) and entry["error"].strip() else None,
+            "active": entry["active"] if isinstance(entry.get("active"), bool) else None,
         })
     return out
 
@@ -779,6 +806,26 @@ def status_word(status):
     """The first word of a status, upper-cased, trailing punctuation stripped: `DONE (no change needed: x)` is DONE."""
     words = str(status or "").split()
     return words[0].rstrip(string.punctuation).upper() if words else ""
+
+
+STALLED_IDLE_HOURS = 2  # a DOING item idle this many hours or more is stalled
+
+
+def idle_hours(item):
+    """The item's `idle_hours` (v0.130): a whole number of hours of at least 0; absent, null or unreadable = None."""
+    n = (item or {}).get("idle_hours")
+    if isinstance(n, bool) or not isinstance(n, (int, float)) or n != n or n < 0 or n == float("inf"):
+        return None
+    return int(n)
+
+
+def idle_label(item):
+    """(text, stalled) for a DOING item's idle time: `active` under 1 h, else `idle 3h`; stalled from 2 h. None when the
+    feed gives no idle_hours."""
+    n = idle_hours(item)
+    if n is None:
+        return None
+    return ("active" if n < 1 else "idle %dh" % n, n >= STALLED_IDLE_HOURS)
 
 
 def setup_open(item):
@@ -863,6 +910,23 @@ def project_light(last_event, now=None):
     return "inactive"
 
 
+def project_light_word(last_event, now=None, active=None):
+    """The words beside a project's light (v0.142: the dot is never the only signal): `active` (an event in the last
+    30 min), `idle 45 min` or `idle 3 h` (up to 24 h), `stalled 4 d` beyond, `no events` without a readable past time.
+    A project switched off (active False) is not stalled: `last event 4 d ago`."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    light, dt = project_light(last_event, now), parse_time(last_event)
+    if light == "active":
+        return "active"
+    if dt is None or dt > now + datetime.timedelta(minutes=PROJECT_SKEW_MINUTES):
+        return "no events"
+    age = (now - dt).total_seconds()
+    if light == "idle":
+        return "idle %d min" % (age // 60) if age < 3600 else "idle %d h" % (age // 3600)
+    days = max(1, int(age // 86400))
+    return "last event %d d ago" % days if active is False else "stalled %d d" % days
+
+
 def filter_items(items, f):
     """All/TODO/DOING/DONE/RELEASED filter keeping feed order."""
     items = list(items or [])
@@ -907,8 +971,162 @@ def project_card(pr, now=None):
         text += ", feed error: %s" % error
     if setup_line:
         text += ", " + setup_line
-    return {"name": name, "light": light, "counts": counts, "text": text, "lost": not_in_filter_line(pr.get("items")),
-            "release": release, "setup": setup_line, "error": error}
+    active = pr.get("active") if isinstance(pr.get("active"), bool) else None
+    badge = INACTIVE_BADGE if active is False else ""
+    if badge:
+        text += ", " + INACTIVE_TEXT
+    return {"name": name, "light": light, "word": project_light_word(pr.get("last_event"), now, active), "counts": counts,
+            "text": text, "lost": not_in_filter_line(pr.get("items")),
+            "release": release, "setup": setup_line, "error": error, "active": active, "badge": badge}
+
+
+# ---- the project switch (v0.139) ----------------------------------------------
+# A project's `active` comes from the projects feed (the project switch file); the card's switch posts
+# {answer_id, kind: project-active, project, active, answered_at, client} on the answer path (same URL and token).
+PROJECT_ACTIVE = "project-active"
+INACTIVE_BADGE = "inactive"
+INACTIVE_TEXT = "switched off (inactive): nothing new is opened"
+SWITCH_HOLD_SECONDS = 180  # a switched card shows the new state this long while the (cached) feed catches up
+SWITCH_TARGET_PX = 44  # the switch line (switch, its word, its reason) is one click target at least this tall (P1.10)
+SWITCH_NO_SINK = "read-only: no answer URL"  # the reason a switch is off without a sink, said on the card
+
+
+def project_active_body(project, active, answer_id):
+    """The POST body that switches a project on (active True) or off."""
+    return {
+        "answer_id": answer_id,
+        "kind": PROJECT_ACTIVE,
+        "project": str(project),
+        "active": bool(active),
+        "answered_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "client": CLIENT,
+    }
+
+
+def switch_state(status_code, reason="", host=None):
+    """What the card says after a switch POST: "" when it went through (200/201), else why it did not."""
+    if status_code in (200, 201):
+        return ""
+    if status_code in (401, 403):
+        return "not switched: refused by %s: %d" % (host or "?", status_code)
+    if status_code == 429:
+        return "not switched: rate limit, try again in a moment"
+    if reason:
+        return "not switched: %s" % reason
+    return "not switched" + (": status %d" % status_code if status_code else "")
+
+
+def post_switch(url, body, token=None):
+    """POST a switch body; returns switch_state's text ("" when switched)."""
+    data = json.dumps(body).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    host = urllib.parse.urlsplit(url).netloc
+    try:
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=ANSWER_TIMEOUT) as r:
+            return switch_state(r.status, host=host)
+    except urllib.error.HTTPError as e:
+        why = ((e.headers.get("X-Reason") if e.headers else None) or "").strip()
+        return switch_state(e.code, why if _REASON.fullmatch(why) else e.reason, host=host)
+    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as e:
+        return switch_state(0, str(getattr(e, "reason", e)))
+
+
+def switch_shown(feed_active, pending, now):
+    """The switch position a card shows: the pending one (a switch the feed does not show yet, until
+    SWITCH_HOLD_SECONDS after it was sent), else the feed's. pending is (active, sent at) or None."""
+    if pending is not None and now - pending[1] < SWITCH_HOLD_SECONDS and pending[0] != feed_active:
+        return pending[0]
+    return feed_active
+
+
+def switch_settled(feed_active, pending, now):
+    """Whether a pending switch can be dropped: the feed agrees, or its hold ran out."""
+    return pending is None or pending[0] == feed_active or now - pending[1] >= SWITCH_HOLD_SECONDS
+
+
+# ---- the release button (v0.140) ----------------------------------------------
+# Each Projects card has a Release button: it ASKS (the answer kind `release-request`, {answer_id, kind, project,
+# note, answered_at, client}, on the answer path, same URL and token); the receiver posts the ask in the project's
+# channel for the PO. Nothing here tags, pushes or runs `po release`.
+RELEASE_REQUEST = "release-request"
+RELEASE_NOTE_MAX = 2000  # characters of the stripped note; the receiver refuses more (400 `note too long`)
+RELEASE_SENT = "release asked \u00b7 sent"
+
+
+def unreleased_done(items):
+    """How many items are DONE (any DONE status word) and not released by the feed's `released` (po released's rule)."""
+    return sum(1 for it in items or [] if isinstance(it, dict) and status_word(it.get("status")) == "DONE"
+               and it.get("released") is not True)
+
+
+def release_view(pr, sink=True):
+    """What a card's Release button shows: {n, title, enabled, why}. title is the confirm dialog's first line,
+    `Release <project>: N DONE items since <last release>` (`since the start (no release yet)` without one); the
+    button is off, saying why, when N is 0 or there is no answer sink. An inactive project releases like any other."""
+    name = str((pr or {}).get("project", ""))
+    n = unreleased_done((pr or {}).get("items"))
+    rel = (pr or {}).get("release")
+    since = rel.strip() if isinstance(rel, str) and rel.strip() else "the start (no release yet)"
+    title = "Release %s: %d DONE item%s since %s" % (name, n, "" if n == 1 else "s", since)
+    why = ""
+    if not sink:
+        why = SWITCH_NO_SINK
+    elif n == 0:
+        why = "nothing to release: no DONE item since %s" % since
+    return {"n": n, "title": title, "enabled": not why, "why": why}
+
+
+def release_counter(note):
+    """The counter under the note box: ("12 / 2000", over_limit), counting the stripped note."""
+    n = len((note or "").strip())
+    return ("%d / %d" % (n, RELEASE_NOTE_MAX), n > RELEASE_NOTE_MAX)
+
+
+def release_body(project, note, answer_id):
+    """The POST body that asks for a release; the note goes as typed (the receiver strips its ends only)."""
+    return {
+        "answer_id": answer_id,
+        "kind": RELEASE_REQUEST,
+        "project": str(project),
+        "note": str(note or ""),
+        "answered_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "client": CLIENT,
+    }
+
+
+def release_state(status_code, reason="", host=None):
+    """What the dialog or card says after a release POST: RELEASE_SENT for 200/201, else `not sent: <why>`."""
+    if status_code in (200, 201):
+        return RELEASE_SENT
+    if status_code in (401, 403):
+        return "not sent: refused by %s: %d" % (host or "?", status_code)
+    if status_code == 429:
+        return "not sent: rate limit, try again in a moment"
+    if reason:
+        return "not sent: %s" % reason
+    return "not sent" + (": status %d" % status_code if status_code else "")
+
+
+def post_release(url, body, token=None):
+    """POST a release body; returns release_state's text."""
+    # not ASCII-escaped: a note at the limit stays well under the receiver's body cap
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    host = urllib.parse.urlsplit(url).netloc
+    try:
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=ANSWER_TIMEOUT) as r:
+            return release_state(r.status, host=host)
+    except urllib.error.HTTPError as e:
+        why = ((e.headers.get("X-Reason") if e.headers else None) or "").strip()
+        return release_state(e.code, why if _REASON.fullmatch(why) else e.reason, host=host)
+    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as e:
+        return release_state(0, str(getattr(e, "reason", e)))
 
 
 def load_projects(url, last=None, feed=None):
@@ -1093,6 +1311,36 @@ def decision_row(entry, now=None, tz=None):
         for st, src in zip(row["steps"], entry["steps"]):
             st["expect"] = src["expect"].strip() if _text(src.get("expect")) else ""
     return row
+
+
+THREAD_LINK_TEXT = "Open thread"  # every decision card's link to its thread, on the web page too (v0.141)
+NO_THREAD_TEXT = "no thread link in the feed"  # what a card without one says instead, on both screens
+
+
+# Schemes a thread link may never have: they run code, show local data or are the browser's own (v0.141).
+LINK_BLOCKED_SCHEMES = ("javascript", "vbscript", "data", "file", "blob", "about", "filesystem", "view-source", "chrome",
+                        "resource", "jar")
+
+
+def thread_link(url):
+    """url trimmed when a decision card may link it (v0.141), else "": http(s) with a host, or a chat app's own deep
+    link (`<scheme>://...`, letters only in the scheme) whose scheme is not in LINK_BLOCKED_SCHEMES."""
+    u = url.strip() if isinstance(url, str) else ""
+    m = re.match(r"([A-Za-z][A-Za-z0-9+.-]*)://(.)", u)
+    scheme = m.group(1).lower() if m else ""
+    if scheme in ("http", "https"):
+        return u if urllib.parse.urlsplit(u).netloc else ""
+    return u if scheme.isalpha() and scheme not in LINK_BLOCKED_SCHEMES and not re.search(r"\s", u) else ""
+
+
+def thread_link_markup(url):
+    """The Pango markup of a decision card's thread link (v0.141): THREAD_LINK_TEXT linking to url, or "" when
+    thread_link refuses it. The URL is escaped for the attribute."""
+    u = thread_link(url)
+    if not u:
+        return ""
+    esc = u.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&apos;")
+    return '<a href="%s">%s</a>' % (esc, THREAD_LINK_TEXT)
 
 
 def decision_rows(entries, now=None, tz=None):
@@ -1564,6 +1812,12 @@ def report_plan(secs, archive_url, archive):
     return "fetch" if archive_url else "unconfigured"
 
 
+def report_reach(secs):
+    """How far back Reports reads for range `secs` (v0.143): the range and the previous period of the same length,
+    which its headline numbers and charts compare against."""
+    return 2 * secs
+
+
 def report_events(live, archive, secs):
     """The events the Reports aggregation reads for range `secs`: live, plus the archive when the range outruns the live window."""
     if secs <= REPORT_LIVE_SECONDS or archive is None:
@@ -1583,6 +1837,16 @@ def shown_events(events, show_all, sort, shown, tz=None, archive=None):
         return page_events(held, shown), len(held)
     held = unique_events(visible(events, False))
     return sorted_events(held, sort, tz), len(held)
+
+
+REPORTS_TITLE = "Reports"
+
+
+def reports_status(range_index, as_of=None, now=None, tz=None):
+    """The header's status line on Reports (v0.142), not the Events count: `7 d · as of 6:42 AM EST`, as_of being
+    when the events last came in (`7 d · loading…` before the first fetch)."""
+    label = REPORT_RANGES[range_index][0]
+    return "%s \u00b7 %s" % (label, "as of " + clock_text(as_of, now, tz) if as_of else "loading\u2026")
 
 
 def events_status(shown, held, show_all):
@@ -1713,30 +1977,49 @@ PALETTES = {
         "base": "#e0e5ec", "light": "#ffffff", "dark": "#a3b1c6",
         "text": "#2b3440", "muted": "#4f5b6a",
         "pass": "#13693a", "fail": "#a8201a", "skip": "#5a5f66", "warn": "#7a4f00",
-        "accent": "#1f5fa8", "series": ["#1f5fa8", "#a14a00", "#7a3d9e", "#00796b", "#8c3b2e", "#5a5f66"],
+        "accent": "#1f5fa8",
+        # v0.143: the report charts. Projects: five colour-blind-safe hues (blue, orange, purple, teal, olive) whose
+        # lightness differs by CHART_LIGHTNESS_STEP or more, so they read in greyscale; failed legs: the fail hue in
+        # lightness steps, most failures darkest. Every one reaches 3:1 on the base.
+        "series": ["#023b76", "#c16d10", "#40015e", "#0e7869", "#61510b"], "legs": ["#770a0a", "#9e362d", "#c75b50"],
+        # v0.142: a control's edge (3:1 on base), the text on a checked control's accent fill, the hairline between
+        # flat rows, and a panel's rim (dark mode: a lighter top edge, since its shadows are 1.2:1)
+        "edge": "#6f7a8a", "on_accent": "#ffffff", "hairline": "#b8c2ce", "rim": "#e0e5ec", "rim_top": "#ffffff",
     },
     "dark": {
         "base": "#2b2f36", "light": "#383d46", "dark": "#1e2126",
         "text": "#e8ebf0", "muted": "#aab2bf",
         "pass": "#6fdc9a", "fail": "#ff9a94", "skip": "#aab2bf", "warn": "#f0c75e",
-        "accent": "#7fb2ff", "series": ["#7fb2ff", "#ffb86b", "#c9a0ff", "#5fd6c4", "#e6a08f", "#aab2bf"],
+        "accent": "#7fb2ff",
+        "series": ["#88bcfe", "#c56e04", "#fff1bb", "#c086e8", "#67ead3"], "legs": ["#fed3cd", "#fe988a", "#d96b5f"],
+        "edge": "#7b8494", "on_accent": "#0b1a2b", "hairline": "#454b55", "rim": "#454b55", "rim_top": "#565e6a",
     },
 }
 
 CSS_TEMPLATE = """\
 window.po-dashboard { background-color: %(base)s; color: %(text)s; }
 .po-header { background-color: %(base)s; border-radius: 18px; padding: 12px 18px; margin: 18px 18px 6px 18px;
+  border: 1px solid %(rim)s; border-top-color: %(rim_top)s;
   box-shadow: 6px 6px 12px %(dark)s, -6px -6px 12px %(light)s; }
 .po-title { color: %(text)s; font-weight: 700; font-size: 16px; }
 .po-status { color: %(muted)s; font-size: 12px; }
 .po-error { color: %(fail)s; font-weight: 600; }
-.po-toggle { background-color: %(base)s; background-image: none; color: %(text)s; border: none; border-radius: 14px;
+.po-toggle { background-color: %(base)s; background-image: none; color: %(text)s; border: 1px solid %(edge)s; border-radius: 14px;
   padding: 8px 16px; box-shadow: 4px 4px 8px %(dark)s, -4px -4px 8px %(light)s; }
-.po-toggle:checked { box-shadow: inset 4px 4px 8px %(dark)s, inset -4px -4px 8px %(light)s; }
+.po-toggle:checked { background-color: %(accent)s; color: %(on_accent)s; border-color: %(accent)s; font-weight: 700; box-shadow: none; }
 .po-toggle:focus-visible { outline: 2px solid %(text)s; outline-offset: 2px; }
 .po-list { background-color: transparent; padding: 6px 18px 18px 18px; }
 .po-card { background-color: %(base)s; border-radius: 14px; padding: 12px 16px; margin: 8px 0;
+  border: 1px solid %(rim)s; border-top-color: %(rim_top)s;
   box-shadow: 5px 5px 10px %(dark)s, -5px -5px 10px %(light)s; }
+.po-panel { background-color: %(base)s; border-radius: 18px; padding: 4px 0; margin: 6px 18px 18px 18px;
+  border: 1px solid %(rim)s; border-top-color: %(rim_top)s;
+  box-shadow: 5px 5px 10px %(dark)s, -5px -5px 10px %(light)s; }
+.po-list.po-panel { padding: 4px 0; }
+.po-panel.po-flush { margin: 6px 0 18px 0; }
+.po-panel .po-row { box-shadow: none; border: none; border-radius: 0; margin: 0 12px; padding: 10px 3px;
+  border-top: 1px solid %(hairline)s; }
+.po-panel .po-row:first-child { border-top-color: transparent; }
 .po-text { color: %(text)s; }
 .po-muted { color: %(muted)s; font-size: 12px; }
 .po-warn { color: %(warn)s; font-size: 12px; font-weight: 700; }
@@ -1753,28 +2036,37 @@ window.po-dashboard { background-color: %(base)s; color: %(text)s; }
 .po-kind-action { color: %(warn)s; }
 .po-kind-unformatted { color: %(fail)s; }
 .po-answered { color: %(accent)s; font-weight: 700; }
+.po-link link { color: %(accent)s; font-weight: 700; }
 .po-already { color: %(warn)s; font-weight: 700; }
 .po-light-active { color: %(pass)s; }
 .po-light-idle { color: %(warn)s; }
 .po-light-inactive { color: %(fail)s; }
 .po-errored .po-text, .po-errored .po-light-active, .po-errored .po-light-idle, .po-errored .po-light-inactive { color: %(muted)s; }
 .po-pcard:focus-visible { outline: 2px solid %(text)s; outline-offset: 2px; }
-.po-view { background-color: %(base)s; background-image: none; color: %(text)s; border: none; border-radius: 14px;
+.po-card switch { border: 1px solid %(muted)s; }
+.po-card switch:checked { border-color: %(accent)s; }
+.po-badge { color: %(muted)s; border: 1px solid %(muted)s; border-radius: 6px; padding: 0 6px; font-size: 12px; }
+.po-view { background-color: %(base)s; background-image: none; color: %(text)s; border: 1px solid %(edge)s; border-radius: 14px;
   padding: 8px 16px; box-shadow: 4px 4px 8px %(dark)s, -4px -4px 8px %(light)s; }
-.po-view:checked { box-shadow: inset 4px 4px 8px %(dark)s, inset -4px -4px 8px %(light)s; }
+.po-view:checked { background-color: %(accent)s; color: %(on_accent)s; border-color: %(accent)s; font-weight: 700; box-shadow: none; }
 .po-view:focus-visible { outline: 2px solid %(text)s; outline-offset: 2px; }
 .po-dhead { background-color: %(base)s; background-image: none; color: %(text)s; border: none; border-radius: 10px;
   box-shadow: none; padding: 0; min-height: 0; }
 .po-dhead:hover { background-color: %(base)s; }
 .po-dhead:focus-visible { outline: 2px solid %(text)s; outline-offset: 2px; }
 .po-subrow { margin: 0 18px 0 18px; }
-.po-small { background-color: %(base)s; background-image: none; color: %(text)s; border: none; border-radius: 10px;
+.po-small { background-color: %(base)s; background-image: none; color: %(text)s; border: 1px solid %(edge)s; border-radius: 10px;
   padding: 2px 12px; min-height: 0; font-size: 12px; box-shadow: 3px 3px 6px %(dark)s, -3px -3px 6px %(light)s; }
-.po-small:checked { box-shadow: inset 3px 3px 6px %(dark)s, inset -3px -3px 6px %(light)s; }
+.po-small:checked { background-color: %(accent)s; color: %(on_accent)s; border-color: %(accent)s; font-weight: 700; box-shadow: none; }
+.po-small:disabled { color: %(muted)s; border-color: %(hairline)s; box-shadow: none; }
 .po-small:focus-visible { outline: 2px solid %(text)s; outline-offset: 2px; }
 .po-chart { background-color: %(base)s; border-radius: 14px; padding: 24px 16px; margin: 8px 0;
-  box-shadow: inset 4px 4px 8px %(dark)s, inset -4px -4px 8px %(light)s; }
+  border: 1px solid %(rim)s; border-top-color: %(rim_top)s; box-shadow: inset 4px 4px 8px %(dark)s, inset -4px -4px 8px %(light)s; }
 .po-chart-draw:focus-visible { outline: 2px solid %(text)s; outline-offset: 2px; }
+.po-chart-title { color: %(text)s; font-weight: 700; font-size: 14px; }
+.po-tile { background-color: %(base)s; border-radius: 14px; padding: 10px 14px; border: 1px solid %(rim)s; border-top-color: %(rim_top)s;
+  box-shadow: 4px 4px 8px %(dark)s, -4px -4px 8px %(light)s; margin: 4px; }
+.po-tile-value { color: %(text)s; font-weight: 700; font-size: 24px; }
 .po-colhead { background-color: transparent; background-image: none; border: none; box-shadow: none; padding: 2px 0; min-height: 0; }
 .po-colhead:hover { background-color: transparent; }
 .po-colhead:focus-visible { outline: 2px solid %(text)s; outline-offset: 2px; }
@@ -1800,8 +2092,15 @@ CONTRAST_PAIRS = [
     (".po-kind-action", ".po-card", "action badge"),
     (".po-kind-unformatted", ".po-card", "unformatted badge"),
     (".po-answered", ".po-card", "answered/sent status"),
+    (".po-link link", ".po-card", "thread link"),
     (".po-already", ".po-card", "already answered status"),
+    (".po-badge", ".po-card", "inactive badge"),
     (".po-view", ".po-view", "view toggle label"),
+    (".po-view:checked", ".po-view:checked", "selected view label on its accent fill"),
+    (".po-small", ".po-small", "small button label"),
+    (".po-small:checked", ".po-small:checked", "selected small button label on its accent fill"),
+    (".po-small:disabled", ".po-small", "disabled small button label"),
+    (".po-toggle:checked", ".po-toggle:checked", "selected toggle label on its accent fill"),
     (".po-dhead", ".po-dhead", "collapsed decision header"),
     (".po-text", ".po-dhead", "decision header text"),
     (".po-muted", ".po-dhead", "decision header detail text"),
@@ -1814,6 +2113,24 @@ CONTRAST_PAIRS = [
     (".po-error", ".po-header", "error line"),
     ("window.po-dashboard", "window.po-dashboard", "window text"),
 ]
+
+
+# v0.142 (P1.10, P2.7): (selector, property, role): every control's edge and a selected control's accent fill reach 3:1
+# against the surface (the window's base), so a control and its selected state show without their shadows.
+EDGE_PAIRS = [
+    (".po-view", "border", "view tab edge"),
+    (".po-small", "border", "small button edge"),
+    (".po-toggle", "border", "toggle edge"),
+    (".po-view:checked", "background-color", "selected view tab fill"),
+    (".po-small:checked", "background-color", "selected small button fill (range, Show all, Reports, Archive, Actions)"),
+    (".po-toggle:checked", "background-color", "selected toggle fill"),
+]
+
+
+def css_color(value):
+    """The #rrggbb colour in a CSS value (`1px solid #6f7a8a` gives #6f7a8a), or None."""
+    m = re.search(r"#[0-9a-fA-F]{6}\b", value or "")
+    return m.group(0).lower() if m else None
 
 
 def css(variant):
@@ -1831,6 +2148,25 @@ def css_properties(text):
                     k, v = decl.split(":", 1)
                     props[k.strip()] = v.strip()
     return out
+
+
+CHART_LIGHTNESS_STEP = 9  # v0.143: the least CIE L* difference between two series colours of one palette
+
+
+def lightness(hexcolor):
+    """CIE L* (0 black to 100 white) of a colour: what is left of it in greyscale."""
+    y = luminance(hexcolor)
+    return 116 * y ** (1 / 3) - 16 if y > 216 / 24389 else y * 24389 / 27
+
+
+def chart_colour(variant, key):
+    """The hex colour of a chart shape's colour key in `variant`: a palette name ("pass", "muted", ...), a
+    ("series", n) or ("legs", n) entry, or ("ink", key): black or white text, whichever reads better on `key`."""
+    pal = PALETTES[variant]
+    if isinstance(key, tuple) and key[0] == "ink":
+        bg = chart_colour(variant, key[1])
+        return max(("#000000", "#ffffff"), key=lambda ink: contrast_ratio(ink, bg))
+    return pal[key[0]][key[1]] if isinstance(key, tuple) else pal[key]
 
 
 def luminance(hexcolor):
@@ -1862,9 +2198,12 @@ def project_state_back(state):
     return dict(state, open=None)
 
 
+PROJECT_DEFAULT_FILTER = "doing"  # v0.142: a project screen opens on DOING (newest first), not on All oldest first
+
+
 def project_state_filter(state, name):
-    key = str(state["filters"].get(name, "all")).strip().lower()
-    return key if key in dict((k, k) for _l, k in PROJECT_FILTERS) else "all"
+    key = str(state["filters"].get(name, PROJECT_DEFAULT_FILTER)).strip().lower()
+    return key if key in dict((k, k) for _l, k in PROJECT_FILTERS) else PROJECT_DEFAULT_FILTER
 
 
 def project_state_set_filter(state, name, key):
@@ -1879,14 +2218,15 @@ def project_state_reconcile(state, projects):
 
 
 def project_screen(pr, key="all", now=None):
-    """What a project screen shows: header (name, light), the filter buttons with their counts, and one row per
-    item in the feed's order. Agents are as the feed gives them; none = a muted dash (agents empty, dash true)."""
+    """What a project screen shows: header (name, light and its word), the filter buttons with their counts, and one
+    row per item, newest first (the feed's order reversed: a backlog lists its oldest item first). Agents are as the
+    feed gives them; none = a muted dash (agents empty, dash true). empty is what an empty filter says."""
     items = pr.get("items") or []
     counts = project_counts(items)
     light = project_light(pr.get("last_event"), now)
     filters = [{"label": lab, "key": k, "count": len(items) if k == "all" else counts[k]} for lab, k in PROJECT_FILTERS]
     rows = []
-    for it in filter_items(items, key):
+    for it in reversed(filter_items(items, key)):
         full = str(it.get("status") or "").strip()
         status = item_word(it)
         note = full[len(full.split()[0]):].strip() if full else ""
@@ -1897,11 +2237,17 @@ def project_screen(pr, key="all", now=None):
             note = ("%s, %s" % (note, rel)) if note else rel
             setup = None
         agents = list(it.get("agents") or [])
-        rows.append({"item": it.get("item", ""), "title": it.get("title", ""), "status": status, "note": note,
+        idle = idle_label(it) if status in _PROJECT_STATUSES_DOING else None
+        rows.append({"idle": idle[0] if idle else "", "stalled": bool(idle and idle[1]),
+                     "idle_words": (idle[0] + (", stalled" if idle[1] else "")) if idle else "",  # never colour alone
+                     "item": it.get("item", ""), "title": it.get("title", ""), "status": status, "note": note,
                      "full": full, "agents": agents, "setup": setup,
                      "live": status == "DOING" and bool(agents),
                      "dash": not agents})
     name = str(pr.get("project", ""))
     release = release_label(pr)
-    return {"name": name, "light": light, "text": "%s, %s, %s" % (name, light, release["text"]), "filters": filters, "rows": rows,
-            "lost": not_in_filter_line(items), "release": release}
+    label = dict((k, lab) for lab, k in PROJECT_FILTERS).get(str(key).strip().lower(), "All")
+    word = project_light_word(pr.get("last_event"), now, pr.get("active") if isinstance(pr.get("active"), bool) else None)
+    return {"name": name, "light": light, "word": word, "text": "%s, %s, %s" % (name, word, release["text"]), "filters": filters,
+            "rows": rows, "lost": not_in_filter_line(items), "release": release,
+            "empty": "no %s items" % label if items and label != "All" else "no items"}

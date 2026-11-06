@@ -18,15 +18,18 @@
 #             on the main branch whose subject starts `admin: <v> DONE` (<v>
 #             as the backlog writes it, with or without a leading `v`, up to
 #             the following space), else the newest commit that changed the
-#             item's row in the backlog. Released when that commit is an
-#             ancestor of the release tag; no such commit means not released.
+#             item's row in the backlog or its `## <tag> — ...` heading in
+#             specs_dir (the heading form older backlogs keep their items in).
+#             Released when that commit is an ancestor of the release tag; no
+#             such commit means not released.
 
 # po_released_done_commit <version>: the DONE commit of an untagged item, or
 # nothing. See the rules in the header.
 po_released_done_commit() {
-	local v=$1 main backlog sha subj tpl cell re cand
+	local v=$1 main backlog specs_dir sha subj tpl cell re cand
 	main=$(po_get layout.main)
 	backlog=$(po_get layout.backlog)
+	specs_dir=$(po_get layout.specs_dir)
 	for cand in "v$v" "$v"; do
 		while IFS=' ' read -r sha subj; do
 			[[ $subj == "admin: $cand DONE"* ]] || continue
@@ -39,7 +42,8 @@ po_released_done_commit() {
 	cell=$(po_fill "$tpl" "$v")
 	[[ -n $cell ]] || cell=$v
 	re=$(printf '%s' "$cell" | sed 's/[][\.*^$]/\\&/g')
-	git log "$main" -1 --format=%H -G"^[|] *$re *[|]" -- "$backlog" 2>/dev/null
+	# -G is an extended regex: a table row, or a heading as po_backlog_headings reads it.
+	git log "$main" -1 --format=%H -G"^([|] *$re *[|]|## $re( |\$))" -- "$backlog" "$specs_dir" 2>/dev/null
 }
 
 po_cmd_released() {

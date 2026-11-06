@@ -48,6 +48,7 @@ declare -gA PO_SCHEMA=(
 	[kickoff.preamble]=0
 	[close.checklist]=0
 	[close.require_setup]=0
+	[close.memory]=0
 	[stamp.prepare]=0
 	[stamp.slow_after]=0
 	[events.live_days]=0
@@ -79,6 +80,7 @@ declare -gA PO_ARRAYS=(
 # The keys whose value is a bare true or false (no quotes).
 declare -gA PO_BOOLS=(
 	[close.require_setup]=1
+	[close.memory]=1
 	[release.review]=1
 	[gate.scope]=1
 )

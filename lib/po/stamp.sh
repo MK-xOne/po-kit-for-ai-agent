@@ -201,6 +201,7 @@ po_stamp_fail() {
 	printf 'po stamp: FAIL: %s\n' "$*" >&2
 	[[ -z $log ]] || printf 'po stamp: the full output is in %s\n' "$log" >&2
 	printf 'po stamp: no evidence written\n' >&2
+	printf "memory: file a proposal or record 'nothing new learned' with the close body\n" >&2
 	exit 4
 }
 

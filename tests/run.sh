@@ -462,6 +462,24 @@ COUNT_CMD="echo 'test result: FAILED. 1 passed; 1 failed;'" stamp_manifest check
 stamp_fails "a summary that is not ok fails" 'printed a summary that is not ok'
 COUNT_CMD="sh ./fake-test.sh; exit 101" stamp_manifest check=true
 stamp_fails "a count command that exits non-zero fails" 'exited 101'
+# A failed stamp prints the memory prompt after its failure lines; a passing one does not.
+stamp_manifest check=true "test=sh ./fake-test.sh" "clippy=echo lint >&2; exit 3" fmt=true
+rm -f "$W"/gate-*.txt
+out=$("$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>&1 >/dev/null)
+code=$?
+[[ $code == 4 && ${out##*$'\n'} == "memory: file a proposal or record 'nothing new learned' with the close body" ]] &&
+	grep -q '^po stamp: no evidence written$' <<<"$out" &&
+	ok "a failed stamp prints the memory prompt last and still exits 4" || bad "stamp failure prompt (exit $code)" "$out"
+[[ -z $("$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>/dev/null) ]] && ok "a failed stamp's stdout stays empty" || bad "failed stamp stdout"
+stamp_manifest "${STD_LEGS[@]}"
+out=$("$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>&1 >/dev/null)
+! grep -q '^memory:' <<<"$out" && ok "a passing stamp prints no memory prompt" || bad "passing stamp prompt" "$out"
+# The evidence block of a passing stamp is unchanged by the memory prompt.
+rm -f "$W"/gate-*.txt
+out=$("$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>/dev/null)
+[[ $out == "$want" && $(cat "$W/gate-1.txt" 2>&1) == "$want" ]] &&
+	ok "a passing stamp's evidence block is byte-identical to the expected block" || bad "passing stamp block" "$out"$'\n--- file\n'"$(cat "$W/gate-1.txt" 2>&1)"
+rm -f "$W"/gate-*.txt
 # A command that leaves a process holding its output must not hang the stamp.
 # LEAK_SLEEP names the leftover (unique, so pgrep finds only ours); the leaker
 # prints a good summary, so the leftover is the only fault.
@@ -955,6 +973,34 @@ expect "a taken --next branch is refused" 6 'branch item-v1\.0\.6 already exists
 	-C "$B" --manifest "$BM" close 1.0.3 --next 1.0.6 --next-title Six
 git -C "$B" branch -q -D item-v1.0.6
 expect "close passes again once repaired" 0 'DRY RUN' -- -C "$B" --manifest "$BM" close 1.0.3
+# Memory write-back ([close] memory): the refusal, the plan line, the off switch.
+MM=$TMP/mem.toml
+{ cat "$BM"; printf '\n[close]\nmemory = true\n'; } >"$MM"
+Q=$TMP/mem
+make_brepo "$Q"
+printf 'Co-Authored-By: Someone <s@example.invalid>\n' >"$TMP/mem-none.txt"
+printf 'Memory: nothing new learned\n' >"$TMP/mem-nothing.txt"
+printf 'Memory: proposed 20261103-120000-ab12 (next time X, do Y, because Z)\n' >"$TMP/mem-id.txt"
+memsnap=$(bsnap "$Q")
+expect "memory on: close without a body file is refused" 6 "needs a line 'Memory:" -- -C "$Q" --manifest "$MM" close 1.0.3 --commit
+expect "memory on: a body with no Memory line is refused" 6 "needs a line 'Memory:" -- -C "$Q" --manifest "$MM" close 1.0.3 --body-file "$TMP/mem-none.txt" --commit
+[[ $(bsnap "$Q") == "$memsnap" ]] && ok "memory on: a refused close changed nothing" || bad "memory refusal changed state"
+expect "memory on: the dry run prints the prompt line" 0 "memory    file a proposal or record 'nothing new learned' with the close body" -- -C "$Q" --manifest "$MM" close 1.0.3
+expect "memory on: the dry run is not refused for a missing line" 0 'DRY RUN' -- -C "$Q" --manifest "$MM" close 1.0.3 --body-file "$TMP/mem-none.txt"
+out=$("$PO" -C "$Q" --manifest "$BM" close 1.0.3 2>&1)
+[[ $out == "$("$PO" -C "$Q" --manifest "$MM" close 1.0.3 2>&1 | grep -v '^memory    ')" ]] &&
+	! grep -q '^memory ' <<<"$out" &&
+	ok "memory key absent: the plan has no memory line and is otherwise identical" || bad "memory key absent plan" "$out"
+for form in id nothing; do
+	Q2=$TMP/mem-$form
+	make_brepo "$Q2"
+	expect "memory on: '$form' form is accepted" 0 'closed|tag v1\.0\.3|v1\.0\.3' -- -C "$Q2" --manifest "$MM" close 1.0.3 --body-file "$TMP/mem-$form.txt" --commit
+	[[ $(git -C "$Q2" cat-file -t v1.0.3 2>/dev/null) == commit ]] && ok "memory on: '$form' form closes the item" || bad "memory $form did not close"
+done
+Q2=$TMP/mem-off
+make_brepo "$Q2"
+expect "memory key absent: close --commit needs no Memory line" 0 'v1\.0\.3' -- -C "$Q2" --manifest "$BM" close 1.0.3 --body-file "$TMP/mem-none.txt" --commit
+[[ $(git -C "$Q2" cat-file -t v1.0.3 2>/dev/null) == commit ]] && ok "memory key absent: the item closes as before" || bad "memory off did not close"
 
 # Anchors that are not exactly one: stop, exit 3, nothing planned.
 anchor_case() { # <name> <pattern> <sed on BACKLOG.md>
@@ -2132,6 +2178,13 @@ out=$("$PO" -C "$ID" status --idle 100 2>&1)
 expect "--idle needs a number" 1 '--idle needs a whole number' -- -C "$ID" status --idle
 expect "--idle rejects text" 1 '--idle needs a whole number' -- -C "$ID" status --idle soon
 expect "status still takes no other arguments" 1 "unknown argument '--bogus'" -- -C "$ID" status --bogus
+# v0.130: status --json, idle_hours per DOING item (whole hours, null with no worktree, held items left out)
+idle_set $((M * 30)) none none
+expect "status --json: idle 30 min is 0 hours, no worktree is null, a held item is left out" 0 '^\[\{"item":"1\.0\.3","idle_hours":0\},\{"item":"1\.0\.5","idle_hours":null\}\]$' -- -C "$ID" status --json
+idle_set $((5 * H)) none none
+expect "status --json: idle 5 h is 5" 0 '"item":"1\.0\.3","idle_hours":5\}' -- -C "$ID" status --json
+idle_set $((72 * H + 20 * M)) none none
+expect "status --json: idle 72 h is 72" 0 '"item":"1\.0\.3","idle_hours":72\}' -- -C "$ID" status --json
 isnap() { git -C "$ID" for-each-ref; git -C "$ID" worktree list --porcelain; git -C "$ID" status --porcelain --ignored; git -C "$IW" status --porcelain --ignored; }
 before=$(isnap; stat -c '%n %Y' "$IW"/*)
 "$PO" -C "$ID" status --idle 1 >/dev/null 2>&1
@@ -3371,7 +3424,7 @@ check("dashboard reports: 30 d reaches back where 7 d does not", r.gate_runs([_s
 check("dashboard reports: empty feed gives empty data and text", r.gate_runs([], 86400, _n)["agents"] == [] and r.first_try([], 86400, _n)["rows"] == [] and r.closed([], 86400, _n)["total"] == 0
       and "none in this range" in r.gate_runs_text(r.gate_runs([], 86400, _n)) and "none in this range" in r.first_try_text(r.first_try([], 86400, _n)) and "none in this range" in r.closed_text(r.closed([], 86400, _n)))
 _o = r.gate_runs([_st("2026-10-25T12:10:00Z", agent="solo")], 86400, _n)
-check("dashboard reports: one agent gives one row", _o["agents"] == ["solo"] and len(_o["series"]["solo"]) == 24 and r.layout_gate_runs(_o, 600)[0] > 0)
+check("dashboard reports: one agent gives one row", _o["agents"] == ["solo"] and len(_o["series"]["solo"]) == 24 and r.layout_fail_rate(r.fail_rate(_o), 600)[0] > 0)
 check("dashboard reports: busiest agent first, ties by name", r.gate_runs([_st("2026-10-25T12:10:00Z", agent="z"), _st("2026-10-25T12:11:00Z", agent="z"), _st("2026-10-25T12:12:00Z", agent="b"), _st("2026-10-25T12:13:00Z", agent="a")], 86400, _n)["agents"] == ["z", "a", "b"])
 _f = r.first_try([_st("2026-10-25T10:00:00Z", result="fail"), _st("2026-10-25T11:00:00Z"),
                   _st("2026-10-25T10:00:00Z", item="2"), _st("2026-10-25T10:00:00Z", item="3", project="q"),
@@ -3385,8 +3438,8 @@ check("dashboard reports: closes per day by project, passing closes only, two da
 check("dashboard reports: 7 d closes reach the older day", r.closed([_st("2026-10-20T03:00:00Z", kind="close", project="y")], 7 * 86400, _n)["total"] == 1 and len(r.closed([], 30 * 86400, _n)["labels"]) == 30)
 check("dashboard reports: a time zone moves the day boundary", r.closed([_st("2026-10-25T02:00:00Z", kind="close")], 86400, _n, datetime.timezone(datetime.timedelta(hours=-4)))["series"]["p"] == [1, 0])
 check("dashboard reports: events with no agent or project are 'unknown'", r.gate_runs([{"time": "2026-10-25T12:10:00Z", "kind": "stamp", "result": "pass"}], 86400, _n)["agents"] == ["unknown"])
-check("dashboard reports: the text alternative carries the numbers", "a 2 runs, 1 passed, 1 failed" in r.gate_runs_text(_g) and "a 67% of 3 items" in r.first_try_text(_f) and "3 in all; x 2; y 1" in r.closed_text(_c))
-check("dashboard reports: reports() gives the five charts in order with text", [t for t, _d, _x in r.reports([], 86400, _n)] == list(c.REPORT_CHARTS) and all(x for _t, _d, x in r.reports([], 86400, _n)))
+check("dashboard reports: the text alternative carries the numbers", "a 2 runs, 1 passed, 1 failed" in r.gate_runs_text(_g) and "a 67\u00a0% of 3 items, too few to rank" in r.first_try_text(_f) and "3 in all; x 2; y 1" in r.closed_text(_c))
+check("dashboard reports: charts() gives the five charts in order with text", [x["topic"] for x in r.charts([], 86400, _n)] == list(c.REPORT_CHARTS) and all(x["text"] for x in r.charts([], 86400, _n)))
 def _lg(t, legs, **k):
     e = _st(t, **k)
     e["legs"] = [{"name": n, "result": x} for n, x in legs]
@@ -3401,7 +3454,7 @@ _t = r.cycle_time(_ct, 86400, _n)
 _ar = {x["agent"]: x for x in _t["rows"]}
 check("dashboard reports: cycle time is open to close per agent, five numbers and n", _ar["a"]["n"] == 2 and _ar["a"]["min"] == 7200 and _ar["a"]["max"] == 14400 and _ar["a"]["median"] == 10800 and _ar["a"]["q1"] == 9000 and _ar["a"]["q3"] == 12600 and _ar["b"]["n"] == 1 and _ar["b"]["min"] == _ar["b"]["max"] == 9000)
 check("dashboard reports: cycle time leaves out unclosed, failed-close and open-less items", sum(x["n"] for x in _t["rows"]) == 3)
-check("dashboard reports: cycle time rows run longest median first and the unit fits", [x["agent"] for x in _t["rows"]] == ["a", "b"] and _t["unit"] == "hour" and r.cycle_time([], 86400, _n) == {"rows": [], "unit": "minute"})
+check("dashboard reports: cycle time rows run longest median first and the unit fits", [x["agent"] for x in _t["rows"]] == ["a", "b"] and _t["unit"] == "hour" and r.cycle_time([], 86400, _n) == {"rows": [], "unit": "minute", "n": 0, "median": None})
 check("dashboard reports: cycle time counts a close only inside the range", r.cycle_time(_ct, 600, _n)["rows"] == [] and len(r.cycle_time(_ct, 3600, _n)["rows"]) == 1 and r.cycle_time([_st("2026-10-01T08:00:00Z", kind="open"), _st("2026-10-25T12:00:00Z", kind="close")], 86400, _n)["rows"][0]["n"] == 1)
 check("dashboard reports: cycle time falls back to the close event's agent without a stamp", r.cycle_time([_st("2026-10-25T08:00:00Z", kind="open"), _st("2026-10-25T08:10:00Z", kind="close", agent="po")], 86400, _n)["rows"][0]["agent"] == "po")
 _fl = r.failed_legs([_lg("2026-10-25T12:10:00Z", [("lint", "pass"), ("test", "fail")]), _lg("2026-10-25T12:20:00Z", [("test", "fail"), ("fmt", "fail")], result="fail"),
@@ -3409,38 +3462,149 @@ _fl = r.failed_legs([_lg("2026-10-25T12:10:00Z", [("lint", "pass"), ("test", "fa
                      {"time": "2026-10-25T12:00:00Z", "legs": "junk"}], 86400, _n)
 check("dashboard reports: failed legs count only failing legs, per name and hour", _fl["legs"] == ["test", "fmt"] and _fl["series"]["test"][-1] == 2 and _fl["series"]["test"][-2] == 1 and _fl["series"]["fmt"][-1] == 1 and _fl["total"] == 4 and _fl["hourly"])
 _seven = r.failed_legs([_lg("2026-10-25T12:10:00Z", [("l%d" % i, "fail")] * (9 - i)) for i in range(8)], 86400, _n)
-check("dashboard reports: past six leg names the rest group as other, last", len(_seven["legs"]) == 7 and _seven["legs"][-1] == "other" and _seven["legs"][:6] == ["l0", "l1", "l2", "l3", "l4", "l5"] and sum(_seven["series"]["other"]) == 3 + 2 and _seven["total"] == sum(9 - i for i in range(8)))
+check("dashboard reports: v0.143 past three leg names the rest group as other, last", len(_seven["legs"]) == 4 and _seven["legs"][-1] == "other" and _seven["legs"][:3] == ["l0", "l1", "l2"] and sum(_seven["series"]["other"]) == 6 + 5 + 4 + 3 + 2 and _seven["total"] == sum(9 - i for i in range(8)))
 check("dashboard reports: failed legs bucket daily for 7 d and are empty without failures", r.failed_legs([_lg("2026-10-23T12:00:00Z", [("t", "fail")])], 7 * 86400, _n)["series"]["t"][-3] == 1 and r.failed_legs([_st("2026-10-25T12:00:00Z")], 86400, _n)["total"] == 0)
 check("dashboard reports: the new charts' text alternatives carry the numbers", "a 2 items, median 3.0 h" in r.cycle_time_text(_t) and "4 in all; test 3; fmt 1" in r.failed_legs_text(_fl) and "none in this range" in r.cycle_time_text(r.cycle_time([], 86400, _n)) and "none in this range" in r.failed_legs_text(r.failed_legs([], 86400, _n)))
 _cs = r.layout_cycle_time(_t, 640)[1] + r.layout_failed_legs(_fl, 640)[1] + r.layout_failed_legs(_seven, 640)[1]
-check("dashboard reports: cycle time shows the median and n as text and boxes for each agent", any(s[0] == "text" and s[3] == "3.0 h  n=2" for s in _cs) and sum(1 for s in r.layout_cycle_time(_t, 640)[1] if s[0] == "rect" and s[5] == ("series", 0)) == 2)
-check("dashboard reports: other is hatched muted, never one of the six colours", any(s[0] == "rect" and s[5] == "muted" and s[6] for s in r.layout_failed_legs(_seven, 640)[1]) and not any(s[0] == "rect" and s[5] == ("series", 6 % 6) and s[6] for s in r.layout_failed_legs(_seven, 640)[1]))
+check("dashboard reports: cycle time shows the median and n as text and boxes for each agent", any(s[0] == "text" and s[3] == "3.0 h  n=2" for s in _cs) and sum(1 for s in r.layout_cycle_time(_t, 640)[1] if s[0] == "rect" and s[5] == "edge") == 2)
+check("dashboard reports: other is hatched muted, and no leg takes a project's colour", any(s[0] == "rect" and s[5] == "muted" and s[6] for s in r.layout_failed_legs(_seven, 640)[1]) and not any(s[0] == "rect" and isinstance(s[5], tuple) and s[5][0] == "series" for s in r.layout_failed_legs(_seven, 640)[1]))
 check("dashboard reports: new charts stay inside the width", all(s[1] >= 0 and s[1] + (s[3] if s[0] == "rect" else 0) <= 640 + 1e-6 for s in _cs if s[0] in ("rect", "line")))
 check("dashboard reports: nice axis tops sit just above the value", [r.nice_max(v) for v in (0, 1, 3, 7, 11, 20, 21, 51, 101)] == [1, 1, 3, 8, 12, 20, 24, 60, 120])
-_hid = r.gate_runs([_st("2026-10-25T12:10:00Z"), _st("2026-10-25T12:20:00Z", result="fail"), _st("2026-10-25T09:10:00Z", agent="b")], 86400, _n)
-_hs = r.layout_gate_runs(_hid, 640)[1]
-check("dashboard reports: gate runs draw only the hours with runs", len({round(s[1], 3) for s in _hs if s[0] == "rect" and s[5] == "pass" and s[3] > 20}) == 2 and sum(1 for s in _hs if s[0] == "text" and s[3] == "09") == 2)
-check("dashboard reports: hidden empty hours are counted in a muted note", any(s[0] == "text" and s[3] == "22 empty hours hidden" and s[4] == "muted" for s in _hs) and not any(s[0] == "text" and "hidden" in s[3] for s in r.layout_gate_runs(r.gate_runs([_st("2026-10-25T%02d:10:00Z" % h) for h in range(13)] + [_st("2026-10-24T%02d:10:00Z" % h) for h in range(13, 24)], 86400, _n), 640)[1]))
-check("dashboard reports: gate runs label every bar with its count above and its hour below, in every row", sum(1 for s in _hs if s[0] == "text" and s[3] == "12") == 2 and sorted(s[3] for s in _hs if s[0] == "text" and s[4] == "text" and s[5] == "middle") == ["1", "2"])
-check("dashboard reports: gate runs say what a bar is", any(s[0] == "text" and s[3] == "each bar = one hour" for s in _hs) and any(s[0] == "text" and s[3] == "each bar = one day" for s in r.layout_gate_runs(r.gate_runs([_st("2026-10-23T12:00:00Z")], 7 * 86400, _n), 640)[1]))
+# v0.141 (8): the cycle-time unit comes from the medians (hours while every median is under a day), not from the one
+# longest item; ticks run from 0 to the end of the range in steps of whole days of hours
+def _cy(agent, item, hours):
+    return [_st("2026-10-20T00:00:00Z", kind="open", item=item, agent="po"), _st("2026-10-20T00:30:00Z", item=item, agent=agent),
+            {"time": (c.parse_time("2026-10-20T00:00:00Z") + datetime.timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+             "kind": "close", "result": "pass", "item": item, "project": "p", "agent": "po"}]
+_cyev = _cy("ana", "1", 2) + _cy("ana", "2", 3) + _cy("ana", "3", 108) + _cy("bo", "4", 1.5) + _cy("cy", "5", 0.75) + _cy("cy", "6", 5)
+_cyt = r.cycle_time(_cyev, 7 * 86400, c.parse_time("2026-10-25T12:00:00Z"))
+check("dashboard reports: v0.141 cycle time medians under a day give the hour unit despite a 4.5 d item", _cyt["unit"] == "hour", _cyt["unit"])
+_cyx = r.cycle_time_text(_cyt)
+check("dashboard reports: v0.141 cycle time medians read in hours, never 0.0 d",
+      "ana 3 items, median 3.0 h" in _cyx and "bo 1 item, median 1.5 h" in _cyx and "cy 2 items, median 2.9 h" in _cyx and "0.0 d" not in _cyx, _cyx)
+_cyl = r.layout_cycle_time(_cyt, 640)[1]
+_tk = [s[3] for s in _cyl if s[0] == "text" and s[4] == "muted" and s[5] == "middle"]
+check("dashboard reports: v0.141 cycle time ticks run 0 to 120 h (the 5 d range) a day apart", _tk == ["0", "24 h", "48 h", "72 h", "96 h", "120 h"], str(_tk))
+check("dashboard reports: v0.141 cycle time row values are hours too", any(s[0] == "text" and s[3] == "3.0 h  n=3" for s in _cyl), str([s[3] for s in _cyl if s[0] == "text"]))
+check("dashboard reports: v0.141 a median of a day or more gives days; a short chart stays in minutes",
+      r.cycle_unit([{"median": 86400, "max": 86400}]) == "day" and r.cycle_unit([{"median": 600, "max": 3600}]) == "minute"
+      and r.cycle_unit([{"median": 600, "max": 3 * 3600}]) == "hour" and r.cycle_unit([]) == "minute")
+check("dashboard reports: v0.141 axis ticks: hours step by whole parts of a day, the end a whole number of steps",
+      [r.axis_ticks(t, u) for t, u in ((108, "hour"), (7, "hour"), (4.5, "day"), (90, "minute"))] == [(120, 24), (8, 2), (5, 1), (90, 15)])
+_hid = r.fail_rate(r.gate_runs([_st("2026-10-25T12:10:00Z"), _st("2026-10-25T12:20:00Z", result="fail"), _st("2026-10-25T09:10:00Z", agent="b")], 86400, _n))
+_hs = r.layout_fail_rate(_hid, 640)[1]
+check("dashboard reports: v0.143 the fail rate per hour is failed over all runs, an hour with no run None",
+      _hid["rates"][-1] == 0.5 and _hid["rates"][-4] == 0 and _hid["rates"][-2] is None and _hid["rate"] == 1 / 3, str(_hid["rates"][-4:]))
+_brk = r.layout_fail_rate(r.fail_rate(r.gate_runs([_st("2026-10-25T09:10:00Z"), _st("2026-10-25T10:10:00Z", result="fail"), _st("2026-10-25T12:10:00Z")], 86400, _n)), 640)[1]
+check("dashboard reports: v0.143 the fail-rate line breaks at an hour with no run: one 2-point line, a lone point after the gap",
+      [len(s[1]) for s in _brk if s[0] == "path" and s[2] == "fail" and s[1][0][0] >= r.AXIS_W + r.PAD] == [2]
+      and sum(1 for s in _brk if s[0] == "rect" and s[5] == "fail") == 3)
+check("dashboard reports: v0.143 the fail rate says what a point is", any(s[0] == "text" and s[3] == "each point = one hour; an hour with no run is a gap" for s in _hs)
+      and any(s[0] == "text" and s[3] == "each point = one day; a day with no run is a gap" for s in r.layout_fail_rate(r.fail_rate(r.gate_runs([_st("2026-10-23T12:00:00Z")], 7 * 86400, _n)), 640)[1]))
 _cl = r.layout_closed(_c, 640)[1]
 check("dashboard reports: closed per day hides empty days, labels bars and says how many were hidden", any(s[0] == "text" and s[3] == "each bar = one day" for s in _cl) and not any(s[0] == "text" and "hidden" in s[3] for s in _cl)
       and any(s[0] == "text" and s[3] == "29 empty days hidden" for s in r.layout_closed(r.closed([_st("2026-10-25T01:00:00Z", kind="close")], 30 * 86400, _n), 640)[1])
       and any(s[0] == "text" and s[3] == "1 empty day hidden" for s in r.layout_closed(r.closed([_st("2026-10-25T01:00:00Z", kind="close")], 86400, _n), 640)[1]))
 _fh = r.layout_failed_legs(r.failed_legs([_lg("2026-10-25T12:10:00Z", [("t", "fail")])], 86400, _n), 640)[1]
 check("dashboard reports: failed legs hide empty hours, label the bar and count it above", any(s[0] == "text" and s[3] == "23 empty hours hidden" for s in _fh) and any(s[0] == "text" and s[3] == "12" and s[5] == "middle" and s[4] == "muted" for s in _fh) and any(s[0] == "text" and s[3] == "1" and s[4] == "text" for s in _fh))
-check("dashboard reports: charts with nothing to draw stay empty", all(r.layout_gate_runs(r.gate_runs([], 86400, _n), 640)[0] > 0 and not any(s[0] == "rect" and s[5] in ("pass", "fail") and s[3] > 20 for s in r.layout_gate_runs(r.gate_runs([], 86400, _n), 640)[1]) for _ in (0,)) and r.layout_closed(r.closed([], 86400, _n), 640)[0] > 0 and r.layout_failed_legs(r.failed_legs([], 86400, _n), 640)[0] > 0)
+check("dashboard reports: charts with nothing to draw stay empty", r.layout_fail_rate(r.fail_rate(r.gate_runs([], 86400, _n)), 640)[0] > 0
+      and not any(s[0] == "rect" for s in r.layout_fail_rate(r.fail_rate(r.gate_runs([], 86400, _n)), 640)[1])
+      and r.layout_closed(r.closed([], 86400, _n), 640)[0] > 0 and r.layout_failed_legs(r.failed_legs([], 86400, _n), 640)[0] > 0)
 _tall = r.layout_closed(r.closed([_st("2026-10-25T%02d:00:00Z" % h, kind="close", item=str(h)) for h in range(11)], 86400, _n), 640)[1]
 check("dashboard reports: the axis top is the closer round step above the tallest bar", any(s[0] == "text" and s[3] == "12" and s[4] == "muted" and s[5] == "end" for s in _tall))
-_shapes = r.layout_gate_runs(_g, 640)[1] + r.layout_first_try(_f, 640)[1] + r.layout_closed(_c, 640)[1]
-check("dashboard reports: fail is hatched, pass solid, so colour is not the only cue", any(s[0] == "rect" and s[5] == "fail" and s[6] for s in _shapes) and any(s[0] == "rect" and s[5] == "pass" and not s[6] for s in _shapes))
-check("dashboard reports: first-try rows carry the share and n as text", any(s[0] == "text" and s[3] == "67%  n=3" for s in r.layout_first_try(_f, 640)[1]))
-check("dashboard reports: shapes stay inside the width", all(s[1] >= 0 and s[1] + (s[3] if s[0] == "rect" else 0) <= 640 + 1e-6 for s in r.layout_gate_runs(_g, 640)[1] + r.layout_closed(_c, 640)[1] if s[0] in ("rect", "line")))
+_shapes = r.layout_first_try(_f, 640)[1]
+check("dashboard reports: v0.143 a not-ranked first-try row is hatched muted, a ranked one solid, so colour is not the only cue",
+      any(s[0] == "rect" and s[5] == "muted" and s[6] for s in _shapes) and any(s[0] == "rect" and s[5] == "pass" and not s[6] for s in r.layout_first_try(r.first_try([_st("2026-10-25T10:00:00Z", item=str(i)) for i in range(5)], 86400, _n), 640)[1]))
+check("dashboard reports: first-try rows carry the share and n as text", any(s[0] == "text" and s[3] == "67\u00a0%  n=3" for s in r.layout_first_try(_f, 640)[1]))
+check("dashboard reports: shapes stay inside the width", all(s[1] >= 0 and s[1] + (s[3] if s[0] == "rect" else 0) <= 640 + 1e-6 for s in r.layout_fail_rate(r.fail_rate(_g), 640)[1] + r.layout_closed(_c, 640)[1] if s[0] in ("rect", "line"))
+      and all(0 <= x <= 640 for s in r.layout_fail_rate(r.fail_rate(_g), 640)[1] if s[0] == "path" for x, _y in s[1]))
 _many = r.closed([_st("2026-10-25T01:00:00Z", kind="close", project="p%d" % i) for i in range(8)], 86400, _n)
-check("dashboard reports: a project past the palette reuses a colour hatched", r.series_colour(0) == (("series", 0), False) and r.series_colour(6) == (("series", 0), True) and len(r.layout_closed(_many, 400)[1]) > 8)
+check("dashboard reports: a project past the palette reuses a colour hatched", r.series_colour(0) == (("series", 0), False) and r.series_colour(5) == (("series", 0), True) and len(r.layout_closed(_many, 400)[1]) > 8)
 for _v, _p in sorted(c.PALETTES.items()):
-    _lo = min(c.contrast_ratio(x, _p["base"]) for x in _p["series"] + [_p["pass"], _p["fail"]])
+    _lo = min(c.contrast_ratio(x, _p["base"]) for x in _p["series"] + _p["legs"] + [_p["pass"], _p["fail"]])
     check("dashboard reports %s: chart colours reach 3:1 against the base (%.2f)" % (_v, _lo), _lo >= 3 and len(_p["series"]) == r.SERIES_COLOURS)
+    _steps = [abs(c.lightness(x) - c.lightness(y)) for k in ("series", "legs") for i, x in enumerate(_p[k]) for y in _p[k][i + 1:]]
+    check("dashboard reports %s: v0.143 series and leg colours differ in lightness by %s L* or more, so greyscale still reads (least %.1f)" % (_v, c.CHART_LIGHTNESS_STEP, min(_steps)),
+          min(_steps) >= c.CHART_LIGHTNESS_STEP and len(_p["legs"]) == r.LEG_SHADES and not set(_p["legs"]) & set(_p["series"]))
+    check("dashboard reports %s: v0.143 ink inside a segment is black or white, whichever reads, at 4.5:1" % _v,
+          all(c.contrast_ratio(c.chart_colour(_v, ("ink", ("series", i))), _p["series"][i]) >= 4.5 for i in range(r.SERIES_COLOURS))
+          and c.chart_colour(_v, ("legs", 0)) == _p["legs"][0] and c.chart_colour(_v, "muted") == _p["muted"])
+# v0.143: Reports redesign. A fixture of two 7 d periods: the range ending _hn and the 7 days before it.
+_hn = c.parse_time("2026-10-25T12:30:00Z")
+def _at(days_ago, hour=10):
+    return (_hn - datetime.timedelta(days=days_ago)).replace(hour=hour, minute=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+_two = ([_st(_at(1), item="1"), _st(_at(1, 11), item="2", result="fail"), _st(_at(2), item="3"), _st(_at(2, 11), item="3"),
+         _st(_at(1, 12), kind="close", project="x"), _st(_at(2, 12), kind="close", project="y", item="3")]
+        + [_st(_at(9), item="9"), _st(_at(9, 11), item="8"), _st(_at(10), item="7", result="fail"), _st(_at(10, 11), item="6", result="fail"),
+           _st(_at(9, 12), kind="close", project="x", item="9")])
+_hd = {t["key"]: t for t in r.headline(_two, 7 * 86400, _hn)}
+check("dashboard reports: v0.143 headline: four numbers, gate runs, fail rate, first try, closed, in that order",
+      [t["label"] for t in r.headline(_two, 7 * 86400, _hn)] == ["gate runs", "fail rate", "first try", "closed"]
+      and (_hd["runs"]["text"], _hd["fail"]["text"], _hd["first"]["text"], _hd["closed"]["text"]) == ("4", "25 %", "67 %", "2"),
+      str([(t["key"], t["text"]) for t in _hd.values()]))
+check("dashboard reports: v0.143 headline: each number has the previous period beside it, in words and an arrow",
+      _hd["runs"]["change"] == "same as the previous 7 d (4)" and _hd["fail"]["change"] == "▼ down 25 points from 50 %, previous 7 d"
+      and _hd["first"]["change"] == "▲ up 17 points from 50 %, previous 7 d" and _hd["closed"]["change"] == "▲ up 1 from 1, previous 7 d",
+      str([t["change"] for t in _hd.values()]))
+_one = [e for e in _two if c.parse_time(e["time"]) > _hn - datetime.timedelta(days=7)]
+check("dashboard reports: v0.143 headline: an empty previous period says no previous period",
+      all(t["change"] == "no previous period" and t["previous"] is None for t in r.headline(_one, 7 * 86400, _hn)))
+check("dashboard reports: v0.143 headline: events that do not reach back (covered False) give no previous period either",
+      all(t["change"] == "no previous period" for t in r.headline(_two, 7 * 86400, _hn, covered=False)))
+check("dashboard reports: v0.143 headline: a rate with nothing to divide reads in words", [t["text"] for t in r.headline([], 86400, _hn)] == ["0", "no runs", "no items", "0"])
+check("dashboard reports: v0.143 report_reach reads the range and its previous period", c.report_reach(7 * 86400) == 14 * 86400)
+_ch = r.charts(_two, 7 * 86400, _hn, tz=datetime.timezone.utc)
+check("dashboard reports: v0.143 titles state the finding", [x["title"] for x in _ch] == [
+      "Fail rate fell to 25 %", "First-try rate rose to 67 %", "2 items closed, most in x (1)",
+      "No items closed with an open event in this range", "No failed legs in this range"], str([x["title"] for x in _ch]))
+check("dashboard reports: v0.143 a title says held at, and was with no previous period",
+      r._trend("Fail rate", 0.25, 0.25, r.pct) == "Fail rate held at 25 %" and r._trend("Fail rate", 0.25, None, r.pct) == "Fail rate was 25 %")
+check("dashboard reports: v0.143 every chart's text alternative carries its title, the previous period, the source and as of",
+      all(x["text"].startswith(x["title"] + ".") and (x["context"].startswith("Previous 7 d: ") or x["context"] == "No previous period.") and x["context"] in x["text"]
+          and "Source: po gate event log" in x["text"] and "as of 12:30 PM UTC" in x["text"] for x in _ch)
+      and _ch[0]["context"] == "Previous 7 d: 50 % of 4 runs failed." and _ch[2]["context"] == "Previous 7 d: 1 closed.", str([x["text"] for x in _ch][:1]))
+check("dashboard reports: v0.143 with no previous period every chart says so",
+      all(x["context"] == "No previous period." and "No previous period." in x["text"] for x in r.charts(_one, 7 * 86400, _hn)))
+# first try: n < 5 not ranked, a team average, the previous period, the roster
+_ft = r.first_try([_st("2026-10-25T10:00:00Z", agent="ana", item=str(i), result="pass" if i else "fail") for i in range(6)]
+                  + [_st("2026-10-25T10:00:00Z", agent="lo", item="x")] + [_st("2026-10-25T10:00:00Z", agent="zed", item="y", result="fail")], 86400, _n)
+check("dashboard reports: v0.143 first-try has a team average over every row", _ft["n"] == 8 and _ft["passed"] == 6 and _ft["team"] == 0.75)
+_ftl = r.layout_first_try(dict(_ft, previous={"ana": 0.5}, team_previous=0.6), 640)[1]
+_ftx = [s[3] for s in _ftl if s[0] == "text"]
+check("dashboard reports: v0.143 first-try ranks n >= 5 first, then n < 5 under a 'not ranked' line, hatched",
+      _ftx.index("ana") < _ftx.index("fewer than 5 items, not ranked") < _ftx.index("lo")
+      and any(s[0] == "rect" and s[5] == "muted" and s[6] for s in _ftl) and r.MIN_N == 5, str(_ftx))
+check("dashboard reports: v0.143 first-try draws the team average as a dashed line through the rows, labelled with the previous period",
+      "team average 75 %, was 60 %" in _ftx and any(s[0] == "path" and s[4] and s[1][0][0] == s[1][1][0] for s in _ftl))
+check("dashboard reports: v0.143 first-try shows an agent's previous rate as words and a tick",
+      "83 %  n=6 · was 50 %" in _ftx and any(s[0] == "rect" and s[5] == "text" and s[3] == 2 for s in _ftl), str(_ftx))
+check("dashboard reports: v0.143 with the Team roster, the owner's own stamps (zed) are no agent's row",
+      [x["agent"] for x in r.first_try([_st("2026-10-25T10:00:00Z", agent="zed", item="y"), _st("2026-10-25T10:00:00Z", agent="ana")], 86400, _n, agents={"ana", "lo"})["rows"]] == ["ana"]
+      and "zed" in [x["agent"] for x in _ft["rows"]])
+check("dashboard reports: v0.143 the text alternative marks the agents too few to rank and gives the average",
+      "lo 100 % of 1 item, too few to rank" in r.first_try_text(_ft) and r.first_try_text(_ft).endswith("team average 75 %."))
+# fixed project colours and labelled segments
+_pc = [_st("2026-10-25T01:00:00Z", kind="close", project=p, item=p) for p in ("zeta", "alpha", "mid")] + [_st("2026-10-10T01:00:00Z", project="beta")]
+def _swatches(data):
+    sh = r.layout_closed(data, 640)[1]
+    return {sh[k + 1][3].split()[0]: sh[k][5] for k in range(len(sh) - 1) if sh[k][0] == "rect" and sh[k][3] == 12 and sh[k + 1][0] == "text"}
+_s1 = _swatches(dict(r.closed(_pc, 86400, _n), colours=r.project_colours(_pc)))
+_s2 = _swatches(dict(r.closed(_pc[:1], 30 * 86400, _n), colours=r.project_colours(list(reversed(_pc)))))
+check("dashboard reports: v0.143 a project keeps its colour between two renders, whatever the range, order or other closes",
+      r.project_colours(_pc) == {"alpha": 0, "beta": 1, "mid": 2, "zeta": 3} and _s1["zeta"] == _s2["zeta"] == ("series", 3) and _s1["alpha"] == ("series", 0), str((_s1, _s2)))
+_big = r.layout_closed(dict(r.closed([_st("2026-10-25T%02d:00:00Z" % h, kind="close", project="x", item=str(h)) for h in range(9)]
+                                     + [_st("2026-10-25T10:30:00Z", kind="close", project="y")], 86400, _n), colours={"x": 0, "y": 1}), 640)[1]
+check("dashboard reports: v0.143 the biggest segment carries its count inside, the legend gives each total and share",
+      any(s[0] == "text" and s[3] == "9" and s[4] == ("ink", ("series", 0)) for s in _big) and any(s[0] == "text" and s[3] == "x 9 (90 %)" for s in _big))
+_lf = r.failed_legs([_lg("2026-10-25T12:10:00Z", [("test", "fail")] * 40 + [("lint", "fail")] * 2 + [("fmt", "fail")])], 86400, _n)
+check("dashboard reports: v0.143 a leg under 5 % of failures folds into other; a lone leftover leg keeps its name",
+      _lf["legs"] == ["test", "other"] and sum(_lf["series"]["other"]) == 3
+      and r.failed_legs([_lg("2026-10-25T12:10:00Z", [("test", "fail")] * 40 + [("lint", "fail")])], 86400, _n)["legs"] == ["test", "lint"])
+check("dashboard reports: v0.143 legs take the leg shades, never a project colour", [r.leg_colour(["a", "b", "other"], j) for j in range(3)] == [(("legs", 0), False), (("legs", 1), False), ("muted", True)])
+_nar = r.layout_first_try(_ft, 300)[1] + r.layout_cycle_time(_t, 300)[1] + r.layout_fail_rate(r.fail_rate(_g), 300)[1] + r.layout_closed(_c, 300)[1]
+check("dashboard reports: v0.143 on a narrow width rows put name and value above a full-width track, all inside the width",
+      all(s[1] >= 0 and s[1] + (s[3] if s[0] == "rect" else 0) <= 300 + 1e-6 for s in _nar if s[0] in ("rect", "line"))
+      and any(s[0] == "text" and s[3] == "ana  83 %  n=6" for s in _nar))
 check("dashboard: fewer than 10 events show them all", len(c.visible(ev[:3], False)) == 3)
 
 utc = datetime.timezone.utc
@@ -3525,9 +3689,26 @@ NOW = dt.datetime(2030, 5, 1, 14, 0, tzinfo=dt.timezone.utc)
 EST = dt.timezone(dt.timedelta(hours=-5))
 lim = {"agent": "a", "state": "WORKING", "free": True, "limit_until": "2030-05-01T18:30:00Z"}
 lr = c.team_row(lim, NOW, EST)
-check("dashboard team: LIMIT wins over WORKING and FREE", lr["kind"] == "limit" and lr["status"] == "LIMIT until 13:30")
-check("dashboard team: LIMIT shows the viewer's local time", c.team_row(lim, NOW, dt.timezone.utc)["status"] == "LIMIT until 18:30")
-check("dashboard team: LIMIT on another day shows the date", c.team_row(dict(lim, limit_until="2030-05-02T03:00:00Z"), NOW, EST)["status"] == "LIMIT until 22:00" and c.team_row(dict(lim, limit_until="2030-05-02T12:00:00Z"), NOW, EST)["status"] == "LIMIT until 2030-05-02 07:00")
+# v0.142 (15): the one time format, with the zone: `LIMIT until 7:00 PM EST Nov 30` (was `2026-11-30 19:00`)
+check("dashboard team: LIMIT wins over WORKING and FREE", lr["kind"] == "limit" and lr["status"] == "LIMIT until 1:30 PM UTC-05:00", lr["status"])
+check("dashboard team: LIMIT shows the viewer's local time", c.team_row(lim, NOW, dt.timezone.utc)["status"] == "LIMIT until 6:30 PM UTC")
+check("dashboard team: LIMIT on another day shows the date", c.team_row(dict(lim, limit_until="2030-05-02T03:00:00Z"), NOW, EST)["status"] == "LIMIT until 10:00 PM UTC-05:00" and c.team_row(dict(lim, limit_until="2030-05-02T12:00:00Z"), NOW, EST)["status"] == "LIMIT until 7:00 AM UTC-05:00 May 2")
+from zoneinfo import ZoneInfo
+_tor = ZoneInfo("America/Toronto")
+check("dashboard team: v0.142 LIMIT names the zone and its daylight time: `7:00 PM EST Nov 29`, `10:00 AM EDT`",
+      c.team_row(dict(lim, limit_until="2030-11-30T00:00:00Z"), NOW, _tor)["status"] == "LIMIT until 7:00 PM EST Nov 29"
+      and c.team_row(dict(lim, limit_until="2030-05-01T14:00:01Z"), NOW, _tor)["status"] == "LIMIT until 10:00 AM EDT")
+check("dashboard: v0.142 clock_text writes midnight and noon as 12, minutes two digits",
+      c.clock_text(dt.datetime(2030, 5, 1, 0, 5, tzinfo=dt.timezone.utc), NOW, dt.timezone.utc) == "12:05 AM UTC"
+      and c.clock_text(dt.datetime(2030, 5, 1, 12, 0, tzinfo=dt.timezone.utc), NOW, dt.timezone.utc) == "12:00 PM UTC"
+      and c.clock_text(dt.datetime(2031, 1, 1, 12, 0, tzinfo=dt.timezone.utc), NOW, dt.timezone.utc) == "12:00 PM UTC Jan 1 2031")
+# v0.142 (15): one subscription's usage is said once in the Team header, each line drops it; usages that differ stay per line
+_shared = [{"agent": a, "usage": {"five_hour": 0.22, "seven_day": 0.64}} for a in ("p", "q", "r")] + [{"agent": "s", "state": "idle"}]
+_sr2 = c.team_rows(_shared)
+check("dashboard team: v0.142 a usage every agent shares is the header's, once", c.team_shared_usage(_sr2) == "5h 22% · 7d 64%"
+      and c.team_status(_sr2) == "4 agents · subscription 5h 22% · 7d 64%" and c.team_status(_sr2).count("22%") == 1)
+check("dashboard team: v0.142 usages that differ, or none, give no shared usage and a plain count",
+      c.team_shared_usage(c.team_rows(_shared + [{"agent": "t", "usage": {"five_hour": 0.5}}])) == "" and c.team_status(c.team_rows([{"agent": "x"}])) == "1 agent")
 for name, v in (("null", None), ("absent", "ABSENT"), ("past", "2030-05-01T13:00:00Z"), ("unparseable", "soon"), ("non-string", 5)):
     e = {"agent": "a", "state": "idle 3h", "free": True}
     if v != "ABSENT":
@@ -3536,7 +3717,7 @@ for name, v in (("null", None), ("absent", "ABSENT"), ("past", "2030-05-01T13:00
 check("dashboard team: usage is shown as muted percentages", c.team_row({"usage": {"five_hour": 0.42, "seven_day": 0.185}})["usage"] == "5h 42% \u00b7 7d 18%")
 check("dashboard team: only the usage parts present are shown", c.team_row({"usage": {"seven_day": 1}})["usage"] == "7d 100%" and c.team_row({"usage": {"five_hour": 0}})["usage"] == "5h 0%")
 check("dashboard team: no, empty or bad usage shows nothing", all(c.team_row({"usage": u})["usage"] == "" for u in (None, {}, [], "x", {"five_hour": "a", "seven_day": 2}, {"five_hour": True, "seven_day": -1})) and c.team_row({})["usage"] == "")
-check("dashboard team: a check line shows LIMIT and usage", c.team_check_lines([dict(lim, usage={"five_hour": 1, "seven_day": 0.5})], NOW, EST) == ["a | LIMIT until 13:30 (5h 100% \u00b7 7d 50%) | now: - | owns: -"])
+check("dashboard team: a check line shows LIMIT and usage", c.team_check_lines([dict(lim, usage={"five_hour": 1, "seven_day": 0.5})], NOW, EST) == ["a | LIMIT until 1:30 PM UTC-05:00 (5h 100% \u00b7 7d 50%) | now: - | owns: -"])
 check("dashboard team: an old feed row shows as before", c.team_row({"agent": "a", "state": "idle 3h", "free": False}, NOW, EST)["status"] == "idle 3h")
 # The Team view's saved order: where it lives, load and save, merged with the feed.
 import os, tempfile
@@ -3652,6 +3833,21 @@ check("dashboard decisions: thread_url is kept as text, trimmed; absent or not a
 check("dashboard decisions: asked_by is trimmed when a string, empty otherwise",
        c.decision_row({"asked_by": " ana "}, now)["asked_by"] == "ana" and c.decision_row({"asked_by": 4}, now)["asked_by"] == "")
 check("dashboard decisions: markup in a field stays text", c.decision_row({"title": "<b>x</b>"}, now)["title"] == "<b>x</b>")
+# v0.141 (17): the desktop card's thread_url is a real link named like the web's, never a scheme other than http(s)
+check("dashboard decisions: v0.141 a thread_url becomes an `Open thread` link, its URL escaped for the attribute",
+      c.thread_link_markup("https://chat.example.org/t/1") == '<a href="https://chat.example.org/t/1">Open thread</a>'
+      and c.thread_link_markup(' http://x/t?a=1&b="2" ') == '<a href="http://x/t?a=1&amp;b=&quot;2&quot;">Open thread</a>'
+      and c.THREAD_LINK_TEXT == "Open thread")
+check("dashboard decisions: v0.141 a chat app's own deep link is a link too (the feed may carry no web URL)",
+      c.thread_link_markup("chat://message?channel=c1&id=e1&thread=r1") == '<a href="chat://message?channel=c1&amp;id=e1&amp;thread=r1">Open thread</a>')
+check("dashboard decisions: v0.141 no link for a scheme that runs code or reads local data, a URL with no host, text, or nothing",
+      all(c.thread_link_markup(u) == "" for u in ("javascript" + ":alert(1)", "JavaScript://x%0aalert(1)", "vbscript://x", "data://x",
+                                                   "file:///etc/passwd", "blob://x", "about://blank", "mailto:a@b", "https://", "chat thread",
+                                                   "chat://a b", "", None, 4)))
+check("dashboard decisions: v0.141 every card kind with an http(s) thread_url gets the link (choice, action, unformatted, legacy)",
+      all(c.thread_link_markup(c.decision_row(dict(e, thread_url="https://h/t/9"), now)["thread_url"]) for e in
+          [{"kind": "choice", "id": "a", "question": "q", "options": [{"label": "x"}, {"label": "y"}]},
+           {"kind": "action", "id": "b", "machine": "m", "done_when": "d", "steps": [{"text": "s"}]}, {"kind": "z", "id": "c"}, {}]))
 check("dashboard decisions: short_title cuts at 80 and keeps short text", c.short_title("x" * 100) == "x" * 80 and c.short_title("abc") == "abc" and c.short_title(None) == "")
 check("dashboard decisions: a long title is cut in the row", len(c.decision_row({"title": "y" * 120}, now)["title"]) == 80)
 check("dashboard decisions: check lines show kind item project title waiting asked and the URL when there is one",
@@ -3989,7 +4185,7 @@ class AnswerH(http.server.BaseHTTPRequestHandler):
             self.send_response(201)  # a bearer token is accepted
         else:
             self.send_response(code)
-        if code == 400:
+        if code == 400 and self.path == "/400":
             self.send_header("X-Reason", "kind")
         if self.path == "/409wb":
             self.send_header("X-Reason", "wrong build")
@@ -4013,6 +4209,8 @@ check("dashboard answers: 401 without a token is refused", c.post_answer(abase +
 check("dashboard answers: 401 with a token is answered · sent", c.post_answer(abase + "/401", ab, token="secret") == "answered \u00b7 sent")
 check("dashboard answers: 500 is not sent", c.post_answer(abase + "/500", ab).startswith("not sent:"))
 check("dashboard answers: an X-Reason header is shown next to the reason", c.post_answer(abase + "/400", ab) == "not sent: bad request (kind)")
+check("dashboard answers: a 400 without an X-Reason keeps the old status text",
+      c.post_answer(abase + "/400n", ab) == "not sent: Bad Request")
 check("dashboard answers: the POST waits up to 20 s", c.ANSWER_TIMEOUT == 20)
 # v0.81: the receiver refuses a look answer from another build with 409 and X-Reason: wrong build.
 _wb = c.post_answer(abase + "/409wb", ab)
@@ -4100,9 +4298,33 @@ for variant in sorted(c.PALETTES):
     for fg, bg, role in c.CONTRAST_PAIRS:
         ratio = c.contrast_ratio(props[fg]["color"], props[bg]["background-color"])
         check("dashboard css %s: %s has contrast >= 4.5 (%.2f)" % (variant, role, ratio), ratio >= 4.5)
-    check("dashboard css %s: cards and toggle are raised, a pressed toggle is inset" % variant,
+    # v0.142 (6): a pressed (checked) control is filled with the accent, not only inset (1.7:1 light, 1.2:1 dark)
+    check("dashboard css %s: cards and toggle are raised, a checked toggle is filled with the accent" % variant,
           "inset" not in props[".po-card"]["box-shadow"] and "inset" not in props[".po-toggle"]["box-shadow"]
-          and "inset" in props[".po-toggle:checked"]["box-shadow"])
+          and props[".po-toggle:checked"]["background-color"] == c.PALETTES[variant]["accent"])
+    _base = props["window.po-dashboard"]["background-color"]
+    for sel, prop, role in c.EDGE_PAIRS:
+        col = c.css_color(props[sel][prop])
+        ratio = c.contrast_ratio(col, _base) if col else 0
+        check("dashboard css %s: v0.142 %s reaches 3:1 on the surface (%.2f)" % (variant, role, ratio), ratio >= 3)
+    for sel in (".po-view:checked", ".po-small:checked", ".po-toggle:checked"):
+        check("dashboard css %s: v0.142 %s is the accent fill with its own text colour, not an inset shadow alone" % (variant, sel),
+              props[sel]["background-color"] == c.PALETTES[variant]["accent"] and props[sel]["color"] == c.PALETTES[variant]["on_accent"]
+              and props[sel]["box-shadow"] == "none")
+    # v0.142 (7): one raised panel per list, the rows inside it flat (no shadow, no radius) with a hairline between them
+    check("dashboard css %s: v0.142 a list panel is raised, with the base colour" % variant,
+          props[".po-panel"]["background-color"] == _base and "inset" not in props[".po-panel"]["box-shadow"] and props[".po-panel"]["box-shadow"] != "none")
+    _row = props[".po-panel .po-row"]
+    check("dashboard css %s: v0.142 a row in a panel is flat, a hairline above it, none above the first" % variant,
+          _row["box-shadow"] == "none" and _row["border-radius"] == "0" and _row["margin"].startswith("0 ")
+          and c.css_color(_row["border-top"]) == c.PALETTES[variant]["hairline"] and props[".po-panel .po-row:first-child"]["border-top-color"] == "transparent")
+    # v0.142 (19): header, panels, cards and charts carry a rim whose top edge is lighter than the surface; in the dark theme
+    # (shadows 1.2:1) it is the edge you see, so it must stand out: 2:1 at least, and lighter than the base
+    for sel in (".po-header", ".po-panel", ".po-card", ".po-chart"):
+        top = props[sel]["border-top-color"]
+        r = c.contrast_ratio(top, _base)
+        check("dashboard css %s: v0.142 %s has a lighter top edge (%.2f)" % (variant, sel, r),
+              c.luminance(top) > c.luminance(_base) and (r >= 2 if variant == "dark" else True))
     check("dashboard css %s: one base colour for window, header, card, toggle" % variant,
           len({props[s]["background-color"] for s in ("window.po-dashboard", ".po-header", ".po-card", ".po-toggle")}) == 1)
 # The new-event highlight: the maths, and AA text at every step read back from the CSS.
@@ -4233,7 +4455,7 @@ _fc = c.project_counts(_feed)
 check("dashboard projects: the feed shape, todo + doing + done + unlisted = All", _fc["todo"] + _fc["doing"] + _fc["done"] + len(c.counts_add_up(_feed)) == len(_feed) == 8)
 _sr = c.project_screen({"project": "p", "items": _nc}, "all", pnow)
 check("dashboard project screen: a row keeps the full status, word and muted note, and the screen carries the lost line",
-      _sr["rows"][0]["status"] == "DONE" and _sr["rows"][0]["note"] == "(no change needed: x)" and _sr["rows"][0]["full"] == "DONE (no change needed: x)" and _sr["lost"] == "1 not in a filter: 58")
+      _sr["rows"][-1]["status"] == "DONE" and _sr["rows"][-1]["note"] == "(no change needed: x)" and _sr["rows"][-1]["full"] == "DONE (no change needed: x)" and _sr["lost"] == "1 not in a filter: 58")
 check("dashboard projects: the list given is not changed", [x["item"] for x in fi] == list("abcdef"))
 pf = c.parse_projects(open(sys.argv[1] + "/../../examples/projects-feed.json").read())
 pcl = c.project_check_lines(pf, datetime.datetime(2026, 10, 26, 1, 10, 0, tzinfo=utc))
@@ -4247,11 +4469,11 @@ check("dashboard project screen: the state starts on the overview with no filter
 _st1 = c.project_state_open(_st0, "orchard")
 check("dashboard project screen: opening a project records it and leaves the old state alone", _st1["open"] == "orchard" and _st0["open"] is None)
 check("dashboard project screen: back returns to the overview", c.project_state_back(_st1)["open"] is None)
-check("dashboard project screen: the filter starts at All", c.project_state_filter(_st1, "orchard") == "all")
-_st2 = c.project_state_set_filter(_st1, "orchard", "DOING")
-check("dashboard project screen: a filter choice is kept for that project only", c.project_state_filter(_st2, "orchard") == "doing" and c.project_state_filter(_st2, "harbor") == "all")
-check("dashboard project screen: the filter survives back and reopening", c.project_state_filter(c.project_state_open(c.project_state_back(_st2), "orchard"), "orchard") == "doing")
-check("dashboard project screen: an unknown filter reads as All", c.project_state_filter(c.project_state_set_filter(_st1, "orchard", "bogus"), "orchard") == "all")
+check("dashboard project screen: v0.142 the filter starts at DOING (was All)", c.project_state_filter(_st1, "orchard") == "doing" and c.PROJECT_DEFAULT_FILTER == "doing")
+_st2 = c.project_state_set_filter(_st1, "orchard", "DONE")
+check("dashboard project screen: a filter choice is kept for that project only", c.project_state_filter(_st2, "orchard") == "done" and c.project_state_filter(_st2, "harbor") == "doing")
+check("dashboard project screen: the filter survives back and reopening", c.project_state_filter(c.project_state_open(c.project_state_back(_st2), "orchard"), "orchard") == "done")
+check("dashboard project screen: v0.142 an unknown filter reads as the default, DOING", c.project_state_filter(c.project_state_set_filter(_st1, "orchard", "bogus"), "orchard") == "doing")
 check("dashboard project screen: a refresh keeps the open project and filter while it is in the feed", c.project_state_reconcile(_st2, pf) == _st2)
 _gone = c.project_state_reconcile(_st2, pf[1:])
 check("dashboard project screen: a project that left the feed returns to the overview and drops its filter", _gone["open"] is None and _gone["filters"] == {})
@@ -4260,11 +4482,11 @@ _ps = c.project_screen(pf[0], "all", _pn)
 check("dashboard project screen: the header has the name and the light in words", _ps["name"] == "orchard" and _ps["light"] == "active" and "active" in _ps["text"])
 check("dashboard project screen: filter buttons are All, TODO, DOING, DONE, RELEASED with their counts", [(f["label"], f["count"]) for f in _ps["filters"]] == [("All", 3), ("TODO", 1), ("DOING", 1), ("DONE", 1), ("RELEASED", 0)])
 check("dashboard project screen: HELD counts in All only", [(f["label"], f["count"]) for f in c.project_screen(pf[1], "all", _pn)["filters"]] == [("All", 13), ("TODO", 0), ("DOING", 1), ("DONE", 0), ("RELEASED", 0)])
-check("dashboard project screen: rows are in the feed's order with id, title and status badge", [(r["item"], r["title"], r["status"]) for r in _ps["rows"]] == [("3.1", "Plant", "TODO"), ("3.2", "Water", "DOING"), ("3.3", "Harvest", "DONE")])
-check("dashboard project screen: TODO lists the agents that could take it", _ps["rows"][0]["agents"] == ["ana", "ben"] and not _ps["rows"][0]["live"])
+check("dashboard project screen: v0.142 rows are newest first (the feed's order reversed) with id, title and status badge", [(r["item"], r["title"], r["status"]) for r in _ps["rows"]] == [("3.3", "Harvest", "DONE"), ("3.2", "Water", "DOING"), ("3.1", "Plant", "TODO")])
+check("dashboard project screen: TODO lists the agents that could take it", _ps["rows"][2]["agents"] == ["ana", "ben"] and not _ps["rows"][2]["live"])
 check("dashboard project screen: DOING marks the current agent live", _ps["rows"][1]["agents"] == ["cy"] and _ps["rows"][1]["live"])
-check("dashboard project screen: DONE lists every agent in the feed's order, not live", _ps["rows"][2]["agents"] == ["dee", "cy", "ana"] and not _ps["rows"][2]["live"])
-check("dashboard project screen: no agent is a muted dash", c.project_screen(pf[1], "all", _pn)["rows"][1]["dash"] and not _ps["rows"][0]["dash"])
+check("dashboard project screen: DONE lists every agent in the feed's order, not live", _ps["rows"][0]["agents"] == ["dee", "cy", "ana"] and not _ps["rows"][0]["live"])
+check("dashboard project screen: no agent is a muted dash", c.project_screen(pf[1], "all", _pn)["rows"][-2]["dash"] and not _ps["rows"][0]["dash"])
 check("dashboard project screen: a DOING row with no agent is not live", not c.project_screen({"project": "p", "items": [{"item": "1", "status": "DOING", "agents": []}]}, "all", _pn)["rows"][0]["live"])
 check("dashboard project screen: the filter narrows the rows, counts stay", [r["item"] for r in c.project_screen(pf[0], "done", _pn)["rows"]] == ["3.3"] and c.project_screen(pf[0], "done", _pn)["filters"][0]["count"] == 3)
 check("dashboard project screen: PAUSED shows under DOING", [r["item"] for r in c.project_screen(pf[1], "doing", _pn)["rows"]] == ["1.1"])
@@ -4289,6 +4511,50 @@ check("dashboard projects: a card carries name, light and the four counts", _pc[
 _pl = {"project": "p", "last_event": "2026-10-26T11:50:00Z", "items": [{"item": "1", "status": "TODO"}, {"item": "2", "status": "DOING"}, {"item": "3", "status": "DONE"}, {"item": "4", "status": "DONE"}]}
 check("dashboard projects: the card text names the light in words, not only colour", c.project_card(_pl, pnow)["text"] == "p, active, TODO 1, DOING 1, DONE 2, RELEASED 0, no release")
 check("dashboard projects: the card text names an idle and an inactive light too", ", idle," in c.project_card(dict(_pl, last_event="2026-10-26T01:00:00Z"), pnow)["text"] and ", inactive," in c.project_card(dict(_pl, last_event=None), pnow)["text"])
+# v0.130: idle_hours per DOING item: `idle 3h` (`active` under 1 h), stalled from 2 h; a feed without the key reads as before.
+_ih = c.parse_projects(json.dumps([{"project": "p", "items": [
+    {"item": "1", "status": "DOING", "agents": ["a"], "idle_hours": 0}, {"item": "2", "status": "DOING", "agents": ["a"], "idle_hours": 5.9},
+    {"item": "3", "status": "DOING", "agents": ["a"], "idle_hours": 72}, {"item": "4", "status": "DOING", "agents": ["a"], "idle_hours": None},
+    {"item": "5", "status": "DOING", "agents": ["a"]}, {"item": "6", "status": "DOING", "agents": ["a"], "idle_hours": "x"},
+    {"item": "7", "status": "DOING", "agents": ["a"], "idle_hours": 1}, {"item": "8", "status": "DOING", "agents": ["a"], "idle_hours": 2},
+    {"item": "9", "status": "TODO", "idle_hours": 9}]}]))[0]
+_ihr = [(r["idle"], r["stalled"]) for r in reversed(c.project_screen(_ih, "all", pnow)["rows"])]  # back to feed order
+check("v0.130 dashboard projects: a row says active under 1 h, else idle Nh rounded down", _ihr[0] == ("active", False) and _ihr[1] == ("idle 5h", True) and _ihr[2] == ("idle 72h", True) and _ihr[6] == ("idle 1h", False), repr(_ihr))
+check("v0.130 dashboard projects: a row is stalled from 2 h", _ihr[7] == ("idle 2h", True))
+check("v0.130 dashboard projects: no, null or unreadable idle_hours shows nothing, and a TODO row shows none", _ihr[3] == _ihr[4] == _ihr[5] == _ihr[8] == ("", False), repr(_ihr))
+# v0.142 (16): status is never colour alone: a stalled row says so in words, and every light has its words beside the dot
+_ihw = [r["idle_words"] for r in reversed(c.project_screen(_ih, "all", pnow)["rows"])]
+check("dashboard projects: v0.142 a stalled row says `stalled` in words, an active or idle one does not",
+      _ihw[0] == "active" and _ihw[1] == "idle 5h, stalled" and _ihw[6] == "idle 1h" and _ihw[7] == "idle 2h, stalled" and _ihw[3] == _ihw[8] == "", repr(_ihw))
+_lw = lambda **kw: c.project_light_word((pnow - datetime.timedelta(**kw)).isoformat(), pnow)
+check("dashboard projects: v0.142 the light's words: `active`, `idle 45 min`, `idle 3 h`, `stalled 4 d`",
+      [_lw(minutes=5), _lw(minutes=45), _lw(hours=3, minutes=59), _lw(hours=24), _lw(days=4, hours=6)] == ["active", "idle 45 min", "idle 3 h", "idle 24 h", "stalled 4 d"],
+      repr([_lw(minutes=5), _lw(minutes=45), _lw(hours=3, minutes=59), _lw(hours=24), _lw(days=4, hours=6)]))
+check("dashboard projects: v0.142 a day and a second past the idle limit is `stalled 1 d`, no or a future time `no events`",
+      _lw(hours=24, seconds=1) == "stalled 1 d" and c.project_light_word(None, pnow) == c.project_light_word("soon", pnow) == "no events"
+      and c.project_light_word((pnow + datetime.timedelta(hours=2)).isoformat(), pnow) == "no events")
+check("dashboard projects: v0.142 a project switched off is not called stalled: `last event 4 d ago`",
+      c.project_light_word((pnow - datetime.timedelta(days=4)).isoformat(), pnow, active=False) == "last event 4 d ago"
+      and c.project_light_word((pnow - datetime.timedelta(days=4)).isoformat(), pnow, active=True) == "stalled 4 d")
+_states = {"active": dict(minutes=1), "idle": dict(hours=2), "inactive": dict(days=3)}
+check("dashboard projects: v0.142 every light state has its words on the card and the screen, and they begin with the state's word",
+      all(c.project_card(dict(_pl, last_event=(pnow - datetime.timedelta(**kw)).isoformat()), pnow)["word"].split()[0] == {"active": "active", "idle": "idle", "inactive": "stalled"}[st]
+          and c.project_card(dict(_pl, last_event=(pnow - datetime.timedelta(**kw)).isoformat()), pnow)["light"] == st
+          and c.project_screen(dict(_pl, last_event=(pnow - datetime.timedelta(**kw)).isoformat()), "all", pnow)["word"]
+          == c.project_card(dict(_pl, last_event=(pnow - datetime.timedelta(**kw)).isoformat()), pnow)["word"] for st, kw in _states.items())
+      and c.project_card(dict(_pl, last_event=None), pnow)["word"] == "no events")
+check("dashboard projects: v0.142 the desktop puts the words beside the dot on the card and on the screen",
+      'top.append(self.label(c["word"], "po-muted"))' in open(sys.argv[1] + "/../../bin/po-dashboard").read()
+      and 'head.append(self.label(screen["word"], "po-muted"))' in open(sys.argv[1] + "/../../bin/po-dashboard").read())
+check("dashboard project screen: v0.142 an empty filter says which, an empty project says no items",
+      c.project_screen({"project": "p", "items": [{"item": "1", "status": "TODO"}]}, "doing", pnow)["empty"] == "no DOING items"
+      and c.project_screen({"project": "p"}, "doing", pnow)["empty"] == "no items")
+# v0.142 (12): the Reports header is `Reports` over `7 d · as of <time>`, not the Events count line
+_asof = datetime.datetime(2030, 5, 1, 18, 32, tzinfo=utc)
+check("dashboard reports: v0.142 the header status is `7 d · as of 6:32 PM UTC`, the title `Reports`",
+      c.reports_status(1, _asof, _asof, utc) == "7 d · as of 6:32 PM UTC" and c.reports_status(0, _asof, _asof, utc).startswith("24 h · ")
+      and c.reports_status(2, None) == "30 d · loading…" and c.REPORTS_TITLE == "Reports" and "events" not in c.reports_status(1, _asof, _asof, utc))
+check("v0.130 dashboard projects: parse keeps idle_hours as whole hours, else None", [it["idle_hours"] for it in _ih["items"]] == [0, 5, 72, None, None, None, 1, 2, 9])
 # v0.109: a feed error greys the card and says so; counts and light come from the last good data in the entry.
 _ep = dict(_pl, error="po released --json: exit 1")
 _ec = c.project_card(c.parse_projects(json.dumps([_ep]))[0], pnow)
@@ -4299,6 +4565,128 @@ check("v0.109 dashboard projects: an errored card says feed error in its text an
 check("v0.109 dashboard projects: a card with no error has error None and the old text", c.project_card(_pl, pnow)["error"] is None and "feed error" not in c.project_card(_pl, pnow)["text"])
 check("v0.109 dashboard projects: --check adds the feed error to the project's line", c.project_check_lines(c.parse_projects(json.dumps([_ep])), pnow)[0].endswith(" | feed error: po released --json: exit 1"))
 check("v0.109 dashboard projects: the example feed carries one error project", [p["project"] for p in pf if p["error"]] == ["meadow"])
+# v0.139: the project switch: `active` from the feed, the inactive badge, the switch body and its states.
+_sw = c.parse_projects(json.dumps([dict(_pl, active=False), dict(_pl, active=True), _pl, dict(_pl, active="no"), dict(_pl, active=None)]))
+check("v0.139 dashboard projects: parse keeps a boolean active, anything else (absent, string, null) is None",
+      [e["active"] for e in _sw] == [False, True, None, None, None], repr([e["active"] for e in _sw]))
+_swc = [c.project_card(e, pnow) for e in _sw]
+check("v0.139 dashboard projects: an inactive project's card has the inactive badge and says it in its text",
+      _swc[0]["badge"] == "inactive" and _swc[0]["active"] is False
+      and _swc[0]["text"] == "p, active, TODO 1, DOING 1, DONE 2, RELEASED 0, no release, switched off (inactive): nothing new is opened", repr(_swc[0]))
+check("v0.139 dashboard projects: an active project's card has no badge and the old text",
+      _swc[1]["badge"] == "" and _swc[1]["active"] is True and _swc[1]["text"] == c.project_card(_pl, pnow)["text"])
+check("v0.139 dashboard projects: a feed without the key still renders: no badge, active None, the old text",
+      _swc[2]["badge"] == "" and _swc[2]["active"] is None and _swc[2]["text"] == "p, active, TODO 1, DOING 1, DONE 2, RELEASED 0, no release")
+check("v0.139 dashboard projects: the badge is in the CSS of both themes", ".po-badge" in c.css("light") and ".po-badge" in c.css("dark"))
+_swb = c.project_active_body("orchard", False, "0b7e3c1a-5d2f-4a8e-9c61-3f0d2b8a7e41")
+check("v0.139 dashboard switch: the body is {answer_id, kind project-active, project, active, answered_at, client}",
+      set(_swb) == {"answer_id", "kind", "project", "active", "answered_at", "client"} and _swb["kind"] == "project-active"
+      and _swb["project"] == "orchard" and _swb["active"] is False and _swb["client"] == c.CLIENT
+      and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", _swb["answered_at"]) is not None, repr(_swb))
+if _recv:
+    _sb = c.project_active_body("orchard", True, c.answer_id())
+    try:
+        _rm.check_active_body(json.dumps(_sb).encode("utf-8"))
+        _sok = "ok"
+    except _rm.Reply as e:
+        _sok = "%d %s" % (e.code, e.why)
+    check("v0.139 dashboard switch: the receiver's check_active_body accepts the client's real body", _sok == "ok", _sok)
+check("v0.139 dashboard switch: switch_state is empty on 200/201 and names the refusal otherwise",
+      c.switch_state(201) == "" and c.switch_state(200) == "" and c.switch_state(404, "unknown project") == "not switched: unknown project"
+      and c.switch_state(401, host="h") == "not switched: refused by h: 401" and c.switch_state(429).startswith("not switched: rate limit")
+      and c.switch_state(0, "timed out") == "not switched: timed out" and c.switch_state(500) == "not switched: status 500")
+check("v0.139 dashboard switch: a pending switch shows until the feed agrees or its hold runs out",
+      c.switch_shown(True, (False, 1000.0), 1010.0) is False and c.switch_shown(True, (False, 1000.0), 1000.0 + c.SWITCH_HOLD_SECONDS) is True
+      and c.switch_shown(True, None, 5.0) is True and c.switch_shown(False, (False, 1000.0), 1010.0) is False)
+check("v0.139 dashboard switch: a pending switch is settled when the feed agrees or the hold ran out, not before",
+      c.switch_settled(False, (False, 1000.0), 1001.0) and c.switch_settled(True, (False, 1000.0), 1000.0 + c.SWITCH_HOLD_SECONDS)
+      and not c.switch_settled(True, (False, 1000.0), 1001.0) and c.switch_settled(True, None, 0.0))
+_swseen = []
+class SwitchH(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        _swseen.append((self.headers.get("Authorization"), json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))))
+        code = int(self.path[1:4])
+        self.send_response(code)
+        if code == 404:
+            self.send_header("X-Reason", "unknown project")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+    def log_message(self, *a):
+        pass
+_swsrv = http.server.HTTPServer(("127.0.0.1", 0), SwitchH)
+threading.Thread(target=_swsrv.serve_forever, daemon=True).start()
+_swbase = "http://127.0.0.1:%d" % _swsrv.server_address[1]
+check("v0.139 dashboard switch: post_switch sends the body with the bearer token; 201 is switched (empty note)",
+      c.post_switch(_swbase + "/201", _swb, token="tok") == "" and _swseen[-1] == ("Bearer tok", _swb), repr(_swseen[-1:]))
+check("v0.139 dashboard switch: a 404 with X-Reason unknown project says not switched: unknown project",
+      c.post_switch(_swbase + "/404", _swb) == "not switched: unknown project")
+check("v0.139 dashboard switch: an unreachable sink says not switched", c.post_switch("http://127.0.0.1:1/", _swb).startswith("not switched:"))
+_swsrv.shutdown()
+_swsrv.server_close()
+# v0.140: the Release button: N from the feed (DONE and not released), the dialog title, the body and its states.
+_rl = {"project": "orchard", "release": "release-23", "items": [
+    {"item": "v1", "status": "DONE", "released": True}, {"item": "v2", "status": "DONE"}, {"item": "v3", "status": "DONE (tag v3)"},
+    {"item": "v4", "status": "DONE", "released": True, "setup_open": 1}, {"item": "v5", "status": "TODO"},
+    {"item": "v6", "status": "DOING"}, {"item": "v7", "status": "done", "released": False}]}
+_rlp = c.parse_projects(json.dumps([_rl, dict(_rl, project="grove", items=[{"item": "v1", "status": "DONE", "released": True}]),
+                                    dict(_rl, project="meadow", release=None, items=[{"item": "v1", "status": "DONE"}]),
+                                    dict(_rl, project="heath", active=False)]))
+check("v0.140 dashboard release: N counts DONE rows not released (any DONE word; a released one with setup open is released)",
+      c.unreleased_done(_rlp[0]["items"]) == 3 and c.unreleased_done(None) == 0, repr(c.unreleased_done(_rlp[0]["items"])))
+_rv = c.release_view(_rlp[0])
+check("v0.140 dashboard release: the dialog title carries N and the last release name from the feed",
+      _rv["title"] == "Release orchard: 3 DONE items since release-23" and _rv["n"] == 3 and _rv["enabled"] and _rv["why"] == "", repr(_rv))
+_rv0 = c.release_view(_rlp[1])
+check("v0.140 dashboard release: the button is off at N = 0 and says why",
+      _rv0["n"] == 0 and not _rv0["enabled"] and _rv0["why"] == "nothing to release: no DONE item since release-23", repr(_rv0))
+check("v0.140 dashboard release: one item is singular; no release yet says so",
+      c.release_view(_rlp[2])["title"] == "Release meadow: 1 DONE item since the start (no release yet)", repr(c.release_view(_rlp[2])))
+check("v0.140 dashboard release: an inactive project's button stays on", _rlp[3]["active"] is False and c.release_view(_rlp[3])["enabled"])
+check("v0.140 dashboard release: without an answer sink the button is off and says read-only",
+      not c.release_view(_rlp[0], sink=False)["enabled"] and c.release_view(_rlp[0], sink=False)["why"] == "read-only: no answer URL")
+check("v0.140 dashboard release: the note counter flags more than 2000 characters (trimmed)",
+      c.release_counter("  " + "x" * 2000 + "\n") == ("2000 / 2000", False) and c.release_counter("x" * 2001)[1] is True)
+_rb = c.release_body("orchard", "line one\nline two ", "0b7e3c1a-5d2f-4a8e-9c61-3f0d2b8a7e41")
+check("v0.140 dashboard release: the body is {answer_id, kind release-request, project, note, answered_at, client}, the note as typed",
+      set(_rb) == {"answer_id", "kind", "project", "note", "answered_at", "client"} and _rb["kind"] == "release-request"
+      and _rb["note"] == "line one\nline two " and _rb["client"] == c.CLIENT
+      and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", _rb["answered_at"]) is not None, repr(_rb))
+if _recv:
+    try:
+        _rm.check_release_body(json.dumps(c.release_body("orchard", "", c.answer_id())).encode("utf-8"))
+        _rok = "ok"
+    except _rm.Reply as e:
+        _rok = "%d %s" % (e.code, e.why)
+    check("v0.140 dashboard release: the receiver's check_release_body accepts the client's real body", _rok == "ok", _rok)
+    check("v0.140 dashboard release: the client's note limit is the receiver's", c.RELEASE_NOTE_MAX == _rm.RELEASE_NOTE_MAX)
+check("v0.140 dashboard release: release_state says sent on 200/201 and names the refusal otherwise",
+      c.release_state(201) == c.RELEASE_SENT and c.release_state(200) == c.RELEASE_SENT and c.release_state(400, "note too long") == "not sent: note too long"
+      and c.release_state(401, host="h") == "not sent: refused by h: 401" and c.release_state(429).startswith("not sent: rate limit")
+      and c.release_state(0, "timed out") == "not sent: timed out" and c.release_state(500) == "not sent: status 500")
+_rlseen = []
+class ReleaseH(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        _rlseen.append((self.headers.get("Authorization"), self.rfile.read(int(self.headers.get("Content-Length", 0)))))
+        code = int(self.path[1:4])
+        self.send_response(code)
+        if code == 400:
+            self.send_header("X-Reason", "note too long")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+    def log_message(self, *a):
+        pass
+_rlsrv = http.server.HTTPServer(("127.0.0.1", 0), ReleaseH)
+threading.Thread(target=_rlsrv.serve_forever, daemon=True).start()
+_rlbase = "http://127.0.0.1:%d" % _rlsrv.server_address[1]
+_rbu = c.release_body("orchard", "caf\u00e9 \u2014 ok", "0b7e3c1a-5d2f-4a8e-9c61-3f0d2b8a7e41")
+check("v0.140 dashboard release: post_release sends the body (UTF-8, not escaped) with the bearer token; 201 is sent",
+      c.post_release(_rlbase + "/201", _rbu, token="tok") == c.RELEASE_SENT and _rlseen[-1][0] == "Bearer tok"
+      and json.loads(_rlseen[-1][1]) == _rbu and "\u2014".encode() in _rlseen[-1][1], repr(_rlseen[-1:]))
+check("v0.140 dashboard release: a 400 with X-Reason note too long says not sent: note too long",
+      c.post_release(_rlbase + "/400", _rbu) == "not sent: note too long")
+check("v0.140 dashboard release: an unreachable sink says not sent", c.post_release("http://127.0.0.1:1/", _rbu).startswith("not sent:"))
+_rlsrv.shutdown()
+_rlsrv.server_close()
 check("dashboard projects: a card for an entry with no items counts zero", c.project_card({"project": "q"}, pnow)["text"] == "q, inactive, TODO 0, DOING 0, DONE 0, RELEASED 0, no release")
 check("dashboard projects: the card lost line carries every item name, no truncation",
       c.project_card({"project": "p", "items": [{"item": "a1"}, {"item": "b2"}, {"item": "c3"}]}, pnow)["lost"] == "3 not in a filter: a1, b2, c3")
@@ -4317,7 +4705,7 @@ check("dashboard released: the RELEASED filter sits right after DONE", [k for _l
 check("dashboard released: the RELEASED filter lists released items, DONE the rest", [x["item"] for x in c.filter_items(_rp[0]["items"], "released")] == ["1", "5"] and [x["item"] for x in c.filter_items(_rp[0]["items"], "done")] == ["2", "3"])
 _rs = c.project_screen(_rp[0], "all", pnow)
 check("dashboard released: the screen row shows RELEASED, and `released, setup N open` muted on a DONE row with steps open",
-      [r["status"] for r in _rs["rows"]] == ["RELEASED", "DONE", "DONE", "TODO", "RELEASED", "HELD"] and _rs["rows"][1]["note"] == "released, setup 2 open" and _rs["rows"][2]["note"] == "" and _rs["rows"][4]["note"] == "(no change needed: x)")
+      [r["status"] for r in _rs["rows"]][::-1] == ["RELEASED", "DONE", "DONE", "TODO", "RELEASED", "HELD"] and _rs["rows"][-2]["note"] == "released, setup 2 open" and _rs["rows"][-3]["note"] == "" and _rs["rows"][1]["note"] == "(no change needed: x)")
 check("dashboard released: a status note and the setup-open note go together", c.project_screen({"project": "p", "items": [{"item": "1", "status": "DONE (tag v1)", "released": True, "setup_open": 1}]}, "all", pnow)["rows"][0]["note"] == "(tag v1), released, setup 1 open")
 check("dashboard released: the screen filter counts include RELEASED", [(f["label"], f["count"]) for f in _rs["filters"]] == [("All", 6), ("TODO", 1), ("DOING", 0), ("DONE", 2), ("RELEASED", 2)])
 check("dashboard released: release_label gives the name, plain", c.release_label(_rp[0]) == {"text": "release-2", "muted": False} and c.release_label({"release": " v1.8.2 "}) == {"text": "v1.8.2", "muted": False})
@@ -4330,7 +4718,7 @@ check("dashboard setup: setup_badge is `setup N open`, None when no step is open
 check("dashboard setup: project_setup_open sums the items' open steps", c.project_setup_open(_sp) == 3 and c.project_setup_open({"project": "q"}) == 0 and c.project_setup_open(None) == 0)
 _ss = c.project_screen(_sp, "all", pnow)
 check("dashboard setup: a screen row with steps open carries its badge; a released one says the count in its note instead",
-      [r["setup"] for r in _ss["rows"]] == ["setup 2 open", None, None] and _ss["rows"][1]["note"] == "released, setup 1 open")
+      [r["setup"] for r in _ss["rows"]] == [None, None, "setup 2 open"] and _ss["rows"][1]["note"] == "released, setup 1 open")
 _sc = c.project_card(_sp, pnow)
 check("dashboard setup: the card counts the open steps in a muted line and its text", _sc["setup"] == "setup open 3" and _sc["text"].endswith(", no release, setup open 3"))
 check("dashboard setup: a project without open steps has no setup line, its text unchanged",
@@ -4467,14 +4855,14 @@ except c.DashboardError:
     check("archive url: a bad one is an error", True)
 import dashboard_reports as rep77
 _n = c.parse_time("2026-10-31T12:00:00Z")
-_g = lambda evs: rep77.reports(evs, 30 * 86400, _n)[0][1]
+_g = lambda evs: rep77.reports(evs, 30 * 86400, _n)["charts"][0]["data"]
 _stamp = lambda t, i: {"time": t, "kind": "stamp", "item": i, "project": "p", "result": "pass", "agent": "ada", "legs": [], "detail": ""}
 _L = [_stamp("2026-10-30T10:00:00Z", "1")]
 _A = [_stamp("2026-10-15T10:00:00Z", "2"), _stamp("2026-10-05T10:00:00Z", "3")]
 check("reports 30 d: the aggregation reads live plus archive; live alone leaves the older runs out",
       len(c.in_range(c.report_events(_L, _A, 30 * 86400), 30 * 86400, _n)) == 3 and len(c.in_range(c.report_events(_L, None, 30 * 86400), 30 * 86400, _n)) == 1
       and _g(c.report_events(_L, _A, 30 * 86400))["total"] == 3 and _g(_L)["total"] == 1)
-check("reports 7 d: the archive never changes the 7 d aggregation", rep77.reports(c.report_events(_L, _A, 7 * 86400), 7 * 86400, _n)[0][1] == rep77.reports(_L, 7 * 86400, _n)[0][1])
+check("reports 7 d: the archive never changes the 7 d aggregation", rep77.reports(c.report_events(_L, _A, 7 * 86400), 7 * 86400, _n)["charts"][0]["data"] == rep77.reports(_L, 7 * 86400, _n)["charts"][0]["data"])
 
 
 print("BLOCK-END dashboard-core")
@@ -4734,7 +5122,7 @@ out=$(PO_DASHBOARD_TEAM_URL="$TMP/team.json" python3 -B "$DB" --url "$CHK_URL" -
 	ok "po-dashboard --check lists the team after the events when a team feed is set" || bad "dashboard check team" "$out"
 printf '[{"agent":"ada","state":"WORKING","owns":[],"usage":{"five_hour":0.5}},{"agent":"cy","state":"idle 3h","free":true,"limit_until":"2099-01-01T12:00:00Z","usage":{"seven_day":0.25}}]\n' >"$TMP/team-limit.json"
 out=$(TZ=UTC PO_DASHBOARD_TEAM_ORDER="$TMP/none-order.json" PO_DASHBOARD_TEAM_URL="$TMP/team-limit.json" python3 -B "$DB" --url "$CHK_URL" --check 2>&1)
-[[ $(tail -2 <<<"$out" | head -1) == "ada | WORKING (5h 50%) | now: - | owns: -" && $(tail -1 <<<"$out") == "cy | LIMIT until 2099-01-01 12:00 (7d 25%) | now: - | owns: -" ]] &&
+[[ $(tail -2 <<<"$out" | head -1) == "ada | WORKING (5h 50%) | now: - | owns: -" && $(tail -1 <<<"$out") == "cy | LIMIT until 12:00 PM UTC Jan 1 2099 (7d 25%) | now: - | owns: -" ]] &&
 	ok "po-dashboard --check shows LIMIT in local time and usage when present" || bad "dashboard check limit" "$out"
 printf '{"order": ["cy"]}\n' >"$TMP/team-order.json"
 out=$(PO_DASHBOARD_TEAM_ORDER="$TMP/team-order.json" PO_DASHBOARD_TEAM_URL="$TMP/team.json" python3 -B "$DB" --url "$CHK_URL" --check 2>&1)
@@ -4884,6 +5272,190 @@ mod.main()
 PY
 		)
 		[[ $out == opened ]] && ok "po-dashboard Projects card activation opens the project screen" || bad "dashboard projects activate" "$out"
+		# v0.139: the GTK switch line is a 44 px click target, a click beside the switch flips it (and does not open
+		# the project), and without a sink the reason is said on the card next to the switch, not only in a tooltip.
+		python3 -c 'import json, sys; p = json.load(open(sys.argv[1]))
+for e, a in zip(p, (True, False, True)): e["active"] = a
+json.dump(p, open(sys.argv[2], "w"))' "$(dirname "$PO")/../examples/projects-feed.json" "$TMP/v139-projects.json"
+		for _sink in slow ""; do
+			# helper
+			out=$(timeout 60 python3 -I - "$DB" "$SV/events.json" "$TMP/v139-projects.json" "$_sink" 2>/dev/null <<'PY'
+import http.server, importlib.machinery, importlib.util, os, sys, threading
+sys.dont_write_bytecode = True
+import gi
+gi.require_version("Gtk", "4.0")
+from gi.repository import GLib, Gtk
+db, events, feed, sink = sys.argv[1:5]
+from gi.repository import Graphene
+body = open(events, "rb").read()
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def log_message(self, *a): pass
+srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+sys.argv = [db, "--url", "http://127.0.0.1:%d/" % srv.server_address[1], "--projects-url", feed, "--view", "projects"]
+if sink:  # a sink that holds the POST, so the flipped switch is still shown when it is looked at
+    class Slow(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            threading.Event().wait(5)
+        def log_message(self, *a): pass
+    slow = http.server.HTTPServer(("127.0.0.1", 0), Slow)
+    threading.Thread(target=slow.serve_forever, daemon=True).start()
+    sys.argv += ["--answer-url", "http://127.0.0.1:%d/answers" % slow.server_address[1]]
+loader = importlib.machinery.SourceFileLoader("po_dashboard", db)
+mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("po_dashboard", loader))
+loader.exec_module(mod)
+n = {"t": 0}
+def walk(w):
+    yield w
+    c = w.get_first_child()
+    while c:
+        yield from walk(c)
+        c = c.get_next_sibling()
+def nodes():
+    return [x for w in Gtk.Window.list_toplevels() for x in walk(w)]
+def line_of(name):
+    for child in (x for x in nodes() if isinstance(x, Gtk.FlowBoxChild) and getattr(x, "project_name", None) == name):
+        return next((x for x in walk(child) if x.has_css_class("po-switch-line")), None)
+def out(*a):
+    print(*a); sys.stdout.flush()
+def tick():
+    n["t"] += 1
+    lines = [x for x in nodes() if isinstance(x, Gtk.Box) and x.has_css_class("po-switch-line")]
+    if len(lines) < 3 or lines[0].get_height() == 0:
+        if n["t"] > 100:
+            out("no switch lines"); os._exit(1)
+        return True
+    sizes = [(x.get_width(), x.get_height()) for x in lines]
+    out("sizes", "ok" if all(w >= 44 and h >= 44 for w, h in sizes) else sizes)
+    texts = [[y.get_label() for y in walk(x) if isinstance(y, Gtk.Label) and y.get_mapped()] for x in lines]
+    out("reason", "inline" if all("read-only: no answer URL" in t for t in texts) else "none" if not any("read-only: no answer URL" in t for t in texts) else texts)
+    if not sink:
+        os._exit(0)
+    harbor = line_of("harbor")
+    word = next(y for y in walk(harbor) if isinstance(y, Gtk.Label) and y.get_label() == "off")
+    _ok, pt = word.compute_point(harbor, Graphene.Point())
+    g = next(c for c in [harbor.observe_controllers().get_item(i) for i in range(harbor.observe_controllers().get_n_items())] if isinstance(c, Gtk.GestureClick))
+    g.emit("released", 1, pt.x + 2, pt.y + 2)
+    GLib.timeout_add(300, after)
+    return False
+def after():
+    harbor = line_of("harbor")
+    sw = next(y for y in walk(harbor) if isinstance(y, Gtk.Switch))
+    stack = next(x for x in nodes() if isinstance(x, Gtk.Stack) and x.get_child_by_name("screen"))
+    out("flip", "on" if sw.get_active() else "off", stack.get_visible_child_name())
+    os._exit(0)
+GLib.timeout_add(100, tick)
+mod.main()
+PY
+			)
+			if [[ -n $_sink ]]; then
+				[[ $out == *"sizes ok"* ]] && ok "v0.139 po-dashboard: each GTK switch line is a click target of at least 44x44 px" || bad "v0.139 GTK switch target" "$out"
+				[[ $out == *"reason none"* && $out == *"flip on overview"* ]] &&
+					ok "v0.139 po-dashboard: a click on the switch's word flips the GTK switch and leaves the overview open; no reason shown with a sink" ||
+					bad "v0.139 GTK switch line click" "$out"
+			else
+				[[ $out == *"sizes ok"* && $out == *"reason inline"* ]] &&
+					ok "v0.139 po-dashboard: without a sink the GTK card says read-only: no answer URL next to the switch" ||
+					bad "v0.139 GTK disabled reason inline" "$out"
+			fi
+		done
+		# v0.140: the GTK Release button: one per card, off with its reason at N = 0, on for an inactive project; its
+		# dialog's title carries N and the last release; Release posts one release-request body and the card says sent.
+		python3 -c 'import json, sys
+json.dump([{"project": "orchard", "release": "release-23", "active": False, "last_event": None, "items": [
+    {"item": "v1", "status": "DONE", "released": True}, {"item": "v2", "status": "DONE"}, {"item": "v3", "status": "DONE"}]},
+    {"project": "grove", "release": "release-23", "last_event": None, "items": [{"item": "v1", "status": "DONE", "released": True}]}],
+    open(sys.argv[1], "w"))' "$TMP/v140-projects.json"
+		# helper
+		out=$(timeout 60 python3 -I - "$DB" "$SV/events.json" "$TMP/v140-projects.json" 2>/dev/null <<'PY'
+import http.server, importlib.machinery, importlib.util, json, os, sys, threading
+sys.dont_write_bytecode = True
+import gi
+gi.require_version("Gtk", "4.0")
+from gi.repository import GLib, Gtk
+db, events, feed = sys.argv[1:4]
+body = open(events, "rb").read()
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def log_message(self, *a): pass
+srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+seen = []
+class Sink(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        seen.append(json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0)))))
+        self.send_response(201); self.send_header("Content-Length", "0"); self.end_headers()
+    def log_message(self, *a): pass
+sink = http.server.HTTPServer(("127.0.0.1", 0), Sink)
+threading.Thread(target=sink.serve_forever, daemon=True).start()
+sys.argv = [db, "--url", "http://127.0.0.1:%d/" % srv.server_address[1], "--projects-url", feed, "--view", "projects",
+            "--answer-url", "http://127.0.0.1:%d/answers" % sink.server_address[1]]
+loader = importlib.machinery.SourceFileLoader("po_dashboard", db)
+mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("po_dashboard", loader))
+loader.exec_module(mod)
+n = {"t": 0}
+def walk(w):
+    yield w
+    c = w.get_first_child()
+    while c:
+        yield from walk(c)
+        c = c.get_next_sibling()
+def nodes():
+    return [x for w in Gtk.Window.list_toplevels() for x in walk(w)]
+def card(name):
+    return next((x for x in nodes() if isinstance(x, Gtk.FlowBoxChild) and getattr(x, "project_name", None) == name), None)
+def button(w, label):
+    return next((y for y in walk(w) if isinstance(y, Gtk.Button) and y.get_label() == label and y.get_mapped()), None)
+def labels(w):
+    return [y.get_label() for y in walk(w) if isinstance(y, Gtk.Label) and y.get_mapped()]
+def out(*a):
+    print(*a); sys.stdout.flush()
+def tick():
+    n["t"] += 1
+    o, g = card("orchard"), card("grove")
+    if o is None or g is None or button(o, "Release") is None or button(o, "Release").get_height() == 0:
+        if n["t"] > 100:
+            out("no release buttons"); os._exit(1)
+        return True
+    ob, gb = button(o, "Release"), button(g, "Release")
+    tall = ob.compute_bounds(ob.get_parent())[1].get_height()  # the allocation, padding and border included
+    out("buttons", "ok" if ob.get_sensitive() and not gb.get_sensitive() and tall >= 44 else (ob.get_sensitive(), gb.get_sensitive(), tall))
+    out("reason", "inline" if "nothing to release: no DONE item since release-23" in labels(g) else labels(g))
+    ob.emit("clicked")
+    GLib.timeout_add(300, dialog)
+    return False
+def dialog():
+    dlg = next((w for w in Gtk.Window.list_toplevels() if w.get_title() == "Release orchard"), None)
+    if dlg is None:
+        out("no dialog"); os._exit(1)
+    out("title", "ok" if "Release orchard: 2 DONE items since release-23" in labels(dlg) else labels(dlg))
+    view = next(y for y in walk(dlg) if isinstance(y, Gtk.TextView))
+    view.get_buffer().set_text("line one\nline two")
+    button(dlg, "Release").emit("clicked")
+    GLib.timeout_add(1500, after)
+    return False
+def after():
+    stack = next(x for x in nodes() if isinstance(x, Gtk.Stack) and x.get_child_by_name("screen"))
+    gone = not any(w.get_title() == "Release orchard" and w.get_visible() for w in Gtk.Window.list_toplevels())
+    b = seen[0] if len(seen) == 1 else {}
+    out("post", "ok" if b.get("kind") == "release-request" and b.get("project") == "orchard" and b.get("note") == "line one\nline two" else seen)
+    out("after", "ok" if gone and "release asked · sent" in labels(card("orchard")) and stack.get_visible_child_name() == "overview"
+        else (gone, labels(card("orchard")), stack.get_visible_child_name()))
+    os._exit(0)
+GLib.timeout_add(100, tick)
+mod.main()
+PY
+		)
+		[[ $out == *"buttons ok"* && $out == *"reason inline"* ]] &&
+			ok "v0.140 po-dashboard: each GTK card has a 44 px Release button, on for an inactive project with DONE items, off at N = 0 saying why" ||
+			bad "v0.140 GTK release button" "$out"
+		[[ $out == *"title ok"* ]] && ok "v0.140 po-dashboard: the GTK Release dialog's title carries N and the last release" || bad "v0.140 GTK release dialog title" "$out"
+		[[ $out == *"post ok"* && $out == *"after ok"* ]] &&
+			ok "v0.140 po-dashboard: the GTK dialog's Release posts one release-request with the note, closes, and the card says release asked" ||
+			bad "v0.140 GTK release post" "$out"
 		# v0.109: the errored project's card is greyed (po-errored) and says `feed error`; the others do not (the example feed's Projects screenshot above shows it).
 		# helper
 		out=$(timeout 60 python3 -I - "$DB" "$SV/events.json" "$(dirname "$PO")/../examples/projects-feed.json" 2>/dev/null <<'PY'
@@ -5271,6 +5843,96 @@ PY
 			saved-file) m="the saved filter file is {actions: true, decisions: true}" ;;
 			esac
 			grep -qx "PASS $t" <<<"$out" && ok "po-dashboard toggle: $m" || bad "dashboard toggle $t" "$out"
+		done
+		# v0.142: the window itself: one panel per list with flat rows, usage once in the Team header, the Reports header,
+		# the project screen on DOING newest first with the same small buttons as every other control.
+		printf '[{"agent":"ada","state":"WORKING","now":"1.4","owns":["1.4"],"usage":{"five_hour":0.22,"seven_day":0.64}},{"agent":"bo","state":"idle 3h","owns":[],"usage":{"five_hour":0.22,"seven_day":0.64}},{"agent":"cy","state":"idle 1h","owns":[]}]\n' >"$TMP/v142-team.json"
+		# helper
+		out=$(DBUS_SESSION_BUS_ADDRESS=disabled: timeout 90 python3 -I - "$DB" "$SV/events.json" "$TMP/v142-team.json" "$(dirname "$PO")/../examples/projects-feed.json" 2>/dev/null <<'PY'
+import gc, http.server, importlib.machinery, importlib.util, os, sys, threading
+sys.dont_write_bytecode = True
+import gi
+gi.require_version("Gtk", "4.0")
+from gi.repository import GLib, Gtk
+db, events, team, projects = sys.argv[1:5]
+body = open(events, "rb").read()
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def log_message(self, *a): pass
+srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+sys.argv = [db, "--url", "http://127.0.0.1:%d/" % srv.server_address[1], "--team-url", team, "--projects-url", projects, "--view", "team", "--no-memory-log"]
+loader = importlib.machinery.SourceFileLoader("po_dashboard", db)
+mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("po_dashboard", loader))
+loader.exec_module(mod)
+def walk(w):
+    yield w
+    c = w.get_first_child()
+    while c:
+        yield from walk(c)
+        c = c.get_next_sibling()
+def kids(box):
+    out, c = [], box.get_first_child()
+    while c:
+        out.append(c); c = c.get_next_sibling()
+    return out
+def say(name, cond, detail=""):
+    print(("PASS " if cond else "FAIL ") + name + ("" if cond else " " + repr(detail)))
+res = {"n": 0}
+def finish(code):
+    sys.stdout.flush(); os._exit(code)
+def tick():
+    res["n"] += 1
+    win = next((o for o in gc.get_objects() if type(o).__name__ == "Dashboard" and hasattr(o, "team_list")), None)
+    if win is not None and win.team and win.events and win.projects and kids(win.list):
+        GLib.timeout_add(300, run, win)
+        return False
+    if res["n"] > 200:
+        print("FAIL no data"); finish(1)
+    return True
+def run(win):
+    try:
+        rows = kids(win.team_list) + kids(win.list)
+        say("panels", all(b.has_css_class("po-panel") for b in (win.list, win.team_list, win.decisions_list)))
+        say("flat-rows", rows and all(r.has_css_class("po-row") for r in rows), [r.get_css_classes() for r in rows[:3]])
+        texts = [n.get_label() for n in walk(win.team_list) if isinstance(n, Gtk.Label)]
+        say("usage-once", win.status.get_label() == "3 agents · subscription 5h 22% · 7d 64%" and not any("22%" in t for t in texts), (win.status.get_label(), texts))
+        say("tab-selected", win.view_buttons["team"].get_active() and win.view_buttons["team"].has_css_class("po-view"))
+        win.view_buttons["events"].set_active(True)
+        win.reports_button.set_active(True)
+        st = win.status.get_label()
+        say("reports-header", win.title_label.get_label() == "Reports" and st.startswith("7 d · as of ") and "events" not in st, (win.title_label.get_label(), st))
+        win.reports_button.set_active(False)
+        say("events-header", win.title_label.get_label() == "Gate events", win.title_label.get_label())
+        win.view_buttons["projects"].set_active(True)
+        win.open_project(win.projects[0]["project"])
+        toggles = [n for n in walk(win.pscreen) if isinstance(n, Gtk.ToggleButton)]
+        on = [t.get_label() for t in toggles if t.get_active()]
+        say("screen-doing", len(on) == 1 and on[0].startswith("DOING "), on)
+        say("screen-buttons", toggles and all(t.has_css_class("po-small") for t in toggles), [t.get_css_classes() for t in toggles])
+        panels = [n for n in walk(win.pscreen) if isinstance(n, Gtk.Box) and n.has_css_class("po-panel")]
+        say("screen-panel", len(panels) == 1 and all(r.has_css_class("po-row") for r in kids(panels[0])), len(panels))
+    except Exception as e:
+        print("FAIL error %r" % (e,))
+    finish(0)
+GLib.timeout_add(100, tick)
+mod.main()
+PY
+		)
+		for t in panels flat-rows usage-once tab-selected reports-header events-header screen-doing screen-buttons screen-panel; do
+			case $t in
+			panels) m="Events, Team and Decisions each draw one raised panel (po-panel)" ;;
+			flat-rows) m="the Team and Events lines inside it are flat rows (po-row), not cards of their own" ;;
+			usage-once) m="a usage every agent shares is in the Team header once, on no line" ;;
+			tab-selected) m="the selected view tab is checked (its accent fill is the CSS's)" ;;
+			reports-header) m="Reports says Reports over 7 d · as of <time>, not the Events count" ;;
+			events-header) m="Reports off gives the Gate events title back" ;;
+			screen-doing) m="a project screen opens on DOING" ;;
+			screen-buttons) m="the project screen's filter buttons are the small po buttons, not stock GTK" ;;
+			screen-panel) m="the project screen's items are flat rows in one panel" ;;
+			esac
+			grep -qx "PASS $t" <<<"$out" && ok "po-dashboard v0.142: $m" || bad "dashboard v0.142 $t" "$out"
 		done
 			[[ -s $TMP/shot.png && -s $TMP/shot-decisions.png && -s $TMP/shot-team.png && -s $TMP/shot-reports.png ]] && ok "po-dashboard opens, loads events and saves a screenshot, also in the Decisions, Team (LIMIT and usage rows) and Reports views" || bad "dashboard ui smoke"
 	else
@@ -5789,6 +6451,28 @@ ur commit -qam 'rows reduced'
 out=$(urel 2>&1)
 [[ $out == $'release: release-2\n1.0' ]] && ok "released: a non-DONE row is never listed, and a DONE row that is gone from the backlog is not listed" || bad "released non-done" "$out"
 
+# ---- po released: an untagged heading item in specs_dir by its heading's last change (v0.140) ----
+HR=$TMP/relrepo-headings
+git init -q -b main "${HR:?}"
+git -C "$HR" config user.name t
+git -C "$HR" config user.email t@example.invalid
+mkdir -p "$HR/docs/backlog"
+printf '%s' "$GOOD_MANIFEST" >"$HR/po.toml"
+printf '# Backlog\n\n| Item | Title | Status | Spec |\n|---|---|---|---|\n| v0.9 | Row | TODO | backlog/v5.md |\n' >"$HR/docs/BACKLOG.md"
+hr() { git -C "$HR" "$@"; }
+hrel() { "$PO" -C "$HR" --manifest "$TMP/rel.toml" released "$@"; }
+printf '## v5.0 — Five — TODO\n\n## v5.1 — FiveOne — TODO\n\n## v5.10 — FiveTen — TODO\n' >"$HR/docs/backlog/v5.md"
+hr add -A && hr commit -qm base
+printf '## v5.0 — Five — DONE (spike)\n\n## v5.1 — FiveOne — TODO\n\n## v5.10 — FiveTen — DONE\n' >"$HR/docs/backlog/v5.md"
+hr commit -qam 'admin: v5.0 Five DONE (old subject form, title before DONE)'
+hr tag release-1
+printf '## v5.0 — Five — DONE (spike)\n\n## v5.1 — FiveOne — DONE\n\n## v5.10 — FiveTen — DONE\n' >"$HR/docs/backlog/v5.md"
+hr commit -qam 'backlog: v5.1 closed'
+out=$(hrel --json 2>&1)
+[[ $out == '{"source":"tag","release":"release-1","released":["5.0","5.10"]}' ]] &&
+	ok "released: an untagged DONE heading in specs_dir with no admin: <v> DONE commit is judged by its heading's last change; 5.1 done after the release is not released and does not match 5.10" ||
+	bad "released headings" "$out"
+
 # po status without python3 fails clearly and leaves no temp dir (v0.99)
 NOPY=$TMP/nopy-bin
 NOPYTMP=$TMP/nopy-tmp
@@ -5800,6 +6484,122 @@ out=$(PATH=$NOPY TMPDIR=$NOPYTMP "$BASH" "$PO" -C "$RL" --manifest "$TMP/rel.tom
 rc=$?
 [[ $rc -ne 0 && $out == *python3* && $(printf '%s\n' "$out" | wc -l) -eq 1 && -z $(ls -A "$NOPYTMP") ]] &&
 	ok "status: no python3 on PATH is a one-line error naming python3 and leaves no temp dir" || bad "status no python3" "rc=$rc out=$out left=$(ls -A "$NOPYTMP")"
+
+# ---- po lint-founding (item AU) ---------------------------------------------
+LF=$TMP/lintf
+mkdir -p "$LF/docs/specs"
+git init -q -b main "$LF"
+git -C "$LF" config user.name t
+git -C "$LF" config user.email t@example.invalid
+cat >"$LF/po.toml" <<'TOML'
+[versioning]
+tag = "v{version}"
+
+[layout]
+backlog = "docs/BACKLOG.md"
+specs_dir = "docs/specs"
+worktrees = ".wt"
+branch = "item-v{version}"
+
+[project]
+name = "lf"
+
+[ready]
+file = "ready.jsonl"
+
+[[team.agent]]
+name = "ada"
+
+[[team.agent]]
+name = "bo"
+TOML
+lf_clean() {
+	cat >"$LF/docs/BACKLOG.md" <<'MD'
+# Backlog
+
+| Item | Title | Status |
+|---|---|---|
+| v1.1 | One | DONE |
+| v1.2 | Two | TODO |
+| v1.3 | Three | TODO |
+| v1.4 | Four | HELD |
+MD
+	cat >"$LF/docs/specs/v1.md" <<'MD'
+## v1.1 — One — DONE
+Old.
+## v1.2 — Two — TODO
+Spec two.
+## v1.3 — Three — TODO
+Spec three.
+## v1.4 — Four — HELD
+Spec four.
+MD
+	cat >"$LF/ready.jsonl" <<'JL'
+{"item":"v1.1","title":"One","agents":["ada"]}
+{"item":"v1.2","title":"Two","agents":["ada","bo"]}
+{"item":"v1.3","title":"Three"}
+{"item":"v1.2","title":"Two, corrected","agents":["bo"]}
+{"project":"other","item":"v9.9","agents":["nobody"]}
+JL
+	git -C "$LF" add -A
+	git -C "$LF" commit -qm "lf state"
+}
+lf_clean
+echo ready.jsonl >"$LF/.gitignore"
+out=$("$PO" -C "$LF" lint-founding 2>&1); code=$?
+[[ $code == 0 && -z $out ]] &&
+	ok "lint-founding: a clean backlog, specs and ready file print nothing and exit 0 (a corrected line, DONE history and another project's line are fine)" ||
+	bad "lint-founding clean (exit $code)" "$out"
+
+# 1. missing status
+sed -i 's/^| v1.3 | Three | TODO |$/| v1.3 | Three |  |/; s/^## v1.2 — Two — TODO$/## v1.2 — Two/' "$LF/docs/BACKLOG.md" "$LF/docs/specs/v1.md"
+git -C "$LF" commit -qam "break statuses"
+out=$("$PO" -C "$LF" lint-founding 2>&1); code=$?
+[[ $code == 1 && $out == *'docs/BACKLOG.md:7: v1.3: status '"''"' is missing'* && $out == *'docs/specs/v1.md:3: v1.2: heading has no status segment'* &&
+	$(wc -l <<<"$out") == 2 ]] &&
+	ok "lint-founding: a row with no status and a heading with no status are one finding each, with file:line" ||
+	bad "lint-founding missing status (exit $code)" "$out"
+git -C "$LF" reset -q --hard HEAD~1
+
+# 2. missing spec
+sed -i '/^## v1.3 — Three — TODO$/,/^Spec three.$/d' "$LF/docs/specs/v1.md"
+git -C "$LF" commit -qam "drop spec three"
+out=$("$PO" -C "$LF" lint-founding 2>&1); code=$?
+[[ $code == 1 && $out == 'docs/BACKLOG.md:7: v1.3 (TODO) has no spec section under docs/specs' ]] &&
+	ok "lint-founding: an open item with no spec section is a finding; a DONE one would not be" || bad "lint-founding missing spec (exit $code)" "$out"
+git -C "$LF" reset -q --hard HEAD~1
+
+# 3. ready-file lines
+git -C "$LF" status --short >/dev/null
+cat >"$LF/ready.jsonl" <<'JL'
+{"item":"v1.2","title":"Two","agents":["ada","zed"]}
+{"item":"v1.4","title":"Four","agents":["ada"]}
+{"item":"v1.3","title":"Three","agents":["bo"]}
+{"item":"v1.3","title":"Three","agents":["bo"]}
+{"item":"v8.8","title":"Absent"}
+not json
+JL
+out=$("$PO" -C "$LF" lint-founding 2>&1); code=$?
+[[ $code == 1 && $out == *"ready.jsonl:1: v1.2: unknown agent 'zed'"* && $out == *'ready.jsonl:2: v1.4 is HELD, not TODO'* &&
+	$out == *'ready.jsonl:4: duplicate of line 3'* && $out == *'ready.jsonl:5: v8.8 is not in the backlog'* &&
+	$out == *'ready.jsonl:6: not valid JSON'* && $(wc -l <<<"$out") == 5 ]] &&
+	ok "lint-founding: an unknown agent, a HELD entry, a duplicate line, an absent item and bad JSON are one finding each" ||
+	bad "lint-founding ready findings (exit $code)" "$out"
+out=$("$PO" -C "$LF" lint-founding --ready "$LF/none.jsonl" 2>&1); code=$?
+[[ $code == 1 && $out == *'cannot read the ready file'* ]] &&
+	ok "lint-founding: an unreadable ready file is a finding" || bad "lint-founding unreadable ready (exit $code)" "$out"
+out=$("$PO" -C "$LF" lint-founding --agents zed 2>&1)
+[[ $out != *'unknown agent'* ]] &&
+	ok "lint-founding: --agents adds known names" || bad "lint-founding --agents" "$out"
+sed -i '/^\[ready\]/,/^$/d; /^\[\[team/,$d' "$LF/po.toml"
+out=$("$PO" -C "$LF" lint-founding 2>&1); code=$?
+[[ $code == 0 && -z $out ]] &&
+	ok "lint-founding: with no ready file configured only the backlog is checked" || bad "lint-founding no ready file (exit $code)" "$out"
+LF_BEFORE=$(git -C "$LF" rev-parse HEAD)
+"$PO" -C "$LF" lint-founding >/dev/null 2>&1
+[[ $(git -C "$LF" rev-parse HEAD) == "$LF_BEFORE" ]] &&
+	ok "lint-founding writes nothing" || bad "lint-founding wrote"
+expect "lint-founding: an unknown argument is a usage error" 1 'unknown argument' -- -C "$LF" lint-founding --nope
 
 # ---- private test blocks (absent from a public snapshot) -------------------
 for _t in "$KITROOT"/private/tests.d/*.sh; do

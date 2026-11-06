@@ -1,6 +1,6 @@
 // The web view in a real headless browser (v0.116): a draft survives a reload, Send posts once to the sink and
 // the card shows `sent <time>`, an unreachable sink keeps the draft and shows `not sent: <class>`, and 390 px
-// screenshots of a long-label card. Not part of tests/run.sh (it needs a Chromium); run it by hand:
+// screenshots of a long-label card; v0.139: the Projects card's switch posts once and the badge follows it; v0.140: the Release dialog posts once. Not part of tests/run.sh (it needs a Chromium); run it by hand:
 //   PO_WEB_CHROME=<chrome or chrome-headless-shell> node tests/web-browser.test.js <out dir>
 // It starts, on loopback only, a stub feed server, a stub answer sink (it answers the page's preflight and
 // records every POST), `po serve` with both configured, and the browser with a remote-debugging pipe-free
@@ -36,7 +36,8 @@ function start(cmd, args, re) {
   });
 }
 
-// Feed stub: /decisions.json is examples/decisions-feed.json with the asked times moved to now.
+// Feed stub: /decisions.json is examples/decisions-feed.json with the asked times moved to now; /projects.json is
+// examples/projects-feed.json with `active` set on the first three projects (v0.139) and a fourth without it.
 const FEED_PY = String.raw`
 import http.server, json, sys, datetime
 d = json.load(open(sys.argv[1]))
@@ -44,17 +45,22 @@ now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"
 for c in d:
     if isinstance(c, dict): c["asked_at"] = now
 body = json.dumps(d).encode()
+p = json.load(open(sys.argv[2]))
+for e, a in zip(p, (True, False, True)): e["active"] = a
+p.append(dict(p[0], project="grove")); p[-1].pop("active")
+pbody = json.dumps(p).encode()
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200 if self.path.startswith("/decisions.json") else 404)
-        self.send_header("Content-Type", "application/json"); self.send_header("ETag", '"1"'); self.end_headers()
-        self.wfile.write(body)
+        proj = self.path.startswith("/projects.json")
+        self.send_response(200 if self.path.startswith("/decisions.json") or proj else 404)
+        self.send_header("Content-Type", "application/json"); self.send_header("ETag", '"2"' if proj else '"1"'); self.end_headers()
+        self.wfile.write(pbody if proj else body)
     def log_message(self, *a): pass
 s = http.server.HTTPServer(("127.0.0.1", 0), H); print("PORT", s.server_address[1], flush=True); s.serve_forever()
 `;
 // Sink stub: the CORS answers of the design (2.5), every POST appended as one JSON line to argv[1].
 const SINK_PY = String.raw`
-import http.server, json, sys
+import http.server, json, sys, time
 class H(http.server.BaseHTTPRequestHandler):
     def cors(self):
         o = self.headers.get("Origin")
@@ -68,7 +74,10 @@ class H(http.server.BaseHTTPRequestHandler):
         rec = {"auth": self.headers.get("Authorization"), "type": self.headers.get("Content-Type"),
                "body": json.loads(self.rfile.read(n))}
         with open(sys.argv[1], "a") as f: f.write(json.dumps(rec) + "\n")
-        self.send_response(201); self.cors(); self.send_header("Access-Control-Expose-Headers", "X-Reason")
+        refuse = rec["body"].get("project") == "meadow"
+        if rec["body"].get("project") == "orchard": time.sleep(4)  # v0.139: holds the switch in its switching state
+        self.send_response(404 if refuse else 201); self.cors(); self.send_header("Access-Control-Expose-Headers", "X-Reason")
+        if refuse: self.send_header("X-Reason", "unknown project")
         self.send_header("Content-Length", "0"); self.end_headers()
     def log_message(self, *a): pass
 s = http.server.HTTPServer(("127.0.0.1", 0), H); print("PORT", s.server_address[1], flush=True); s.serve_forever()
@@ -100,9 +109,11 @@ async function cdp(port) {
     for (let t = 0; t < (ms || 8000); t += 100) { if (await evaluate(expr)) return true; await sleep(100); }
     return false;
   };
-  const shot = async (file) => {
+  const shot = async (file, width) => {
+    const w = width || 390;
+    if (w !== 390) { await send("Emulation.setDeviceMetricsOverride", { width: w, height: 844, deviceScaleFactor: 1, mobile: false }); await sleep(300); }
     const h = await evaluate("Math.ceil(document.documentElement.scrollHeight)");
-    await send("Emulation.setDeviceMetricsOverride", { width: 390, height: h, deviceScaleFactor: 1, mobile: true });
+    await send("Emulation.setDeviceMetricsOverride", { width: w, height: h, deviceScaleFactor: 1, mobile: w === 390 });
     const r = await send("Page.captureScreenshot", { format: "png" });
     fs.writeFileSync(file, Buffer.from(r.result.data, "base64"));
     await send("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
@@ -118,10 +129,12 @@ const cardOf = (title) => `[...document.querySelectorAll("article.card")].find((
 (async () => {
   const posts = path.join(OUT, "sink-posts.jsonl");
   fs.rmSync(posts, { force: true });
-  const feed = await start("python3", ["-I", "-c", FEED_PY, path.join(ROOT, "examples", "decisions-feed.json")], /PORT (\d+)/);
+  const feed = await start("python3", ["-I", "-c", FEED_PY, path.join(ROOT, "examples", "decisions-feed.json"),
+    path.join(ROOT, "examples", "projects-feed.json")], /PORT (\d+)/);
   const sink = await start("python3", ["-I", "-c", SINK_PY, posts], /PORT (\d+)/);
   const serve = await start("python3", ["-B", path.join(ROOT, "lib", "po", "serve.py"), "--repo", ROOT, "--port", "0",
     "--decisions-url", "http://127.0.0.1:" + feed.port + "/decisions.json",
+    "--projects-url", "http://127.0.0.1:" + feed.port + "/projects.json",
     "--answer-url", "http://127.0.0.1:" + sink.port + "/answers"], /listening on http:\/\/127\.0\.0\.1:(\d+)\//);
   const profile = fs.mkdtempSync(path.join(OUT, "profile-"));
   const chrome = await start(CHROME, ["--headless", "--no-sandbox", "--disable-gpu", "--no-first-run", "--remote-debugging-port=0",
@@ -140,7 +153,12 @@ const cardOf = (title) => `[...document.querySelectorAll("article.card")].find((
     await b.send("Page.reload");
     await b.until("document.querySelectorAll('article.card').length > 0");
     check("web-browser: the header says the token is set and never shows it",
-      await b.evaluate(`document.getElementById("settings-toggle").textContent === "Device token set" && !document.body.innerText.includes(${JSON.stringify(TOKEN)})`));
+      await b.evaluate(`document.getElementById("settings-toggle").textContent === "device token set \u00b7 change" && !document.body.innerText.includes(${JSON.stringify(TOKEN)})`));
+    // v0.142 (18): once set it is a small settings link (smaller text than the view tabs, no button frame), still 44 px tall
+    const link = await b.evaluate(`(() => { const t = document.getElementById("settings-toggle"), v = document.querySelector("#views button");
+      const s = getComputedStyle(t); return [t.classList.contains("link"), parseFloat(s.fontSize) < parseFloat(getComputedStyle(v).fontSize),
+      s.borderTopWidth, t.getBoundingClientRect().height]; })()`);
+    check("web-browser: v0.142 a set token is a small settings link, not a full-size button", link[0] && link[1] && link[2] === "0px" && link[3] >= 44, JSON.stringify(link));
 
     // a draft: pick a radio and type a note, then reload
     await b.evaluate(expand("Accept the new import screen"));
@@ -184,6 +202,105 @@ const cardOf = (title) => `[...document.querySelectorAll("article.card")].find((
     check("web-browser: after a sent answer the draft is gone from storage",
       await b.evaluate(`!("ask-0707" in JSON.parse(localStorage.getItem("po-web:drafts") || "{}"))`));
     await b.shot(path.join(OUT, "sent-390.png"));
+
+    // v0.139: the Projects card's switch
+    const projCard = (name) => `[...document.querySelectorAll("article.card")].find((x) => x.querySelector("strong") && x.querySelector("strong").textContent === ${JSON.stringify(name)})`;
+    await b.evaluate(`location.hash = "#projects"; true`);
+    await b.until(`!!(${projCard("harbor")})`);
+    const pv = await b.evaluate(`(() => {
+      const card = (n) => [...document.querySelectorAll("article.card")].find((x) => x.querySelector("strong") && x.querySelector("strong").textContent === n);
+      const sw = (n) => card(n).querySelector("button.switch");
+      const badge = (n) => (card(n).querySelector(".badge") || {}).textContent || "";
+      return { harborBadge: badge("harbor"), orchardBadge: badge("orchard"), groveSwitch: !!sw("grove"), groveBadge: badge("grove"),
+               harborChecked: sw("harbor").getAttribute("aria-checked"), harborRole: sw("harbor").getAttribute("role"),
+               harborWords: sw("harbor").textContent, harborH: Math.round(sw("harbor").getBoundingClientRect().height),
+               scrollW: document.documentElement.scrollWidth }; })()`);
+    check("web-browser: v0.139 an inactive project's card shows the `inactive` badge as text, an active one none",
+      pv.harborBadge === "inactive" && pv.orchardBadge === "", JSON.stringify(pv));
+    check("web-browser: v0.139 the switch is a role=switch button, aria-checked false and `off` in words for an inactive project, 44 px tall",
+      pv.harborRole === "switch" && pv.harborChecked === "false" && pv.harborWords === "off" && pv.harborH >= 44, JSON.stringify(pv));
+    check("web-browser: v0.139 a feed entry without `active` renders with neither switch nor badge", pv.groveSwitch === false && pv.groveBadge === "", JSON.stringify(pv));
+    check("web-browser: v0.139 no sideways scroll at 390 px on the Projects view", pv.scrollW <= 390, pv.scrollW);
+    await b.shot(path.join(OUT, "projects-light-390.png"));
+    await b.shot(path.join(OUT, "projects-light-1280.png"), 1280);
+    const nPosts = fs.readFileSync(posts, "utf8").trim().split("\n").length;
+    await b.evaluate(`${projCard("harbor")}.querySelector("button.switch").click(), true`);
+    const switched = await b.until(`(() => { const c = ${projCard("harbor")}; const s = c.querySelector("button.switch");
+      return s.getAttribute("aria-checked") === "true" && !s.disabled && !c.querySelector(".badge") && s.textContent === "active"; })()`);
+    const swPosts = fs.readFileSync(posts, "utf8").trim().split("\n").map(JSON.parse).slice(nPosts);
+    check("web-browser: v0.139 a tap posts one project-active body with the device token; the switch shows on and the badge goes",
+      switched && swPosts.length === 1 && swPosts[0].auth === "Bearer " + TOKEN && swPosts[0].body.kind === "project-active"
+      && swPosts[0].body.project === "harbor" && swPosts[0].body.active === true && /^[0-9a-f-]{36}$/.test(swPosts[0].body.answer_id), JSON.stringify(swPosts));
+    await sleep(11000);  // a poll: the feed still says false, the switch keeps the new position
+    check("web-browser: v0.139 the switched card keeps its new position across a feed refresh that does not show it yet",
+      await b.evaluate(`${projCard("harbor")}.querySelector("button.switch").getAttribute("aria-checked") === "true"`));
+    await b.evaluate(`${projCard("meadow")}.querySelector("button.switch").click(), true`);
+    const refused = await b.until(`(() => { const c = ${projCard("meadow")}; return c.textContent.includes("not switched: unknown project")
+      && c.querySelector("button.switch").getAttribute("aria-checked") === "true"; })()`);
+    check("web-browser: v0.139 a refused switch says `not switched: unknown project` and shows the feed's position again", refused);
+    await b.shot(path.join(OUT, "projects-switched-light-390.png"));
+    await b.evaluate(`${projCard("orchard")}.querySelector("button.switch").click(), true`);
+    const switching = await b.until(`(() => { const c = ${projCard("orchard")}; const s = c.querySelector("button.switch");
+      return s.disabled && s.getAttribute("aria-checked") === "false" && c.textContent.includes("switching\u2026"); })()`, 3000);
+    check("web-browser: v0.139 while its POST is out the switch shows the new position, is off and says switching…", switching);
+    await b.shot(path.join(OUT, "projects-switching-light-390.png"));
+    await b.until(`!${projCard("orchard")}.querySelector("button.switch").disabled`, 8000);
+    await b.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "dark" }] });
+    await sleep(300);
+    await b.shot(path.join(OUT, "projects-dark-390.png"));
+    await b.shot(path.join(OUT, "projects-dark-1280.png"), 1280);
+    await b.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "light" }] });
+    // v0.140: the Release button and its confirm dialog
+    const rv = await b.evaluate(`(() => {
+      const card = (n) => [...document.querySelectorAll("article.card")].find((x) => x.querySelector("strong") && x.querySelector("strong").textContent === n);
+      const rb = (n) => card(n).querySelector("button.release");
+      return { orchardOn: !rb("orchard").disabled, harborOff: rb("harbor").disabled,
+               harborWhy: card("harbor").querySelector(".release-row").textContent,
+               h: Math.round(rb("orchard").getBoundingClientRect().height), scrollW: document.documentElement.scrollWidth }; })()`);
+    check("web-browser: v0.140 every card has a 44 px Release button, off at N = 0 saying why",
+      rv.orchardOn && rv.harborOff && rv.harborWhy.includes("nothing to release: no DONE item since the start (no release yet)") && rv.h >= 44 && rv.scrollW <= 390, JSON.stringify(rv));
+    const nPosts140 = fs.readFileSync(posts, "utf8").trim().split("\n").length;
+    await b.evaluate(`${projCard("orchard")}.querySelector("button.release").click(), true`);
+    const dlgOpen = await b.until(`(() => { const d = document.getElementById("release-dialog"); return !!d && d.open
+      && d.querySelector(".release-title").textContent === "Release orchard: 1 DONE item since release-3"; })()`, 3000);
+    check("web-browser: v0.140 Release opens a modal dialog titled with N and the last release", dlgOpen);
+    await b.evaluate(`(() => { const t = document.querySelector("#release-dialog textarea"); t.value = "line one\\n  line two"; t.dispatchEvent(new Event("input")); return true; })()`);
+    await b.shot(path.join(OUT, "release-dialog-light-390.png"));
+    await b.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "dark" }] });
+    await sleep(300);
+    await b.shot(path.join(OUT, "release-dialog-dark-390.png"));
+    await b.shot(path.join(OUT, "release-dialog-dark-1280.png"), 1280);
+    await b.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "light" }] });
+    await b.evaluate(`[...document.querySelectorAll("#release-dialog button")].find((x) => x.textContent === "Release").click(), true`);
+    const asked = await b.until(`(() => !document.getElementById("release-dialog") && ${projCard("orchard")}.textContent.includes("release asked · sent"))()`, 8000);
+    const rlPosts = fs.readFileSync(posts, "utf8").trim().split("\n").map(JSON.parse).slice(nPosts140);
+    check("web-browser: v0.140 the dialog's Release posts one release-request with the note as typed and the device token; the card says release asked",
+      asked && rlPosts.length === 1 && rlPosts[0].auth === "Bearer " + TOKEN && rlPosts[0].body.kind === "release-request"
+      && rlPosts[0].body.project === "orchard" && rlPosts[0].body.note === "line one\n  line two", JSON.stringify(rlPosts));
+    await b.shot(path.join(OUT, "release-asked-light-390.png"));
+    await b.evaluate(`${projCard("orchard")}.querySelector("button.release").click(), true`);
+    await b.until(`!!document.getElementById("release-dialog")`, 3000);
+    await b.evaluate(`[...document.querySelectorAll("#release-dialog button")].find((x) => x.textContent === "Cancel").click(), true`);
+    check("web-browser: v0.140 Cancel closes the dialog and posts nothing",
+      await b.until(`!document.getElementById("release-dialog")`, 3000) && fs.readFileSync(posts, "utf8").trim().split("\n").length === nPosts140 + 1);
+    await b.evaluate(`${projCard("orchard")}.querySelector("button.release").click(), true`);
+    await b.until(`!!document.getElementById("release-dialog")`, 3000);
+    await b.evaluate(`(() => { const t = document.querySelector("#release-dialog textarea"); t.value = "by keyboard"; t.dispatchEvent(new Event("input"));
+      t.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", ctrlKey: true, bubbles: true, cancelable: true })); return true; })()`);
+    const keyed = await b.until(`!document.getElementById("release-dialog")`, 8000);
+    const kPosts = fs.readFileSync(posts, "utf8").trim().split("\n").map(JSON.parse).slice(nPosts140);
+    check("web-browser: v0.140 Ctrl+Enter in the note posts the release-request like Release and closes the dialog",
+      keyed && kPosts.length === 2 && kPosts[1].auth === "Bearer " + TOKEN && kPosts[1].body.kind === "release-request"
+      && kPosts[1].body.project === "orchard" && kPosts[1].body.note === "by keyboard", JSON.stringify(kPosts));
+    await b.evaluate(`localStorage.removeItem("po-web:device-token"); location.hash = "#projects"; true`);
+    await b.send("Page.reload");
+    await b.until(`!!(${projCard("orchard")})`);
+    check("web-browser: v0.139 without a device token the switch is off and the card says why",
+      await b.evaluate(`(() => { const c = ${projCard("orchard")}; return c.querySelector("button.switch").disabled && c.textContent.includes("set the device token to switch"); })()`));
+    await b.shot(path.join(OUT, "projects-disabled-light-390.png"));
+    await b.evaluate(`localStorage.setItem("po-web:device-token", ${JSON.stringify(TOKEN)}); location.hash = "#decisions"; true`);
+    await b.send("Page.reload");
+    await b.until("document.querySelectorAll('article.card button.head').length > 0");
 
     // the sink goes away: the draft stays and the card says `not sent: <class>`
     sink.p.kill();

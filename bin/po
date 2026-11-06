@@ -14,6 +14,7 @@
 #                           the gate event log, newest first (read-only except --archive-now)
 #   team [--json]   the Team-view feed: roster, state, owned items, free (read-only)
 #   dispatch --plan|--commit  give the ready items to the free eligible agents
+#   lint-founding   do the backlog, the specs and the ready file hold together? (read-only)
 #   serve [--bind <addr>] [--port <n>] read-only HTTP viewer of the gate events
 #   setup list|confirm|record  the setup steps recorded at close, and confirming them
 #   version         the installed po-kit tag (works anywhere)
@@ -59,6 +60,8 @@ PO_LIB="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/po" && pwd)
 . "$PO_LIB/released.sh"
 # shellcheck source=dispatch.sh
 . "$PO_LIB/dispatch.sh"
+# shellcheck source=lint.sh
+. "$PO_LIB/lint.sh"
 # shellcheck source=serve.sh
 . "$PO_LIB/serve.sh"
 # shellcheck source=team.sh
@@ -72,7 +75,7 @@ po_usage() {
 usage: po [-C <repo>] [--manifest <file>] <command> [args]
 
 commands:
-  status [--idle <minutes>]
+  status [--idle <minutes>] [--json]
                     DOING and held items, their branches and worktrees,
                     ahead/behind main, dirty state, latest tag, orphans;
                     each DOING item's idle time (3h12m, or - with no
@@ -127,6 +130,11 @@ commands:
                     an item is skipped; --commit opens each with po open
                     --for <agent> --commit as agent `dispatcher`, then runs
                     the [dispatch] notify command (item, agent, prompt path)
+  lint-founding [--ready <file>] [--project <name>] [--agents <a,b>]
+                    one finding per line (exit 1) for: a backlog row or item
+                    heading without its status, an open item without its spec
+                    section, a ready-file line that is not a TODO item with
+                    known agents or is a duplicate; exit 0 and no output when clean
   serve [--bind <addr>] [--port <n>]
                     a read-only HTTP viewer of the gate events (last 10 at /,
                     all at /all, JSON at /events.json, the archive at /archive.json, the Team feed at /team.json); reads them through
@@ -257,6 +265,7 @@ main() {
 	release) po_cmd_release "$@" ;;
 	released) po_cmd_released "$@" ;;
 	dispatch) po_cmd_dispatch "$@" ;;
+	lint-founding) po_cmd_lint_founding "$@" ;;
 	serve) po_cmd_serve "$@" ;;
 	setup) po_cmd_setup "$@" ;;
 	*) po_usage_die "unknown command '$cmd'" ;;

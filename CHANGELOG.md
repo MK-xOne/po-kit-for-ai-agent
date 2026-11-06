@@ -16,6 +16,143 @@ one row per step or per group of steps.
 
 ## Unreleased
 
+## Release 25 (2026-11-05): dashboard overhaul, project switch and Release button, no bot posts in project channels, release counting
+
+### Setup after install
+
+| # | Machine | Command | Who | Check |
+|---|---|---|---|---|
+| 1 | the build host (private host glue; nothing in the public kit) | add `[release_due]` / `po-kit = 24` to the sweep config (v0.138), run the host glue's `install`, then restart the units it flags `restart needed` (v0.137, v0.144, v0.145) | the session on that host | `install --check` prints every script as current |
+| 2 | the machine that shows the dashboard | install the release package (`pacman -Q` shows the release build), then restart `po-dashboard` (v0.139 to v0.143, v0.146) | the session on that machine | `po-dashboard` shows the Release button on each Projects card |
+
+**Agents:** no bot posts into a project channel or thread any more: a stalled item, a QUIET finding or a BLOCKED ping reaches you as a DM or on the dashboard (v0.144, v0.145); QUIET and OWED-by-dev findings are routed to the second PO, the rest to the first (v0.137). A release request from the Projects page carries a note: put it verbatim in the release's close message and notes (v0.140). **Adopt:** a projects-feed producer sets `active` per project (v0.139); an answer receiver handles `project-active` and `release-request`.
+
+### Heartbeat routing: findings carry a destination (v0.137, 2026-11-05)
+
+- The heartbeat marks each finding with a destination column (`dest=`): QUIET and OWED-by-dev findings go to the second PO, every other finding to the first; one send per destination, the hold after a send kept per destination.
+- **Agents**: none. **Adopt**: none. Setup: run the host glue's `install`.
+
+### No bot posts into a project channel or thread (v0.144, 2026-11-04)
+
+- `swept:` lines, `REPEATED x<n>:` posts and OWED/NO THREAD findings are no longer posted into project channels or threads by a timer: they go to the heartbeat's DM and to the dashboard's state (`projects-feed`), and the heartbeat no longer counts an automated post as OWED.
+- **Agents**: none. **Adopt**: none. Setup: run the host glue's `install` and restart the units it flags.
+
+### Releases by count: RELEASE DUE finding (v0.138, 2026-11-05)
+
+- the heartbeat raises `RELEASE DUE <project>: <N> DONE unreleased >= <threshold>` (key `release:<project>`, 2 h hold) when the DONE rows of the backlog not in `po released --json` reach the project's `[release_due]` threshold in the sweep config (po.toml's manifest check rejects the key). `report-sweep` sweep 3 records it in the state file only (v0.144).
+- **Agents**: none. **Adopt**: none. Setup: add `[release_due]` / `po-kit = 24` to the sweep config, then run the host glue's `install`.
+
+### mk-queue --flag sends FIX? and BLOCKED as DMs (v0.145, 2026-11-04)
+
+- `mk-queue --flag` no longer posts into item threads: the `FIX? — your ask to the owner is not shown` note goes to the asker's DM and the 2 h `BLOCKED — the look card is held` ping to the first PO's DM, signed by the Heartbeat identity, no reply-to, with `Thread root: <id>`. No DM or no identity: error line, nothing posted, dedupe not marked.
+- **Agents**: none. **Adopt**: none. Setup: run the host glue's `install` after v0.144's Heartbeat identity exists.
+
+### Dashboard: an Events card with no item names its project alone (v0.146, 2026-11-04)
+
+- Web `/app/`: an Events card whose item is empty or `-` reads `demo` (All) or nothing (one project), never `demo v-`;
+  the `v` now comes from the same rule as the Team view, so an item already starting with `v` keeps it. The desktop
+  window has no such prefix (its item column shows the value as it is) and is unchanged.
+
+### Projects page: active/inactive switch on each project card (v0.139, 2026-11-04)
+
+- Each Projects card, desktop and web, has a switch when the projects feed carries the new optional `active`
+  boolean; it posts the answer kind `project-active` (`{answer_id, kind, project, active, answered_at, client}`)
+  through the authenticated answer path (same sink, same device token). An inactive project shows a muted
+  `inactive` badge in words. A feed without `active` renders as before (no switch, no badge).
+- **Adopt:** a projects-feed producer sets `active` per project from its project switch file; an answer receiver
+  handles `project-active` (validate the project, remove or append its line, keep every other byte).
+
+### Dashboard: wrong or hidden data (v0.141, 2026-11-04)
+
+- Web `/app/`: an Events card's head shows its newest event's result as a mark and a word (`✔ pass`, `✘ fail`)
+  and its kind; Team no longer prints `on vproject v1.2` (a bare version gets its `v`, a `project vX` value is
+  kept); a greyed Projects card keeps its text colours (no opacity) and says why it is grey.
+- Decisions, both screens: every card ends in an `Open thread` link (desktop: a real link, not URL text), an
+  http(s) URL or a chat app's own `<scheme>://` deep link (a code-running or local scheme never links); the web
+  page sorts like the desktop: Choices, then Actions, then the rest, oldest asked first.
+- Reports: the gate-runs rows share one y top, the largest single agent's bucket (not the busiest bucket of all
+  agents), so small agents are no longer flat lines; cycle time takes its unit from the medians (hours while
+  they are under a day, never `0.0 d`) and ticks its axis at every whole step from 0.
+
+### Dashboard: controls and surfaces (v0.142, 2026-11-04)
+
+- Selected state: a selected view tab, Reports range (24 h / 7 d / 30 d), Show all, Reports, Archive, Actions and the
+  project screen's filter is filled with the accent colour, its text in the accent's own colour (was an inset shadow
+  only, 1.7:1 light and 1.2:1 dark). Every desktop button and every web control has a border at 3:1 against its surface.
+- Desktop lists (events, team, decisions, a project's items) are one raised panel with flat rows and a hairline between
+  them, not a raised card per row. In the dark theme the header, panels, cards and charts have a lighter top edge.
+- Status in words: each project light has its words beside the dot (`active`, `idle 3 h`, `stalled 4 d`, `no events`;
+  `last event 4 d ago` for a project switched off); a stalled DOING item says `stalled` on the project screen and on
+  the web card. The web idle warning names the cause (`idle: its 2 items wait on someone else`, or `owns 3 items and
+  works on none`) and no longer shows on an agent at its usage limit.
+- Team: a usage every agent shares (one subscription) is said once in the header, not on every line. One time format
+  with the zone on both screens: `LIMIT until 7:00 PM EST Nov 30` (desktop was `2026-11-30 19:00`; the web page said it
+  twice in two formats).
+- Web: once a device token is set, `Set device token` becomes a small `device token set · change` link beside the views.
+- Project screen: opens on DOING, newest first (was All, oldest first); its Back, filter and Release buttons are the
+  window's own buttons, not stock GTK. Reports: the header reads `Reports` over `7 d · as of 6:42 AM EST`, not the
+  Events count.
+
+### Dashboard: Reports redesign (v0.143, 2026-11-04)
+
+- Reports opens with four numbers: gate runs, fail rate, first-try rate and items closed, each with the previous
+  period beside it in words and an arrow (`▲ up 24 from 188, previous 7 d`; `no previous period` when there is none).
+- One fail-rate line (failed runs over all runs, a gap where no run happened, the previous period dashed) replaces the
+  per-agent gate-run rows; the page is about a third shorter.
+- Every chart's title states its finding (`First-try rate fell to 61 %`), and a line at its foot gives the previous
+  period, the source and `as of`; the text alternative carries all of them.
+- First-try: agents under 5 items are not ranked (below a muted line, hatched), a dashed team average runs through the
+  rows, each agent shows its previous rate; with a Team feed only the roster's agents count.
+- Colours: five colour-blind-safe project hues stepped in lightness (9 L* apart or more, so greyscale reads), a fixed
+  colour per project whatever the range, failed legs in shades of the fail colour (at most three named, the rest
+  `other`), the cycle-time box neutral; each bar's biggest segment carries its count and the legend each share.
+- **Adopt:** nothing to configure. With an archive URL the dashboard now fetches the archive for 7 d too (for its
+  previous period); without one, 7 d says `no previous period`.
+
+### Projects page: Release button on each project card (v0.140, 2026-11-04)
+
+- Each Projects card, desktop and web, has a `Release` button: a confirm dialog `Release <project>: N DONE items
+  since <last release>` (N: DONE rows the feed does not mark `released`) with an optional note (2000 characters at
+  most), Cancel and Release (Ctrl+Enter in the note sends it too). Release posts the answer kind `release-request`
+  (`{answer_id, kind, project, note, answered_at, client}`) through the authenticated answer path (same sink, same
+  device token). Off at N = 0 and without a sink, saying why; on for an inactive project; one POST at a time, a
+  Retry re-posts the same `answer_id`. It only asks: the kit never tags, pushes or runs `po release` from it.
+- `po released`: an untagged DONE item kept as a `## <tag> — ... — DONE` heading in `specs_dir`, with no
+  `admin: <v> DONE` commit, is judged by the newest commit that changed that heading (before: only a backlog table
+  row was looked for, so such items never counted as released and inflated N).
+- **Agents:** the PO carries a release request's note verbatim into the release's close message and release notes.
+  **Adopt:** an answer receiver handles `release-request` (validate the project, cap the note, post the ask in the
+  project's own channel for the PO).
+
+## Release 24 (2026-11-03): memory write-back at close, founding lint, idle time on the dashboard
+
+### Setup after install
+
+| # | Machine | Command | Who | Check |
+|---|---|---|---|---|
+| 1 | the build host (private host glue; nothing in the public kit) | `install the host glue && systemctl --user daemon-reload && systemctl --user enable --now` the timers it added (v0.136), restart the units it flags `restart needed` (v0.126, v0.127), restart the sessions whose prompts it rebuilt (v0.120, v0.121, v0.122) | the session on that host | `install --check` prints nothing and exits 0; `systemctl --user list-timers` lists each added timer with a next run |
+| 2 | the machine that shows the dashboard | install the release package (`pacman -Q` shows the release build), then restart `po-dashboard` (v0.130 idle time) | the session on that machine | `po-dashboard --check` prints one line per project |
+
+**Agents:** write a `Memory:` line in every close body when `[close] memory = true` (v0.129); run `po lint-founding` after a founding or spec commit (v0.124); `po status --json` carries `idle_hours` per DOING item (v0.130). **Adopt:** `[close] memory = true` in `po.toml` (v0.129); a projects-feed producer copies `idle_hours` into each DOING item (v0.130). Items: v0.117-v0.122, v0.124-v0.127, v0.129, v0.130, v0.133, v0.135, v0.136 (the entries below; every item but v0.124, v0.129 and v0.130 touches only private files: host-glue upkeep, with no public notes).
+
+### Memory write-back prompt at close and failed stamp (v0.129, 2026-11-03)
+
+With `[close] memory = true`, `po close --commit` refuses without a `Memory:` line in the close body (a memory id, a proposed note, or "nothing new learned"), and the dry run prints a plan line for it. A failed `po stamp` prints the same prompt on stderr after "no evidence written"; its exit code and evidence block are unchanged.
+
+**Agents:** write a `Memory:` line in every close body; on a failed stamp, record what the failure taught. **Adopt:** `[close] memory = true` in `po.toml`; absent, close and stamp behave as before.
+
+### po lint-founding and the refused-entry ping (v0.124, 2026-11-03)
+
+`po lint-founding` checks, against main, that every backlog row and item heading carries its status, that every open item has its spec heading, and that every line of the ready file names an existing item that is not held, with known agents and no repeated line. One finding per line, exit 1 when there are any. Private host glue also gained a refused-entry ping and a post-commit lint hook.
+
+**Agents:** run `po lint-founding` after a founding or spec commit and fix what it lists. **Adopt:** nothing; `[ready] file` and `[dispatch] order` are read when set, `--ready`, `--project` and `--agents` override them.
+
+### Idle time per DOING item on the dashboard (v0.130, 2026-11-03)
+
+`po status --json` prints the DOING items with `idle_hours` (the idle time `po status` shows, in whole hours; null with no worktree). A projects feed may carry it per item: the desktop project screen and the web Projects card then show `idle 3h` (`active` under 1 h) and mark an item idle 2 hours or more as stalled. A feed without the key renders as before.
+
+**Agents:** nothing. **Adopt:** a feed producer of your own copies `idle_hours` from `po status --json` into each DOING item.
+
 ## Release 23 (2026-11-02): web dashboard on the phone, release counting by DONE commit, stamp drain
 
 ### Setup after install

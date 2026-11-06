@@ -13,7 +13,7 @@ JSON array of {agent, model?, state, now, owns[], free, limit_until?, usage?}; w
 --decisions-url or PO_DASHBOARD_DECISIONS_URL (no default) adds a Decisions view to the toggle, read-only:
 a JSON array of {project, item, title, waiting_for, asked_at, thread_url?, asked_by?, kind?, id?, ...}: Choices first, then
 Actions, then unformatted and legacy entries, oldest asked first in each group; an Actions toggle (saved in $XDG_CONFIG_HOME/po-dashboard/decisions.json)
-hides the Action entries. One line per entry, asked_at as "3h ago" (local time in the tooltip), thread_url as copyable muted text. Esc closes the window.
+hides the Action entries. One line per entry, asked_at as "3h ago" (local time in the tooltip), thread_url as an "Open thread" link (v0.141; a URL that is not http(s) stays copyable muted text). Esc closes the window.
 --answer-url or PO_DASHBOARD_ANSWER_URL (no default; --answer-url wins) sets an http(s) answer sink:
 when it is set, expanded decision cards gain pick controls (one radio row per option plus an
 `or write your own` text box for a Choice; Pass and Failed with a step chooser and note for an
@@ -30,7 +30,15 @@ status line). An action may carry `requires` {package, sha256}: the card shows t
 each project's cards one `Install this build` block (the newest card's build) gives the sha256 check and the
 `sudo pacman -U` command, each with a Copy button, built from --install-dir or PO_DASHBOARD_INSTALL_DIR (an
 absolute path, no default; unset, the block says `set install_dir`); a card needing another build is marked
-`needs <package>: install it first`. No Enter-to-send, no confirmation dialog. Exit codes: 1 usage, 2 GTK or PyGObject missing
+`needs <package>: install it first`. A Projects card whose feed entry carries `active` (v0.139) shows a switch, and a
+muted `inactive` badge when it is false; flipping the switch POSTs {answer_id, kind: "project-active", project, active,
+answered_at, client} to the same answer sink with the same token (off without a sink, the card saying `read-only: no
+answer URL` beside it; the switch's line is one click target of 44 px at least); the switch keeps the new
+position while the feed catches up (3 minutes at most), and a refusal is said on the card (`not switched: ...`).
+Every Projects card has a Release button (v0.140): a confirm dialog `Release <project>: N DONE items since <release>`
+with a note box, Cancel and Release, which POSTs {answer_id, kind: "release-request", project, note, answered_at, client}
+to the same sink; off at N = 0 or without a sink, saying why beside it; it asks only (nothing here tags or pushes).
+No Enter-to-send, no confirmation dialog for an answer. Exit codes: 1 usage, 2 GTK or PyGObject missing
 (or, with --check, the feed unreachable).
 """
 import argparse
@@ -66,10 +74,11 @@ def load_gtk():
 
         gi.require_version("Gtk", "4.0")
         gi.require_version("Gdk", "4.0")
-        from gi.repository import GLib, Gdk, Gtk, Gio, Graphene, Pango
+        gi.require_version("Gsk", "4.0")
+        from gi.repository import GLib, Gdk, Gsk, Gtk, Gio, Graphene, Pango
     except (ImportError, ValueError, AttributeError) as e:
         die("needs GTK 4 and PyGObject (pacman -S gtk4 python-gobject): %s" % e, 2)
-    return GLib, Gdk, Gtk, Gio, Graphene, Pango
+    return GLib, Gdk, Gsk, Gtk, Gio, Graphene, Pango
 
 
 def main():
@@ -132,7 +141,7 @@ def main():
         except core.DashboardError as e:
             die(str(e), 2)
         return
-    GLib, Gdk, Gtk, Gio, Graphene, Pango = load_gtk()
+    GLib, Gdk, Gsk, Gtk, Gio, Graphene, Pango = load_gtk()
 
     class Chart(Gtk.Widget):
         """One report chart: the shapes of dashboard_reports, painted with GTK's snapshot (no drawing library
@@ -155,10 +164,8 @@ def main():
             return h, h, -1, -1
 
         def colour(self, key):
-            pal = core.PALETTES["dark" if self.dark else "light"]
-            hexcolor = pal["series"][key[1]] if isinstance(key, tuple) else pal[key]
             rgba = Gdk.RGBA()
-            rgba.parse(hexcolor)
+            rgba.parse(core.chart_colour("dark" if self.dark else "light", key))
             return rgba
 
         def box(self, snap, rgba, x, y, w, h):
@@ -186,9 +193,20 @@ def main():
                         self.box(snap, rgba, 0, 0, h * 1.4143, 1.5)
                         snap.restore()
                     snap.pop()
-                elif kind == "line":
-                    _k, x1, y1, x2, _y2, key = shape
-                    self.box(snap, self.colour(key), x1, y1, x2 - x1, 1)
+                elif kind == "line":  # level or upright
+                    _k, x1, y1, x2, y2, key = shape
+                    self.box(snap, self.colour(key), x1, y1, max(1, x2 - x1), max(1, y2 - y1))
+                elif kind == "path":  # a polyline, solid or dashed (v0.143: the fail-rate line, reference lines)
+                    _k, points, key, width, dashed = shape
+                    build = Gsk.PathBuilder.new()
+                    build.move_to(*points[0])
+                    for px, py in points[1:]:
+                        build.line_to(px, py)
+                    stroke = Gsk.Stroke.new(width)
+                    stroke.set_line_join(Gsk.LineJoin.ROUND)
+                    if dashed:
+                        stroke.set_dash([4, 3])
+                    snap.append_stroke(build.to_path(), stroke, self.colour(key))
                 else:
                     _k, x, y, text, key, align = shape
                     lay = self.create_pango_layout(text)
@@ -246,6 +264,7 @@ def main():
             self.read_only_said = False  # shows "read-only" once in the status line
             self.view = "events"
             self.events_failed = False
+            self.events_as_of = None
             self.team_failed = False
             self.decisions_failed = False
             self.projects = None  # the last good projects feed 
@@ -296,6 +315,7 @@ def main():
 
             self.reports_on = a.view == "reports"  # the Reports pane replaces the Events list; kept across refreshes
             self.report_range = core.REPORT_DEFAULT
+            title.set_text(self.title_for("events"))
             self.reports_button = Gtk.ToggleButton(label="Reports", active=self.reports_on)
             self.reports_button.add_css_class("po-small")
             self.reports_button.connect("toggled", self.on_reports)
@@ -322,6 +342,7 @@ def main():
             self.error.set_visible(False)
             self.list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
             self.list.add_css_class("po-list")
+            self.list.add_css_class("po-panel")  # one raised panel per list, flat rows inside (v0.142, P2.10)
             self.foot = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10, margin_start=36, margin_end=36, margin_top=6, margin_bottom=8)
             self.more = Gtk.Button(label="Load more")
             self.more.add_css_class("po-small")
@@ -335,8 +356,9 @@ def main():
             body.append(self.foot)
             scroll = self.event_scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.AUTOMATIC)
             scroll.set_child(body)
-            self.team_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            self.team_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.START)
             self.team_list.add_css_class("po-list")
+            self.team_list.add_css_class("po-panel")
             team_scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.AUTOMATIC)
             team_scroll.set_child(self.team_list)
             self.stack = Gtk.Stack(vexpand=True)
@@ -357,12 +379,16 @@ def main():
             self.events_stack.set_visible_child_name("reports" if self.reports_on else "list")
             self.stack.add_named(self.events_stack, "events")
             self.stack.set_visible_child_name("events")  # not the first page added (Team): v0.32 showed it at start
-            self.decisions_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            self.decisions_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.START)
             self.decisions_list.add_css_class("po-list")
+            self.decisions_list.add_css_class("po-panel")
             self.decisions_scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.AUTOMATIC)
             self.decisions_scroll.set_child(self.decisions_list)
             self.stack.add_named(self.decisions_scroll, "decisions")
             self.projects_sig = None  # what the cards show now; a refresh that changes nothing touches nothing
+            self.switch_pending = {}  # project -> (active, sent at): a switch the (cached) feed does not show yet (v0.139)
+            self.switch_note = {}  # project -> why the last switch did not go through ("" when it did)
+            self.release_note = {}  # project -> the last Release request's result (v0.140)
             self.pstate = core.project_view_state(a.project)  # open project (None = overview) and per-project filter
             self.pscreen_sig = None
             self.projects_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -539,11 +565,12 @@ def main():
                 self.pscreen.remove(c)
             head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
             back = Gtk.Button(label="\u2190 Back")
+            back.add_css_class("po-small")
             back.connect("clicked", lambda _b: self.back_to_overview())
             head.append(back)
             head.append(self.label("\u25cf", "po-light-%s" % screen["light"]))
             head.append(self.label(screen["name"], "po-title", hexpand=True, ellipsize=3))
-            head.append(self.label(screen["light"], "po-muted"))
+            head.append(self.label(screen["word"], "po-muted"))
             head.append(self.release_widget(screen["release"]))
             head.set_tooltip_text(screen["text"])
             self.pscreen.append(head)
@@ -553,15 +580,19 @@ def main():
             for f in screen["filters"]:
                 b = Gtk.ToggleButton(label="%s %d" % (f["label"], f["count"]), active=f["key"] == current, group=first)
                 first = first or b
+                b.add_css_class("po-small")  # the same controls as every other view, not stock GTK (v0.142)
                 b.connect("toggled", lambda btn, k=f["key"]: btn.get_active() and self.set_project_filter(k))
                 bar.append(b)
             self.pscreen.append(bar)
             if screen["lost"]:
                 self.pscreen.append(self.label(screen["lost"], "po-muted", wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR, max_width_chars=30))
-            rows = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            rows = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.START)
+            rows.add_css_class("po-panel")
+            rows.add_css_class("po-flush")  # the screen has its own side margins
             for r in screen["rows"]:
                 line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
                 line.add_css_class("po-card")
+                line.add_css_class("po-row")
                 line.append(self.label(r["item"], "po-text", width_chars=6))
                 line.append(self.label(r["title"], "po-text", hexpand=True, ellipsize=3))
                 badge = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
@@ -570,7 +601,11 @@ def main():
                     badge.append(self.label(r["note"], "po-muted", ellipsize=3, max_width_chars=28))
                 if r["setup"]:
                     badge.append(self.label(r["setup"], "po-muted"))
-                badge.set_tooltip_text(r["full"] + (" (%s)" % r["setup"] if r["setup"] else ""))
+                tip = r["full"] + (" (%s)" % r["setup"] if r["setup"] else "")
+                if r["idle"]:  # stalled said in words too, not by its colour alone (v0.142)
+                    badge.append(self.label(r["idle_words"], "po-warn" if r["stalled"] else "po-muted"))
+                    tip += " (%s%s)" % (r["idle"], ", stalled" if r["stalled"] else "")
+                badge.set_tooltip_text(tip)
                 line.append(badge)
                 agents = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
                 if r["dash"]:
@@ -582,7 +617,7 @@ def main():
                 line.append(agents)
                 rows.append(line)
             if not screen["rows"]:
-                rows.append(self.label("no items", "po-muted"))
+                rows.append(self.label(screen["empty"], "po-muted", margin_start=16, margin_top=10, margin_bottom=10))
             scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
             scroll.set_child(rows)
             self.pscreen.append(scroll)
@@ -593,9 +628,160 @@ def main():
             w.set_xalign(1)
             return w
 
+        def on_switch(self, sw, state, name):
+            """The card's switch was flipped: POST the new state in a worker thread; the switch shows it meanwhile."""
+            self.switch_pending[name] = (state, time.time())
+            self.switch_note[name] = "switching\u2026"
+            body = core.project_active_body(name, state, core.answer_id())
+            threading.Thread(target=self._send_switch, args=(name, body), daemon=True).start()
+            self.redraw_projects()
+            return True  # the redraw sets the shown state
+
+        @staticmethod
+        def over_switch(line, sw, x, y):
+            """Whether (x, y) of the switch's line falls on the switch itself."""
+            hit = line.pick(x, y, Gtk.PickFlags.DEFAULT)
+            while hit is not None and hit is not line:
+                if hit is sw:
+                    return True
+                hit = hit.get_parent()
+            return False
+
+        def on_switch_line_press(self, g, _n, x, y, line, sw):
+            if not self.over_switch(line, sw, x, y):  # the switch handles its own clicks
+                g.set_state(Gtk.EventSequenceState.CLAIMED)
+
+        def on_switch_line(self, _g, _n, x, y, line, sw):
+            """A click on the switch's line beside the switch flips it."""
+            if not self.over_switch(line, sw, x, y) and sw.get_sensitive():
+                sw.set_active(not sw.get_active())
+
+        def _send_switch(self, name, body):
+            note = core.post_switch(self.answer_url, body, self.answer_token)
+            GLib.idle_add(self.on_switch_done, name, note)
+
+        def on_switch_done(self, name, note):
+            self.switch_note[name] = note
+            if note:  # not switched: the feed's state is shown again
+                self.switch_pending.pop(name, None)
+            self.redraw_projects()
+            return False
+
+        def switch_view(self, c):
+            """(shown position or None when the feed gives no state, note) for one card, dropping a settled pending switch."""
+            name, now = c["name"], time.time()
+            pending = self.switch_pending.get(name)
+            if c["active"] is None:
+                return None, ""
+            if pending is not None and core.switch_settled(c["active"], pending, now):
+                self.switch_pending.pop(name, None)
+                if self.switch_note.get(name) == "":
+                    self.switch_note.pop(name, None)
+                pending = None
+            return core.switch_shown(c["active"], pending, now), self.switch_note.get(name, "")
+
+        def release_of(self, name):
+            """The Release button's view for one project (v0.140), from the current feed."""
+            pr = next((p for p in self.projects or [] if str(p.get("project", "")) == name), {})
+            return core.release_view(pr, sink=bool(self.answer_url))
+
+        def release_line(self, name):
+            """The card's Release button, the reason it is off said beside it, and the last request's result."""
+            rv = self.release_of(name)
+            line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            line.set_size_request(-1, core.SWITCH_TARGET_PX)  # the button fills the line: a 44 px target (P1.10)
+            b = Gtk.Button(label="Release")
+            b.add_css_class("po-small")
+            b.update_property([Gtk.AccessibleProperty.LABEL], ["Release %s" % name])
+            b.set_sensitive(rv["enabled"])
+            b.connect("clicked", lambda _b: self.open_release(name))
+            line.append(b)
+            said = rv["why"] or self.release_note.get(name, "")
+            if said:
+                cls = "po-warn" if said.startswith("not sent") else "po-muted"
+                line.append(self.label(said, cls, wrap=True, hexpand=True, wrap_mode=Pango.WrapMode.WORD_CHAR,
+                                       max_width_chars=24))
+            return line
+
+        def open_release(self, name):
+            """The confirm dialog: the title with N and the last release, a note box, Cancel and Release. Release
+            only asks (the receiver posts the ask for the PO); the dialog's answer_id is kept for its Retry."""
+            rv = self.release_of(name)
+            if not rv["enabled"]:
+                return
+            dlg = Gtk.Window(transient_for=self.win, modal=True, title="Release %s" % name, default_width=440)
+            dlg.add_css_class("po-dashboard")
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin_top=16, margin_bottom=16,
+                          margin_start=16, margin_end=16)
+            box.append(self.label(rv["title"], "po-text", wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR))
+            box.append(self.label("This asks the PO to cut the release now; nothing is tagged or pushed from here.",
+                                  "po-muted", wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR))
+            go = Gtk.Button(label="Release")
+            go.add_css_class("suggested-action")
+            note_w, view = self.answer_box("Note for the release (optional)", "", go, {})
+            box.append(note_w)
+            state = self.label("", "po-muted", wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR, visible=False)
+            box.append(state)
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, halign=Gtk.Align.END)
+            cancel = Gtk.Button(label="Cancel")
+            cancel.connect("clicked", lambda _b: dlg.close())
+            row.append(cancel)
+            row.append(go)
+            box.append(row)
+            dlg.set_child(box)
+            buf = view.get_buffer()
+            sent = {"aid": core.answer_id(), "note": None}
+
+            def note_text():
+                return buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+
+            def ready(_buf=None):
+                go.set_sensitive(not core.release_counter(note_text())[1] and go.get_label() != "Releasing\u2026")
+
+            def on_go(_b):
+                note = note_text()
+                if sent["note"] is not None and sent["note"] != note:  # a changed note is a new request
+                    sent["aid"] = core.answer_id()
+                sent["note"] = note
+                go.set_label("Releasing\u2026")
+                go.set_sensitive(False)  # one POST at a time: no double request from a double click
+                state.set_text("sending\u2026")
+                state.set_visible(True)
+                body = core.release_body(name, note, sent["aid"])
+                threading.Thread(target=self._send_release, args=(name, body, dlg, go, state), daemon=True).start()
+
+            buf.connect("changed", ready)
+            go.connect("clicked", on_go)
+            esc = Gtk.EventControllerKey()  # Escape cancels, as in a dialog (P1.3, P1.7)
+            esc.connect("key-pressed", lambda _c, k, _code, _st: (dlg.close() or True) if k == Gdk.KEY_Escape else False)
+            dlg.add_controller(esc)
+            ready()
+            dlg.present()
+            view.grab_focus()
+
+        def _send_release(self, name, body, dlg, go, state):
+            result = core.post_release(self.answer_url, body, self.answer_token)
+            GLib.idle_add(self.on_release_done, name, result, dlg, go, state)
+
+        def on_release_done(self, name, result, dlg, go, state):
+            self.release_note[name] = result
+            if result == core.RELEASE_SENT:
+                dlg.close()
+            else:  # the dialog stays with the reason; Retry re-posts the same answer_id
+                state.set_text(result)
+                state.remove_css_class("po-muted")
+                state.add_css_class("po-warn")
+                go.set_label("Retry")
+                go.set_sensitive(True)
+            self.projects_sig = None
+            self.redraw_projects()
+            return False
+
         def redraw_projects(self):
             cards = [core.project_card(pr) for pr in self.projects or []]
-            sig = [(c["name"], c["text"], c["lost"]) for c in cards]
+            views = [self.switch_view(c) for c in cards]
+            sig = [(c["name"], c["text"], c["lost"], v, self.release_of(c["name"]), self.release_note.get(c["name"]))
+                   for c, v in zip(cards, views)]
             self.redraw_project_screen()
             if sig == self.projects_sig:
                 return
@@ -616,7 +802,7 @@ def main():
                                max_children_per_line=6, column_spacing=12, row_spacing=4, valign=Gtk.Align.START)
             flow.connect("child-activated", lambda _f, child: self.open_project(child.project_name))
             restore = None
-            for c in cards:
+            for c, (shown, note) in zip(cards, views):
                 child = Gtk.FlowBoxChild(focusable=True)
                 child.project_name = c["name"]
                 child.set_tooltip_text(c["text"])
@@ -628,8 +814,41 @@ def main():
                 top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
                 top.append(self.label("●", "po-light-%s" % c["light"]))
                 top.append(self.label(c["name"], "po-text", hexpand=True, ellipsize=3))
+                top.append(self.label(c["word"], "po-muted"))  # the light in words: never colour alone (v0.142)
+                if shown is False:  # the badge follows the switch, so a switch still on its way shows at once
+                    top.append(self.label(core.INACTIVE_BADGE, "po-badge"))
                 top.append(self.release_widget(c["release"]))
                 card.append(top)
+                if shown is not None:
+                    # the whole line (switch, its word, the reason) is the click target, at least 44 px tall (P1.10)
+                    line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+                    line.add_css_class("po-switch-line")
+                    line.set_size_request(core.SWITCH_TARGET_PX, core.SWITCH_TARGET_PX)
+                    sw = Gtk.Switch(active=shown, valign=Gtk.Align.CENTER)
+                    sw.update_property([Gtk.AccessibleProperty.LABEL], ["%s active" % c["name"]])
+                    why = ""
+                    if not self.answer_url:
+                        sw.set_sensitive(False)
+                        why = core.SWITCH_NO_SINK
+                        sw.set_tooltip_text(why)
+                    elif self.switch_note.get(c["name"]) == "switching\u2026":
+                        sw.set_sensitive(False)  # one POST at a time per project
+                    sw.connect("state-set", self.on_switch, c["name"])
+                    line.append(sw)
+                    line.append(self.label("active" if shown else "off", "po-muted"))
+                    if why:  # said beside the switch, not only in its tooltip (P1.5)
+                        line.append(self.label(why, "po-muted", wrap=True, hexpand=True,
+                                               wrap_mode=Pango.WrapMode.WORD_CHAR, max_width_chars=24))
+                    if sw.get_sensitive():
+                        click = Gtk.GestureClick()
+                        # claimed (beside the switch only): flips the switch and does not also open the project
+                        click.connect("pressed", self.on_switch_line_press, line, sw)
+                        click.connect("released", self.on_switch_line, line, sw)
+                        line.add_controller(click)
+                    card.append(line)
+                    if note:  # its own line: a long refusal wraps inside the card instead of widening it
+                        card.append(self.label(note, "po-muted" if note == "switching\u2026" else "po-warn", wrap=True,
+                                               wrap_mode=Pango.WrapMode.WORD_CHAR, max_width_chars=30))
                 row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
                 for lab, key in (("TODO", "todo"), ("DOING", "doing"), ("DONE", "done"), ("RELEASED", "released")):
                     row.append(self.label("%s %d" % (lab, c["counts"][key]), "po-muted"))
@@ -640,6 +859,7 @@ def main():
                     card.append(self.label("feed error", "po-muted"))
                 if c["lost"]:
                     card.append(self.label(c["lost"], "po-muted", wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR, max_width_chars=30))
+                card.append(self.release_line(c["name"]))
                 child.set_child(card)
                 child.add_css_class("po-pcard")
                 flow.append(child)
@@ -703,8 +923,11 @@ def main():
             self.team_failed = False
             self.team_error.set_visible(False)
             if text != self.team_text:
+                roster = {r.get("agent") for r in self.team}
                 self.team_text, self.team = text, team
                 self.redraw_team()
+                if {r.get("agent") for r in team} != roster:
+                    self.redraw_reports()  # first-try counts only the roster's agents (v0.143)
             self.show_status()
             return False
 
@@ -731,9 +954,11 @@ def main():
                 if self.team_failed:
                     self.status.set_text("team not updated")
                 else:
-                    self.status.set_text("%d agents" % len(self.team) if self.team_text is not None else "loading…")
+                    self.status.set_text(core.team_status(core.team_rows(self.team)) if self.team_text is not None else "loading…")
             elif self.events_failed:
                 self.status.set_text("not updated")
+            elif self.reports_on:
+                self.status.set_text(core.reports_status(self.report_range, self.events_as_of))
             else:
                 self.status.set_text(core.events_status(self.shown_count, self.held_count, self.show_all) if self.shown_count is not None else "%d events" % len(self.events))
 
@@ -779,7 +1004,7 @@ def main():
                 self.born.clear()
                 self.fade_tick()
             self.stack.set_visible_child_name(name)
-            self.title_label.set_text({"team": "Team", "decisions": "Decisions", "projects": "Projects"}.get(name, "Gate events"))
+            self.title_label.set_text(self.title_for(name))
             self.subrow_show(name)
             self.error.set_visible(name == "events" and self.events_failed)
             self.team_error.set_visible(name == "team" and self.team_failed)
@@ -808,6 +1033,7 @@ def main():
             """A fetch's events: a whole feed (text and events), a ?since= answer (partial, merged into the
             events held) or a 304 (events None, nothing changes)."""
             self.events_failed = False
+            self.events_as_of = datetime.datetime.now(datetime.timezone.utc)  # what Reports says it is "as of"
             self.error.set_visible(False)
             if events is None:
                 changed = False
@@ -883,8 +1109,6 @@ def main():
         def build_reports(self):
             """The Reports pane: a title, the time-range choice, one area per chart (placeholders) or the empty text."""
             pane = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_start=36, margin_end=36, margin_top=10)
-            title = self.label("Reports", "po-title")
-            pane.append(title)
             choice = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
             self.range_buttons = []
             first = None
@@ -898,6 +1122,7 @@ def main():
             pane.append(choice)
             self.chart_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
             pane.append(self.chart_box)
+            self.want_report_archive()
             self.redraw_reports()
             scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
             scroll.set_child(pane)
@@ -911,38 +1136,61 @@ def main():
                 child = nxt
             secs = core.REPORT_RANGES[self.report_range][1]
             plan = core.report_plan(secs, archive_url, self.report_archive)
-            events = core.report_events(self.events, self.report_archive, secs)
+            reach = core.report_reach(secs)  # v0.143: the previous period too
+            events = core.report_events(self.events, self.report_archive, reach)
             note = {"unconfigured": core.REPORT_NO_ARCHIVE, "fetch": self.report_archive_note}.get(plan, "")
             if note:
                 self.chart_box.append(self.label(note, "po-muted", margin_top=8))
             if not core.in_range(events, secs):
                 self.chart_box.append(self.label(core.REPORT_EMPTY, "po-muted", margin_top=8))
                 return
-            layouts = (reports.layout_gate_runs, reports.layout_first_try, reports.layout_closed,
-                       reports.layout_cycle_time, reports.layout_failed_legs)
-            for (name, data, text), layout in zip(reports.reports(events, secs, tz=local_tz()), layouts):
+            covered = core.report_plan(reach, archive_url, self.report_archive) in ("live", "merged")
+            agents = {r.get("agent") for r in self.team} if self.team else None  # the roster: the owner's own stamps are not an agent's
+            page = reports.reports(events, secs, tz=local_tz(), agents=agents, covered=covered, as_of=self.events_as_of)
+            tiles = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True, min_children_per_line=4,
+                                max_children_per_line=4, column_spacing=12, row_spacing=12, margin_top=4)
+            for t in page["headline"]:  # v0.143: the four numbers first, each beside the previous period
+                tile = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+                tile.add_css_class("po-tile")
+                tile.append(self.label(t["label"], "po-muted"))
+                tile.append(self.label(t["text"], "po-tile-value"))
+                tile.append(self.label(t["change"], "po-text", wrap=True, max_width_chars=18))
+                tile.update_property([Gtk.AccessibleProperty.LABEL], ["%s %s, %s" % (t["label"], t["text"], t["change"])])
+                tiles.append(tile)
+            tiles.set_tooltip_text(reports.headline_text(page["headline"]))
+            self.chart_box.append(tiles)
+            for ch in page["charts"]:
                 area = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
                 area.add_css_class("po-chart")
-                area.append(self.label(name, "po-text"))
-                if reports_empty(data):
+                area.append(self.label(ch["title"], "po-chart-title", wrap=True))
+                area.append(self.label(ch["topic"], "po-muted"))
+                if reports_empty(ch["data"]):
                     area.append(self.label("none in this range", "po-muted"))
                 else:
-                    area.append(Chart(layout, data, text, self.dark()))
+                    area.append(Chart(ch["layout"], ch["data"], ch["text"], self.dark()))
+                area.append(self.label("%s %s" % (ch["context"], ch["source"]), "po-muted", wrap=True))
                 self.chart_box.append(area)
+
+        def want_report_archive(self):
+            """Fetch the archive once when the range and its previous period outrun the live window (v0.143: 7 d
+            reaches back 14 d); drop it when they no longer do."""
+            reach = core.report_reach(core.REPORT_RANGES[self.report_range][1])
+            if reach <= core.REPORT_LIVE_SECONDS:
+                self.report_archive, self.report_archive_note = None, ""
+            elif archive_url and self.report_archive is None and not self.report_archive_note:
+                self.report_archive_note = core.REPORT_LOADING_ARCHIVE
+                threading.Thread(target=self.archive_worker, args=(self.on_report_archive, self.on_report_archive_error), daemon=True).start()
 
         def on_range(self, button, i):
             if button.get_active():
                 self.report_range = i
-                secs = core.REPORT_RANGES[i][1]
-                if secs <= core.REPORT_LIVE_SECONDS:
-                    self.report_archive, self.report_archive_note = None, ""  # inside the live window: drop it
-                elif archive_url and self.report_archive is None:
-                    self.report_archive_note = core.REPORT_LOADING_ARCHIVE
-                    threading.Thread(target=self.archive_worker, args=(self.on_report_archive, self.on_report_archive_error), daemon=True).start()
+                self.want_report_archive()
                 self.redraw_reports()
+                self.show_status()
 
         def on_report_archive(self, events):
-            if core.REPORT_RANGES[self.report_range][1] > core.REPORT_LIVE_SECONDS:
+            self.report_archive_note = ""
+            if core.report_reach(core.REPORT_RANGES[self.report_range][1]) > core.REPORT_LIVE_SECONDS:
                 self.report_archive, self.report_archive_note = events, ""
                 self.redraw_reports()
             return False
@@ -952,9 +1200,17 @@ def main():
             self.redraw_reports()
             return False
 
+        def title_for(self, name):
+            """The header title: the view's name; Events with Reports on says Reports (v0.142)."""
+            if name == "events" and self.reports_on:
+                return core.REPORTS_TITLE
+            return {"team": "Team", "decisions": "Decisions", "projects": "Projects"}.get(name, "Gate events")
+
         def on_reports(self, button):
             self.reports_on = button.get_active()
             self.events_stack.set_visible_child_name("reports" if self.reports_on else "list")
+            self.title_label.set_text(self.title_for(self.view))
+            self.show_status()
 
         def on_toggle(self, button):
             self.show_all = button.get_active()
@@ -1028,6 +1284,7 @@ def main():
             r = core.row(ev)
             card = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
             card.add_css_class("po-card")
+            card.add_css_class("po-row")
             step = self.step_of(key)
             if step:
                 card.add_css_class("po-fade-%d" % step)
@@ -1111,9 +1368,11 @@ def main():
             self.heads["team"]["model"][0].set_visible(any_model)
             self.team_shown = [r["agent"] for r in rows]
             self.team_cards = {}
+            shared = core.team_shared_usage(rows)  # one subscription: said once in the header, not on every line (v0.142)
             for r in rows:
                 card = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
                 card.add_css_class("po-card")
+                card.add_css_class("po-row")
                 card.add_css_class("po-team")
                 self.make_movable(card, r["agent"])
                 name = self.label(r["agent"], "po-text", width_chars=10, max_width_chars=16, ellipsize=3)
@@ -1124,7 +1383,7 @@ def main():
                     state.append(self.label("\u25cf", "po-live"))
                 style = {"working": "po-live", "free": "po-free", "limit": "po-fail"}.get(r["kind"], "po-muted")
                 state.append(self.label(r["status"], style, ellipsize=3, max_width_chars=28))
-                if r["usage"]:
+                if r["usage"] and r["usage"] != shared:
                     state.append(self.label(r["usage"], "po-muted", ellipsize=3, max_width_chars=20))
                 now = self.label(("now " + r["now"]) if r["now"] else "", "po-text", width_chars=10, max_width_chars=16, ellipsize=3)
                 owns = self.label(("owns " + r["owns"]) if r["owns"] else "owns nothing", "po-muted", hexpand=True, ellipsize=3)
@@ -1170,6 +1429,7 @@ def main():
                     self.decisions_list.append(self.install_block(r["project"], block))
                 card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
                 card.add_css_class("po-card")
+                card.add_css_class("po-row")
                 top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
                 item = self.label(r["item"], "po-text", width_chars=6, max_width_chars=10, ellipsize=3)
                 project = self.label(r["project"], "po-muted", width_chars=8, max_width_chars=20, ellipsize=3)
@@ -1205,10 +1465,16 @@ def main():
                 if key in marks:
                     card.append(self.label(marks[key], "po-warn", wrap=True))
                 card.append(expanded)
-                if r["thread_url"]:
-                    url = self.label(r["thread_url"], "po-muted", selectable=True, ellipsize=2)
+                link = core.thread_link_markup(r["thread_url"])  # a real link, not URL text (v0.141)
+                if link:
+                    url = self.label("", "po-link")
+                    url.set_markup(link)
                     url.set_tooltip_text(r["thread_url"])
                     card.append(url)
+                elif r["thread_url"]:
+                    card.append(self.label(r["thread_url"], "po-muted", selectable=True, ellipsize=2))
+                else:
+                    card.append(self.label(core.NO_THREAD_TEXT, "po-muted"))
                 self.decisions_list.append(card)
             view = self.answer_views.get(focus[:2]) if focus else None
             if view is not None:
@@ -1233,6 +1499,7 @@ def main():
             """One project's `Install this build` card: the package, then the sha256 check and the install, or the note."""
             card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
             card.add_css_class("po-card")
+            card.add_css_class("po-row")
             card.append(self.label("Install this build \u00b7 %s" % project, "po-kind", "po-kind-action"))
             card.append(self.label(block["package"], "po-text", selectable=True, wrap=True))
             if block["commands"]:

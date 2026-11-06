@@ -120,7 +120,9 @@ the same from any worktree.
   tables and the spec-file headings, each with its branch (ahead/behind
   main) and worktree (dirty count); the latest tag; orphaned and dirty
   worktrees; unmerged branches no open item claims. Exits 3 when the
-  backlog's sources disagree about an item.
+  backlog's sources disagree about an item. `po status --json` prints only the DOING
+  items, `[{"item": "0.9", "idle_hours": 3}]`: `idle_hours` is the idle time below in whole hours
+  (rounded down), `null` with no worktree; a feed producer copies it into the projects feed.
   Each DOING item's branch line ends in `idle 3h12m`: now minus the newest
   of the branch tip's commit date, the newest `gate-<n>.txt`, and the
   newest mtime among the worktree's changed and untracked files (`idle -`
@@ -366,6 +368,12 @@ the same from any worktree.
   one). A value that is not an array of quoted strings, or any other key under
   `[close]`, is a manifest error (2); `po doctor` lists the key as
   `adopt [close] checklist` for a manifest without it.
+- `[close] memory = true` — an optional switch (a bare `true` or `false`, no
+  quotes; absent is off). On, `po close` prints a memory prompt line and
+  `po close --commit` refuses unless the `--body-file` has a line starting
+  `Memory:` with a proposal id, a `proposed` note or `nothing new learned`.
+  A failed `po stamp` prints the same prompt after its failure lines whether
+  the key is set or not; it never changes the exit code or the evidence block.
 - `[close] require_setup = true` — an optional switch (a bare `true` or
   `false`, no quotes; absent is off). On, every item's spec carries a
   `Setup after install` section, written by the dev: the single word `None`,
@@ -470,8 +478,11 @@ the same from any worktree.
 - `po released [--json] [--release <tag>]` — the DONE items the project's
   latest release contains, judged from git, read-only: an item is released
   when its item tag (`[versioning] tag` filled) is an ancestor of the release
-  tag (`git merge-base --is-ancestor`); a DONE row without an item tag (closed
-  without a commit) is not. The release comes from `[release] source`
+  tag (`git merge-base --is-ancestor`). A DONE item without an item tag is
+  judged by its DONE commit instead: the newest `admin: <v> DONE` commit on
+  main, else the newest commit that changed its backlog row or its
+  `## <tag> — ...` heading in `specs_dir`; released when that commit is an
+  ancestor of the release tag, not released when there is none. The release comes from `[release] source`
   (above). Prints `release: <tag>` (or `release: none`) and one released
   version per line; `--json` prints `{"source", "release" (null when none),
   "released": [versions]}`. `--release` is for source `github` only (exit 1
@@ -530,6 +541,7 @@ the same from any worktree.
   empty `owner_column` cell in its own admin commit (a cell already naming
   another agent is refused, exit 3), so `po team` sees the agent as busy and
   a repeated run gives no agent a second item. Needs `python3`.
+- `po lint-founding [--ready <file>] [--project <name>] [--agents <a,b>]` — read-only check of what a founding commit left on main, one `file:line: finding` per line, exit 0 clean (no output) or 1 with findings: a backlog row or item heading without its status as one ALL-CAPS word; an open item without a spec heading under `[layout] specs_dir` (skipped when it is `.`); a ready-file line (`[ready] file` or `--ready`) that is not valid JSON, names an item absent from the backlog or HELD, PAUSED or BLOCKED, names an agent outside the roster, `[dispatch] order` and `--agents`, or repeats an identical line. DOING and DONE lines are history and pass; the last line for an item wins.
 - `po serve [--bind <addr>] [--port <n>]` — a small read-only web viewer of the
   gate events, for a screen you leave open. `/` shows the last 10 events, newest on top,
   one row each: result (symbol and word), item, project, kind, checks (each
@@ -556,7 +568,10 @@ the same from any worktree.
   and a count on each (`Decisions (2)`, `Events (5 today)`, `Projects (3)`, `Team (1 working)`); the
   chosen view is kept in the address (`#team`) so a reload returns to it. A decision card shows its kind,
   title, who waits and `asked 12m ago`, collapsed to that header until tapped, with a choice's options
-  listed and the recommended one marked. It lays out for a 360 px
+  listed and the recommended one marked, and ends in an `Open thread` link (its `thread_url`; a card with
+  no answer form says to answer there). Decisions sort as on the desktop: Choices, then Actions, then the
+  rest, oldest asked first. An Events card's head names its newest event's result (`✔ pass`, `✘ fail`) and
+  kind; Team writes a bare version as `v0.141` and a `project v1.2` value as it is. It lays out for a 360 px
   screen (44 px tap targets, no sideways scroll) and in columns on a wide one, follows the system's light
   or dark scheme, refreshes every 10 s with `If-None-Match` (a hidden tab pauses), and when a fetch fails
   keeps what it has and shows `not updated 5m ago`. Feed text is only ever written as text, never as markup.
@@ -585,8 +600,9 @@ the same from any worktree.
   it failed at) and a note, and a Send button that stays in view at the bottom of a small screen. Send posts
   the same JSON body as the desktop viewer's (see "Answering decisions" below; `client` is `po-dashboard`) to
   `answer_url`, with the device token as `Authorization: Bearer`. The token is entered once with the header's
-  `Set device token` button and kept in the browser's storage for the page's origin; the page shows only
-  `device token set`, never the token, and sends it nowhere but `answer_url`. A draft (the pick and the text)
+  `Set device token` button and kept in the browser's storage for the page's origin; once it is set the button
+  becomes a small `device token set · change` link beside the views, the page never shows the token, and sends it
+  nowhere but `answer_url`. A draft (the pick and the text)
   is kept per card across refreshes and reloads; while the pick is unchanged a new Send reuses the same
   `answer_id`, so a retry after a lost reply posts nothing twice. Send is disabled from the tap until the
   reply. The card then shows `sent 3:41 PM` and leaves the list with the next feed; `already answered` (409),
@@ -601,7 +617,7 @@ the same from any worktree.
   any other origin.
 - `po-dashboard [--url <url>] [--archive-url <url>] [--team-url <url>] [--decisions-url <url>] [--projects-url <url>] [--view events|team|decisions|projects|reports] [--project <name>] [--theme auto|light|dark] [--all] [--size WxH] [--check] [--screenshot <png>] [--screenshot-delay <s>]`
   (`bin/po-dashboard`, not a `po` subcommand) — a desktop window for the same
-  events: the last 10 as soft raised single-line cards (result, item, project,
+  events: the last 10 as flat single-line rows in one raised panel, a hairline between rows (result, item, project,
   kind, checks, agent, took (sortable like the others; `-` when unknown,
   the warning colour when slow), time in the local zone, note) in fixed columns that line
   up from card to card, long values ellipsized with the full text as a tooltip,
@@ -628,7 +644,10 @@ the same from any worktree.
   drop. A server without `ETag` or `X-Po-Since` (a file, an older `po serve`)
   is fetched whole each time, as before. `examples/events-demo-server.py`
   shows the headers on its `/events.json`. The window has the desktop's own title bar and a neumorphic style (GTK
-  CSS, one base colour per variant); pass and fail carry a symbol and a word
+  CSS, one base colour per variant): one raised panel per list (Events, Team, Decisions, a project's items) with flat
+  rows inside it, never a raised card per row; every button has a border at 3:1 against the surface, and a selected
+  view tab, range or toggle is filled with the accent colour (not only pressed in); in the dark variant the header,
+  panels, cards and charts have a lighter top edge, since their shadows barely show. Pass and fail carry a symbol and a word
   as well as a colour, text and status colours meet WCAG AA (4.5:1), and the
   light or dark variant follows the desktop's setting (`--theme` overrides it).
   Needs GTK 4 and PyGObject (`pacman -S gtk4 python-gobject`; exit 2 without
@@ -640,16 +659,20 @@ the same from any worktree.
   one Status column, then the `now` item and the `owns` items). `working_on`,
   when present, splits the owns list into `working on:` and `parked:`; absent,
   the whole list is shown as `owns`. Status is
-  `LIMIT until <time>` (in the viewer's local time, with the date when not
-  today; red; it wins over the rest) while `limit_until`, an ISO time, is still
+  `LIMIT until <time>` (in the viewer's local time and named zone, `7:00 PM EST`, then the date when not
+  today, `7:00 PM EST Nov 30`: the one time format of the desktop window and the web page; red; it wins over the rest) while `limit_until`, an ISO time, is still
   ahead (null, absent, past or unparseable is no limit); else `state` as given
   with a live dot when it starts with WORKING; else a FREE badge when `free`;
-  else `state` in muted text (`idle 22m`). An idle agent that still owns
-  items gets a warning card (amber border, ⚠️, "idle, owns 3 items"); missing
+  else `state` in muted text (`idle 22m`). On the web page an idle agent that still owns
+  items gets a warning card (amber border, ⚠️) that names the cause: `idle: its 2 items wait on someone else`
+  when `free`, else `idle, owns 3 items and works on none`; an agent at its usage limit gets none (its LIMIT
+  line is the cause), and the LIMIT line replaces the feed's own `state` text; missing
   or non-array `owns` counts as empty, and warning agents sort to the top of
   the Team view. `usage` is
   `{five_hour, seven_day}`, each 0-1, shown after the status as muted
-  percentages (`5h 42% · 7d 18%`), only the parts present; values above 1 are
+  percentages (`5h 42% · 7d 18%`), only the parts present; when every agent that has a usage has the same one
+  (one subscription), it is said once in the header (`13 agents · subscription 5h 22% · 7d 64%`; the web page:
+  a `Subscription:` line above the cards) and on no line; values above 1 are
   shown as-is (`130%`), and non-numeric values, `NaN`, and `null` are left out
   (never shown as `NaN%`). The guard is `Number.isFinite`. The same words are
   repeated in the card's accessible label (`aria-label`). Old feeds without
@@ -673,7 +696,8 @@ the same from any worktree.
   again collapses. Oldest `asked_at` first (entries without a readable one
   last). `asked_at` is shown relative
   ("3h ago"), its local time in the tooltip; `thread_url`, when present, is
-  muted text you can select and copy, never opened from the window. Refreshed
+  an `Open thread` link (http(s), or a chat app's own `<scheme>://` deep link; a scheme that runs code or
+  reads local data, such as `javascript` or `file`, is never a link and stays muted text). Refreshed
   with the events; a failed fetch keeps the last decisions data and says so.
   An entry you expand stays open across refreshes (until it leaves the feed).
   The view is read-only. The feed is an http(s) URL or a file
@@ -736,12 +760,15 @@ window. `--check` prints the rows the window would show, without a
   `--projects-url` or `PO_DASHBOARD_PROJECTS_URL` (no default; `--projects-url`
   wins; an http(s) URL or a file, like the team feed) reads the projects feed, refreshed
   with the events; a failed fetch keeps the last projects data and says so. The feed is
-  a JSON array of `{project, error?, last_event?, release?, items: [{item, title?, status, agents: [], released?, setup_open?, last_event?}]}`:
+  a JSON array of `{project, error?, last_event?, release?, items: [{item, title?, status, agents: [], released?, setup_open?, last_event?, idle_hours?}]}`:
   `last_event` is an ISO time or null; an item's own `last_event` (optional, the time of that item's newest event, left out when it has none) feeds the web Projects card; `status` is the item's po status word: TODO,
   DOING and DONE, with PAUSED and BLOCKED counted as DOING, and any other word (HELD)
   listed under All only and counted nowhere; `agents` are the names tied to the item,
   in order, filled by the producer of the feed: for TODO the agents that could take it,
   for DOING the one working now, for DONE every agent involved, first event to last.
+  A DOING item's optional `idle_hours` (whole hours since its last event, null or absent when it has no worktree)
+  shows on its project-screen row and on the web Projects card as `idle 3h` (`active` under 1 h); 2 hours or more is
+  stalled: amber and the word (`idle 3h, stalled`), never the colour alone. A feed without the key renders as before.
   A project's light is `active` when its last event is at most 30 minutes old, `idle`
   at most 24 hours old, else `inactive` (null, unreadable or in the future beyond a
   minute is `inactive`). `release` is the project's latest release name, null or absent
@@ -762,10 +789,38 @@ window. `--check` prints the rows the window would show, without a
   `error` is an optional one-line string: the producer sets it when it could not read
   that project this time and sends the last good data instead (items, release,
   last_event), so a project never vanishes from the feed. A card with an `error` is
-  greyed (muted text, no light colour), says `feed error`, carries the error in its
+  greyed (muted text, no light colour; on the web a dashed card on the page background whose text keeps
+  its colours and says why it is grey), says `feed error`, carries the error in its
   tooltip, still opens and shows the last good items; counts and the light come from that
   data. A non-string or empty `error` reads as absent; `--check` adds ` | feed error: <text>`.
   The kit defines the shape only; the producer is yours.
+  `active` (optional, a boolean) says whether the project is switched on in your project switch file (the list
+  of projects your automation drives: one name per line, `#` comment lines). A project whose `active` is false
+  shows a muted `inactive` badge (the word, not only a colour) on its card, desktop and web, and ", switched off
+  (inactive): nothing new is opened" in its tooltip. A card whose entry carries `active` also gets a switch
+  (`active` / `off` beside it); flipping it POSTs, to the same answer sink with the same device token,
+  `{answer_id, kind: "project-active", project, active, answered_at, client: "po-dashboard"}`. Your receiver
+  validates `project`, then removes the project's line (off) or appends it as the last line (on, never twice),
+  leaving every other byte of the file alone; it answers 201 when it wrote, 200 when nothing changed, and a 404
+  with an `X-Reason` (`unknown project`) for a name it does not know. The switch keeps its new position while the
+  feed catches up (3 minutes at most), is off without a sink (and, on the web page, without a device token) and
+  while its POST is out, the card saying why beside it (`read-only: no answer URL`), and a refusal reads
+  `not switched: <why>` on the card. The switch with its word is one click target at least 44 px tall. An entry without `active` (or a
+  non-boolean one) shows neither switch nor badge. The switch only edits the file: what reads it decides what
+  "inactive" means (for example: open nothing new there; items already in progress finish).
+  Every card also has a `Release` button (v0.140). It opens a confirm dialog titled `Release <project>: N DONE
+  items since <last release>` (`since the start (no release yet)` without one), N being the items whose status
+  word is DONE and whose `released` is not true (the rule of `po released`), with an optional note (2000
+  characters at most, counted after trimming), Cancel and Release (Ctrl+Enter or Cmd+Enter in the note sends it too). Release POSTs, to the same answer sink with the
+  same device token, `{answer_id, kind: "release-request", project, note, answered_at, client: "po-dashboard"}`;
+  the note goes as typed. The button is off at N = 0 (`nothing to release: no DONE item since <release>` beside
+  it) and without a sink, stays on for an inactive project, and Release is off while its POST is out; a refusal
+  stays in the dialog with a Retry that re-posts the same `answer_id` (a changed note gets a new one). The button
+  only asks: nothing in the kit tags, pushes or runs `po release`. Your receiver validates `project`, refuses a
+  note over the limit (400, `X-Reason: note too long`) and posts the ask where your PO reads it, for example
+  a ruling line `... cut the release now. Note: <note>` with the note verbatim (its ends stripped only);
+  the PO cuts the release under its usual rules and carries the note verbatim into the close message and the
+  release notes.
   `examples/projects-feed.json` is a sample, and `examples/events-demo-server.py`
   serves it at `/projects.json` with fresh times. `--check` prints
   `name | light | todo/doing/done/released | <release or no release>` per project.
@@ -814,7 +869,8 @@ window. `--check` prints the rows the window would show, without a
   projects feed is set; `--view projects` starts in it, and exits 1 without a feed) is a
   grid of rectangular cards, one per project in the feed's order, wrapping to the window
   width. A card shows a status light (a filled circle: green `active`, yellow `idle`, red
-  `inactive`), the project name with its latest release right-aligned beside it (`no
+  `inactive`) with its words beside it (`active`, `idle 45 min`, `idle 3 h`, `stalled 4 d`, `no events`; a project
+  switched off says `last event 4 d ago`), the project name with its latest release right-aligned beside it (`no
   release` in grey when the feed gives none), and the counts `TODO`, `DOING`, `DONE` and
   `RELEASED`. The light is also spelled out in the card's tooltip and accessible label
   ("orchard, active, TODO 1, DOING 1, DONE 1, RELEASED 0, release-3"), so colour is not the
@@ -824,10 +880,12 @@ window. `--check` prints the rows the window would show, without a
   leaves the cards alone, and one that does keeps the scroll position and the focused card.
   The **project screen** replaces the cards: a header with a Back button (Escape does the
   same; the overview keeps its scroll and the project's card takes the focus back), the
-  project name, its light and its release (right-aligned, as on the card); filter buttons
-  All, TODO, DOING, DONE and RELEASED, each with its
-  count (All at start; the choice is kept across refreshes and per project while the window
-  is open); and one row per item in the feed's order: item id, title, status badge and its
+  project name, its light with its words and its release (right-aligned, as on the card); filter buttons
+  All, TODO, DOING, DONE and RELEASED (the window's own small buttons, the selected one filled), each with its
+  count (DOING at start; the choice is kept across refreshes and per project while the window
+  is open; an empty filter says `no DOING items`); and one flat row per item, newest first (the feed's order
+  reversed), in one panel: item id, title, status badge (a DOING item idle 2 h or more says `idle 3h, stalled` in
+  words as well as colour) and its
   agents, as the feed gives them. TODO rows list the agents that could take the item, DOING
   rows the agent working now (with the live dot of the Team view), DONE rows every agent
   involved in order; none is a muted dash. A refresh rebuilds the rows without resetting
@@ -843,25 +901,41 @@ window. `--check` prints the rows the window would show, without a
   and "Reports". The row is hidden in Team; in Decisions it holds the "Actions" and "Decisions" toggles; the view buttons never move.
   With Show all on the list holds the newest 50 events (after the sort) and a "Load more" button at its foot adds 50 per click, with `N of M` beside it; Show all off resets it. A refresh adds cards only for new events and leaves the others (and the scroll and focus) as they are.
   With `--archive-url` (or `PO_DASHBOARD_ARCHIVE_URL`; the `/archive.json` of a `po serve`, or a file) the row also holds an "Archive" button. Pressing it fetches the archive once (never on the 5-second refresh), turns Show all on, and appends the archived events below the live ones as further pages of 50 under "Load more", each with a muted `archived` marker; pressing it again hides them and drops the data from memory. A failed fetch says so in the error line and keeps the live list. Without the URL the button is hidden.
-  "Reports" swaps the list for a report pane (a title, a time-range choice 24 h / 7 d / 30 d,
-  7 d by default, and five charts; "no events in this range" when the range holds none);
-  "Reports" again returns to the list. The charts (the numbers come from `lib/po/dashboard_reports.py`,
-  no GTK; drawn with GTK's own snapshot API, no drawing library to install): gate runs per agent, one
-  row per agent with stacked pass (solid) and fail (hatched) bars per bucket, hourly for 24 h and daily
-  for 7 d and 30 d, busiest agent first; an empty bucket is not drawn (a muted note under the chart counts the hidden days or hours), each bar shows its count above and its date or hour below, a line under the title says "each bar = one day" (or hour), and every axis top is the closest round step above the highest value, so bars use the height; first-try pass rate per agent, the share of items whose first
-  stamp (per project, item and agent) passed, a horizontal bar with the percentage and n; items closed
-  per day, stacked by project with a legend (a project past the palette's six colours reuses one,
-  hatched); item cycle time per agent, a box plot of the time from an item's open event to its
-  passing close event (whisker min to max, box first to third quartile, a bar at the median, then the
-  median and n; items not yet closed, or with no open event in the feed, are left out, and an item
+  "Reports" swaps the list for a report pane (the header then reads `Reports` over `7 d · as of 6:42 AM EST`, the
+  range and when the events last came in, not the Events count; a time-range choice 24 h / 7 d / 30 d,
+  7 d by default, four headline numbers and five charts; "no events in this range" when the range holds none);
+  "Reports" again returns to the list. The pane opens with four numbers: gate runs, fail rate, first-try rate and
+  items closed, each with the previous period of the same length beside it in words and an arrow
+  (`▲ up 24 from 188, previous 7 d`, `▼ down 7 points from 21 %, previous 7 d`, or `no previous period` when the
+  feed holds nothing that far back). Each chart's title states its finding (`Fail rate fell to 14 %`,
+  `First-try rate rose to 72 %`, `12 items closed, most in api (7)`), its topic is the muted line under it, and
+  a muted line at its foot gives the previous period, the source (the gate event log and which events) and
+  `as of` the last fetch. The charts (the numbers come from `lib/po/dashboard_reports.py`,
+  no GTK; drawn with GTK's own snapshot API, no drawing library to install): the fail rate of gate runs,
+  one line of failed runs over all runs per bucket on a percent axis from 0, hourly for 24 h and daily
+  for 7 d and 30 d; a bucket with no run is a gap in the line, not a zero, the previous period's rate is a
+  dashed line labelled in words, and the last point carries its value; first-try pass rate per agent, the share of items whose first
+  stamp (per project, item and agent) passed, a horizontal bar with the percentage, n and the previous
+  period's rate (a tick on the track and `was 70 %`); agents with fewer than 5 items are not ranked: they sit
+  under a muted `fewer than 5 items, not ranked` line, hatched; a dashed line through every row marks the
+  team average; with a Team feed only the roster's agents count (stamps made without an agent name carry
+  the user's name and are left out); items closed
+  per day, stacked by project, each project in a fixed colour (projects take the palette in name order
+  over the whole feed, so a colour never moves with the range; past the palette's five colours one repeats,
+  hatched), the legend giving each project's total and share and each bar's biggest segment its count inside; item cycle time per agent, a box plot of the time from an item's open event to its
+  passing close event (whisker min to max, a neutral box first to third quartile, a bar at the median, then the
+  median and n, in minutes, hours or days chosen from the medians (hours while every median is under a day),
+  with a tick every whole step from 0; items not yet closed, or with no open event in the feed, are left out, and an item
   counts for the agent that stamped it most, else the agent of its close event); failed legs by kind
   over time, the failed legs of the events counted per leg name per bucket (hourly for 24 h, daily
-  otherwise), stacked, the six leg names with most failures in the range each with a colour and the
-  rest grouped as "other" (hatched grey, last). Colours come from the dashboard theme, light and dark; each chart is an image for assistive
+  otherwise), stacked, at most three leg names that each hold 5 % or more of the failures in shades of
+  the fail colour and the rest grouped as "other" (hatched grey, last), labelled like the closed chart.
+  The project colours are colour-blind-safe hues (blue, orange, purple, teal, olive) that also differ in
+  lightness by 9 L* or more, so every chart still reads in greyscale; a test computes the steps. Colours come from the dashboard theme, light and dark; each chart is an image for assistive
   technology whose label, also its tooltip, is the numbers as a sentence. Days and hours are in the
   viewer's time zone. The charts read these fields of each event in the feed: `kind`, `item`,
   `project`, `result`, `agent`, `time` and `legs` (a list of `{name, result}`); `examples/events-demo-server.py`
-  serves enough open, stamp and close events to show all five (and an `/archive.json` of older ones). The 24 h and 7 d ranges read the live events only. The 30 d range is longer than the default live window (10 days), so it needs the archive: with `--archive-url` set it is fetched when 30 d is chosen (and dropped when you leave the range) and the charts read live plus archive; without it the pane says `older than the live window; archive not configured` above the charts of the live events. `--screenshot` with `--view reports` saves the pane. The range and the pane
+  serves enough open, stamp and close events to show all five (and an `/archive.json` of older ones). The numbers compare against the previous period, so a range reads twice its length back. 24 h reads the live events only. The 7 d range's previous period and the whole 30 d range are older than the default live window (10 days), so they need the archive: with `--archive-url` set it is fetched once when such a range is shown (and dropped when only 24 h is) and the charts read live plus archive; without it 7 d has no previous period and the 30 d pane says `older than the live window; archive not configured` above the charts of the live events. `--screenshot` with `--view reports` saves the pane. The range and the pane
   survive the 5-second refresh. `--view reports` starts in the pane.
   The Events and Team lists have a header line of column titles in muted text
   (same widths as the rows, so each sits over its data). Each is a button
@@ -932,3 +1006,4 @@ events/seen/born means a leak outside the records. Pass `--no-memory-log` to dis
 MIT; see `LICENSE`. Provided as-is.
 
 
+Memory write-back: at a retry, hang, rollback, refused action, second attempt at the same step, or ruling received, the task is not done until a memory proposal is filed or `nothing new learned` is written in the report; a memory reads "next time X, do Y, because Z", carries when it stops applying, and a shipped-feature summary is a changelog line, not a memory.

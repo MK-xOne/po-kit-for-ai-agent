@@ -146,6 +146,15 @@ po_cmd_close() {
 	# Setup after install: the spec's section, under [close] require_setup.
 	po_setup_check "$version" "$tag" "$mtip" "$tip" "$mtip"
 
+	# Memory write-back: with [close] memory = true, a --commit needs a
+	# "Memory:" line in the body: a proposal id, a "proposed" note, or
+	# "nothing new learned".
+	if [[ ${PO_MANIFEST[close.memory]:-false} == true && $commit == 1 ]]; then
+		if [[ -z $body_file ]] || ! grep -qiE '^Memory:[[:space:]]*(.*nothing new learned|.*proposed|[0-9]{8}-[0-9]{6}-[0-9a-f]{4})' "$body_file"; then
+			po_refuse "the close body (--body-file) needs a line 'Memory: <proposal id | proposed: ...>' or 'Memory: nothing new learned'"
+		fi
+	fi
+
 	# --also-done: investigations that close with no merge and no tag.
 	local a ab
 	for a in "${also[@]}"; do
@@ -228,6 +237,8 @@ po_cmd_close() {
 	printf 'evidence  %s\n' "$(po_rel "$stamp")"
 	printf '%s\n' "$block" | sed 's/^/          /'
 	po_setup_plan_line
+	[[ ${PO_MANIFEST[close.memory]:-false} != true ]] ||
+		printf "memory    file a proposal or record 'nothing new learned' with the close body\\n"
 	printf '\nSTEPS\n'
 	local s=1 tagmsg="$tag: $title" tagat
 	tagat=$(po_short "$tip")

@@ -116,6 +116,24 @@ check("web: empty events returns no groups", C.group_events([]).length === 0);
 check("web: item label All shows project and item", C.item_label({project: "demo", item: "0.1"}, "") === "demo v0.1");
 check("web: item label filtered shows item only", C.item_label({project: "demo", item: "0.1"}, "demo") === "v0.1");
 check("web: item label empty project", C.item_label({project: "", item: "0.1"}, "") === "v0.1");
+check("web: v0.146 item label with item - and All shows the project alone", C.item_label({project: "demo", item: "-"}, "") === "demo",
+  C.item_label({project: "demo", item: "-"}, ""));
+check("web: v0.146 item label with item - and one project is empty", C.item_label({project: "demo", item: "-"}, "demo") === "",
+  C.item_label({project: "demo", item: "-"}, "demo"));
+check("web: v0.146 item label with empty item is the same as -",
+  C.item_label({project: "demo", item: ""}, "") === "demo" && C.item_label({project: "demo", item: ""}, "demo") === "");
+check("web: v0.146 item label keeps an item that already starts with v", C.item_label({project: "demo", item: "v1.2"}, "") === "demo v1.2",
+  C.item_label({project: "demo", item: "v1.2"}, ""));
+var itemless = C.group_events([
+  {time: "2026-11-01T12:00:00Z", project: "demo", item: "-", kind: "note"},
+  {time: "2026-11-01T11:00:00Z", project: "demo", item: "", kind: "note"},
+  {time: "2026-11-01T10:00:00Z", project: "demo", kind: "note"},
+  {time: "2026-11-01T09:00:00Z", project: "demo", item: "0.1", kind: "stamp"},
+]);
+var heads = [];
+["", "demo"].forEach(function (f) { itemless.forEach(function (g) { heads.push(C.item_label(g, f)); }); });
+check("web: v0.146 no Events card head reads v-", itemless.length === 3 && heads.every(function (h) { return h.indexOf("v-") < 0; }),
+  JSON.stringify(heads));
 
 // filter_events
 check("web: filter_events empty project returns all", C.filter_events(evts, "").length === 5);
@@ -129,12 +147,31 @@ function isoLocal(d) {
 check("web: usage_words both parts", C.usage_words({five_hour: 0.8, seven_day: 0.12}, null, NOW) === "80% of the 5 h window used, 12% of the 7 d window");
 check("web: usage_words one part", C.usage_words({five_hour: 1.0}, null, NOW) === "100% of the 5 h window used");
 check("web: usage_words none", C.usage_words({}, null, NOW) === "");
-check("web: usage_words limit until today", C.usage_words(null, isoLocal(NOW), NOW) === "limit until " + locHm(NOW));
-check("web: usage_words limit until another day", C.usage_words(null, isoLocal(new Date(NOW.getFullYear(), NOW.getMonth(), NOW.getDate() + 1, NOW.getHours(), NOW.getMinutes())), NOW).startsWith("limit until " + locHm(new Date(NOW.getFullYear(), NOW.getMonth(), NOW.getDate() + 1, NOW.getHours(), NOW.getMinutes())) + " "));
-check("web: usage_words with limit and usage", C.usage_words({five_hour: 0.5}, isoLocal(NOW), NOW) === "50% of the 5 h window used, limit until " + locHm(NOW));
 check("web: usage_words over 100%", C.usage_words({five_hour: 1.3}, null, NOW) === "130% of the 5 h window used");
 check("web: usage_words non-numeric", C.usage_words({five_hour: NaN, seven_day: "x"}, null, NOW) === "");
-check("web: usage_words limit only", C.usage_words(null, isoLocal(new Date(NOW.getFullYear(), NOW.getMonth(), NOW.getDate(), 23, 30)), NOW) === "limit until 11:30 PM");
+// v0.142 (15): the limit is no longer part of the usage; limitText says it once, in the one time format
+check("web: v0.142 usage_words never says the limit (it is the state line now)", C.usage_words({five_hour: 0.5}, isoLocal(NOW), NOW) === "50% of the 5 h window used" && C.usage_words(null) === "");
+check("web: v0.142 limitText today is `LIMIT until 3:30 PM UTC`", C.limitText({ limit_until: isoLocal(new Date(2026, 10, 1, 15, 30)) }, NOW) === "LIMIT until 3:30 PM UTC", C.limitText({ limit_until: isoLocal(new Date(2026, 10, 1, 15, 30)) }, NOW));
+check("web: v0.142 limitText another day adds the date: `LIMIT until 7:00 PM UTC Nov 30`", C.limitText({ limit_until: "2026-11-30T19:00:00Z" }, NOW) === "LIMIT until 7:00 PM UTC Nov 30");
+check("web: v0.142 limitText of a past, missing or unreadable limit is empty",
+  ["2026-11-01T14:00:00Z", null, undefined, "soon", 5].every((v) => C.limitText({ limit_until: v }, NOW) === "") && C.limitText(null, NOW) === "");
+check("web: v0.142 clockText is h:mm AM/PM and the zone, midnight and noon as 12", C.clockText(new Date(2026, 10, 1, 0, 5), NOW) === "12:05 AM UTC" && C.clockText(new Date(2026, 10, 1, 12, 0), NOW) === "12:00 PM UTC");
+// the same instants through the desktop's clock_text in a zone with daylight time: one format on both screens
+const pyClock = (isos, nowIso) => JSON.parse(require("child_process").execFileSync("python3", ["-B", "-c",
+  "import json,sys,datetime as d; sys.path.insert(0, sys.argv[1]); import dashboard_core as c; n = c.parse_time(sys.argv[3]);"
+  + " print(json.dumps([c.clock_text(c.parse_time(t), n) for t in json.loads(sys.argv[2])]))",
+  path.join(__dirname, "..", "lib", "po"), JSON.stringify(isos), nowIso], { env: Object.assign({}, process.env, { TZ: "America/Toronto" }) }).toString());
+const jsClock = (isos, nowIso) => JSON.parse(require("child_process").execFileSync(process.execPath, ["-e",
+  "const C = require(process.argv[1]); const n = new Date(process.argv[3]); console.log(JSON.stringify(JSON.parse(process.argv[2]).map((t) => C.clockText(new Date(t), n))))",
+  path.join(__dirname, "..", "share", "po-web", "core.js"), JSON.stringify(isos), nowIso], { env: Object.assign({}, process.env, { TZ: "America/Toronto" }) }).toString());
+const instants = ["2026-12-01T00:00:00Z", "2026-11-04T11:42:00Z", "2026-07-04T16:05:00Z", "2026-11-04T04:59:00Z", "2099-01-01T12:00:00Z"];
+check("web: v0.142 the page and the desktop write one time format with the zone (`7:00 PM EST Nov 30`)",
+  eq(jsClock(instants, "2026-11-04T12:00:00Z"), pyClock(instants, "2026-11-04T12:00:00Z"))
+  && jsClock(instants, "2026-11-04T12:00:00Z")[0] === "7:00 PM EST Nov 30" && jsClock(instants, "2026-11-04T12:00:00Z")[1] === "6:42 AM EST"
+  && jsClock(instants, "2026-11-04T12:00:00Z")[2] === "12:05 PM EDT Jul 4" && jsClock(instants, "2026-11-04T12:00:00Z")[4] === "7:00 AM EST Jan 1 2099", JSON.stringify([jsClock(instants, "2026-11-04T12:00:00Z"), pyClock(instants, "2026-11-04T12:00:00Z")]));
+// v0.142 (15): one subscription's usage is said once above the Team cards, not on every card
+check("web: v0.142 teamUsage gives the one usage the agents share", C.teamUsage([{ usage: { five_hour: 0.22, seven_day: 0.64 } }, { usage: null }, { usage: { five_hour: 0.22, seven_day: 0.64 } }]) === "22% of the 5 h window used, 64% of the 7 d window");
+check("web: v0.142 teamUsage is empty when the usages differ or none has one", C.teamUsage([{ usage: { five_hour: 0.2 } }, { usage: { five_hour: 0.3 } }]) === "" && C.teamUsage([{}, { usage: null }]) === "" && C.teamUsage(null) === "");
 
 // split_owns
 check("web: split_owns with working_on in list", JSON.stringify(C.split_owns(["1.4", "1.5", "1.6"], "1.4")) === JSON.stringify({working_on: ["1.4"], parked: ["1.5", "1.6"]}));
@@ -149,17 +186,35 @@ var unsorted = [
   {agent: "cy", state: "idle 3h", owns: []},
   {agent: "di", state: "idle 5m", owns: ["1.7"]}
 ];
-var sorted = C.team_sort(unsorted);
+var sorted = C.team_sort(unsorted, NOW);
 check("web: team_sort warning agents first", sorted[0].agent === "bo" && sorted[1].agent === "di" && sorted[2].agent === "ada" && sorted[3].agent === "cy");
 check("web: team_sort keeps feed order within groups", JSON.stringify(sorted.map((a) => a.agent)) === JSON.stringify(["bo", "di", "ada", "cy"]));
 check("web: team_sort copies a short array", JSON.stringify(C.team_sort([unsorted[2]]).map((a) => a.agent)) === JSON.stringify(["cy"]));
 
 // team_warning
 check("web: team_warning working owns", C.team_warning({state: "WORKING", owns: ["1.4"]}) === null);
-check("web: team_warning idle owns", C.team_warning({state: "idle 22m", owns: ["1.5", "1.6"]}) === "idle, owns 2 items");
+check("web: team_warning idle owns names the cause (v0.142)", C.team_warning({state: "idle 22m", owns: ["1.5", "1.6"]}, NOW) === "idle, owns 2 items and works on none");
 check("web: team_warning idle none", C.team_warning({state: "idle 22m", owns: []}) === null);
-check("web: team_warning idle one", C.team_warning({state: "idle 22m", owns: ["1.7"]}) === "idle, owns 1 item");
+check("web: team_warning idle one", C.team_warning({state: "idle 22m", owns: ["1.7"]}, NOW) === "idle, owns 1 item and works on none");
+check("web: v0.142 team_warning of a FREE agent says its items wait on someone else", C.team_warning({state: "idle 50 min", free: true, owns: ["1.7"]}, NOW) === "idle: its 1 item waits on someone else"
+  && C.team_warning({state: "idle 50 min", free: true, owns: ["1.7", "1.8"]}, NOW) === "idle: its 2 items wait on someone else");
+check("web: v0.142 no idle warning on an agent at its usage limit (LIMIT is the cause)", C.team_warning({state: "LIMIT until Nov 30 7:00 PM", owns: ["1.7"], limit_until: "2026-11-30T19:00:00Z"}, NOW) === null
+  && C.team_warning({state: "idle 5m", owns: ["1.7"], limit_until: "2026-11-01T14:00:00Z"}, NOW) === "idle, owns 1 item and works on none");
 check("web: team_warning idle missing owns", C.team_warning({state: "idle 22m"}) === null);
+
+// v0.141 (5): an item in the Team view is "v" + a bare version, a "project vX" value as it is
+check("web: v0.141 itemRef keeps a value that already says project and version",
+  C.itemRef("harbor v1.10.5.1") === "harbor v1.10.5.1" && C.itemRef("orchard v1.9.57.3") === "orchard v1.9.57.3", C.itemRef("harbor v1.10.5.1"));
+check("web: v0.141 itemRef puts v before a bare version", C.itemRef("0.141") === "v0.141" && C.itemRef(" 1.9.57.3 ") === "v1.9.57.3");
+check("web: v0.141 itemRef never doubles the v", C.itemRef("v0.141") === "v0.141" && C.itemRef("") === "" && C.itemRef(null) === "");
+// v0.141 (4): an Events card head names the newest event's result (mark and word) and its kind
+const hd = (e) => C.eventHead(e);
+check("web: v0.141 a passing stamp heads its card with the check mark, `pass` and `stamp`",
+  eq(hd({ kind: "stamp", result: "pass" }), { mark: "\u2714", word: "pass", kind: "stamp", cls: "ok" }), JSON.stringify(hd({ kind: "stamp", result: "pass" })));
+check("web: v0.141 a failing stamp heads its card with the cross, `fail`, the bad colour class",
+  eq(hd({ kind: "stamp", result: "fail" }), { mark: "\u2718", word: "fail", kind: "stamp", cls: "bad" }));
+check("web: v0.141 a close and an open carry their kind; an event with no result has no mark",
+  hd({ kind: "close", result: "pass" }).kind === "close" && eq(hd({ kind: "open" }), { mark: "", word: "", kind: "open", cls: "" }));
 
 // C5, C8: the files
 const files = ["index.html", "core.js", "app.js", "style.css"].map((f) => [f, fs.readFileSync(path.join(dir, f), "utf8")]);
@@ -177,12 +232,12 @@ const doing = (item, agents, last) => Object.assign({ item: item, status: "DOING
 let d = D([doing("0.99", ["budy"], "2026-11-01T14:58:00Z")]);
 check("web: doingLines writes a fresh DOING item as `v0.99 - budy - 2m ago`, not stalled", eq(d, { lines: [{ text: "v0.99 - budy - 2m ago", stalled: false }], more: 0 }), JSON.stringify(d));
 d = D([doing("0.98", ["ana"], "2026-11-01T14:20:00Z")]);
-check("web: doingLines marks an item whose last event is older than 30 min stalled", d.lines[0].text === "v0.98 - ana - 40m ago" && d.lines[0].stalled === true, JSON.stringify(d));
+check("web: doingLines marks an item whose last event is older than 30 min stalled, in words too (v0.142)", d.lines[0].text === "v0.98 - ana - 40m ago, stalled" && d.lines[0].stalled === true, JSON.stringify(d));
 check("web: doingLines treats exactly stall_minutes as not yet stalled", D([doing("1", ["a"], "2026-11-01T14:30:00Z")]).lines[0].stalled === false);
 check("web: doingLines takes stall_minutes from its argument", D([doing("1", ["a"], "2026-11-01T14:20:00Z")], 60).lines[0].stalled === false && D([doing("1", ["a"], "2026-11-01T14:58:00Z")], 1).lines[0].stalled === true);
 d = D([doing("0.97", ["cy"])]);
-check("web: doingLines with no last_event says `no events` and is stalled", d.lines[0].text === "v0.97 - cy - no events" && d.lines[0].stalled === true, JSON.stringify(d));
-check("web: doingLines with an unreadable time says `no events` and is stalled", D([doing("0.96", ["cy"], "soon")]).lines[0].text === "v0.96 - cy - no events");
+check("web: doingLines with no last_event says `no events` and is stalled", d.lines[0].text === "v0.97 - cy - no events, stalled" && d.lines[0].stalled === true, JSON.stringify(d));
+check("web: doingLines with an unreadable time says `no events` and is stalled", D([doing("0.96", ["cy"], "soon")]).lines[0].text === "v0.96 - cy - no events, stalled");
 d = D([doing("0.95", [], "2026-11-01T14:58:00Z")]);
 check("web: doingLines with no owner leaves the owner out", d.lines[0].text === "v0.95 - 2m ago", JSON.stringify(d));
 const many = [1, 2, 3, 4, 5, 6, 7].map((i) => doing("m" + i, ["a"], "2026-11-01T14:58:00Z"));
@@ -192,6 +247,13 @@ check("web: doingLines of exactly 5 has no more", D(many.slice(0, 5)).more === 0
 d = D([{ item: "1", status: "TODO" }, { item: "2", status: "DONE" }, { item: "3", status: "PAUSED", agents: ["x"], last_event: "2026-11-01T14:58:00Z" }]);
 check("web: doingLines lists only DOING (PAUSED and BLOCKED count as DOING)", d.lines.length === 1 && d.lines[0].text.startsWith("v3"), JSON.stringify(d));
 check("web: doingLines of a non-list is empty", eq(C.doingLines(null, NOW), { lines: [], more: 0 }));
+// v0.130: idle_hours per DOING item
+const idl = (h) => Object.assign(doing("7", ["a"], "2026-11-01T14:58:00Z"), { idle_hours: h });
+d = D([idl(0.5), idl(3), idl(72), idl(1), idl(2)]);
+check("web: doingLines writes `active` under 1 h and `idle 3h` otherwise, stalled from 2 h and says so",
+  eq(d.lines.map((l) => [l.text, l.stalled]), [["v7 - a - active", false], ["v7 - a - idle 3h, stalled", true], ["v7 - a - idle 72h, stalled", true], ["v7 - a - idle 1h", false], ["v7 - a - idle 2h, stalled", true]]), JSON.stringify(d));
+d = D([idl(null), idl("x")]);
+check("web: doingLines with a null or unreadable idle_hours falls back to the last event's age", d.lines.every((l) => l.text === "v7 - a - 2m ago" && l.stalled === false), JSON.stringify(d));
 const proj = C.parseFeed(feed("projects-feed.json"));
 let card = C.projectCard(proj[0], NOW);
 check("web: projectCard of the example: release, count line, setup line, one fresh DOING line",
@@ -200,7 +262,7 @@ check("web: projectCard of the example: release, count line, setup line, one fre
 card = C.projectCard(proj[1], NOW);
 check("web: projectCard says `no release` muted and wraps the n not in a filter line", card.release === "no release" && card.releaseMuted === true && card.lost === "12 not in a filter: 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 1.10, 1.11, 1.12, 1.13", card.release + "|" + card.lost);
 card = C.projectCard(proj[2], NOW);
-check("web: projectCard of a project with error is grey, says feed error and keeps its counts", card.grey === true && card.error === "feed error" && card.countLine.indexOf("RELEASED 1") > 0 && card.setup === "setup open 1", JSON.stringify(card));
+check("web: projectCard of a project with error is grey, says why in words and keeps its counts", card.grey === true && card.error === C.GREY_REASON && /feed failed/.test(card.error) && card.countLine.indexOf("RELEASED 1") > 0 && card.setup === "setup open 1", JSON.stringify(card));
 check("web: projectCard of a healthy project is not grey", C.projectCard(proj[0], NOW).grey === false && C.projectCard(proj[0], NOW).error === "");
 
 // contrast: the CSS variables of each scheme, text pairs at 4.5:1 (WCAG AA)
@@ -213,10 +275,34 @@ const css = files[3][1];
 const vars = (block) => Object.fromEntries([...block.matchAll(/--([a-z-]+):\s*(#[0-9a-fA-F]{6})/g)].map((m) => [m[1], m[2]]));
 const light = vars(css.slice(0, css.indexOf("@media")));
 const dark = vars(css.slice(css.indexOf("prefers-color-scheme: dark")));
-const PAIRS = [["text", "bg"], ["text", "card"], ["muted", "bg"], ["muted", "card"], ["warn", "bg"], ["warn", "card"], ["ok", "card"], ["bad", "card"], ["on-accent", "accent"], ["accent", "bg"]];
+const PAIRS = [["text", "bg"], ["text", "card"], ["muted", "bg"], ["muted", "card"], ["warn", "bg"], ["warn", "card"], ["ok", "card"], ["bad", "card"], ["on-accent", "accent"], ["accent", "bg"], ["accent", "card"]];
 for (const [name, v] of [["light", light], ["dark", Object.assign({}, light, dark)]]) {
   const low = PAIRS.filter(([f, b]) => !(v[f] && v[b]) || ratio(v[f], v[b]) < 4.5).map(([f, b]) => f + "/" + b + (v[f] && v[b] ? " " + ratio(v[f], v[b]).toFixed(2) : " missing"));
   check("web: " + name + " scheme text colours meet WCAG AA (4.5:1)", low.length === 0, low.join("; "));
+}
+// v0.142 (6): every control has a border at 3:1 against the page and the card (--edge), and a selected view tab or
+// filter chip is filled with the accent, which stands 3:1 on both too, in both schemes
+const ruleOf = (sel) => { const m = css.match(new RegExp("(?:^|\\n)" + sel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\s*\\{([^}]*)\\}")); return m ? m[1] : null; };
+for (const [name, v] of [["light", light], ["dark", Object.assign({}, light, dark)]]) {
+  const low = [["edge", "bg"], ["edge", "card"], ["accent", "bg"], ["accent", "card"]].filter(([f, b]) => !(v[f] && v[b]) || ratio(v[f], v[b]) < 3)
+    .map(([f, b]) => f + "/" + b + (v[f] && v[b] ? " " + ratio(v[f], v[b]).toFixed(2) : " missing"));
+  check("web: v0.142 " + name + " control edges and the selected fill reach 3:1 on page and card", low.length === 0, low.join("; "));
+}
+const controls = ["#views button", "#event-filters .chip", "#settings-toggle", "#settings input", ".writein textarea"];
+const noEdge = controls.filter((sel) => !/border:\s*1px solid var\(--edge\)/.test(ruleOf(sel) || ""));
+check("web: v0.142 every control's border is --edge", noEdge.length === 0, noEdge.join("; "));
+const selFill = ['#views button[aria-current="page"]', "#event-filters .chip.on"].filter((sel) => !/background:\s*var\(--accent\)/.test(ruleOf(sel) || "") || !/color:\s*var\(--on-accent\)/.test(ruleOf(sel) || ""));
+check("web: v0.142 the selected view tab and filter chip are filled with the accent, its own text colour on it", selFill.length === 0, selFill.join("; "));
+check("web: v0.142 the settings link has no frame and smaller text", /border:\s*0/.test(ruleOf("#settings-toggle.link") || "") && /font-size:\s*\.875rem/.test(ruleOf("#settings-toggle.link") || ""));
+// v0.141 (14): a greyed project card keeps its text colours: no opacity on it, and its muted text on its own background
+// stays 4.5:1 in both schemes
+const rule = (sel) => { const m = css.match(new RegExp(sel.replace(/\./g, "\\.") + "\\s*\\{([^}]*)\\}")); return m ? m[1] : null; };
+const grey = rule(".card.grey");
+const greyBg = grey && (grey.match(/background(?:-color)?:\s*var\(--([a-z-]+)\)/) || [])[1];
+check("web: v0.141 a greyed card has no opacity and a background of its own", grey !== null && !/opacity/.test(grey) && !!greyBg, grey);
+for (const [name, v] of [["light", light], ["dark", Object.assign({}, light, dark)]]) {
+  const r = greyBg && v[greyBg] ? ratio(v.muted, v[greyBg]) : 0;
+  check("web: v0.141 " + name + " muted text on a greyed card reaches 4.5:1 (" + r.toFixed(2) + ")", r >= 4.5, greyBg);
 }
 check("web: the page has a viewport meta and a dark scheme", /name="viewport"/.test(files[0][1]) && /prefers-color-scheme: dark/.test(css));
 
@@ -224,11 +310,51 @@ check("web: the page has a viewport meta and a dark scheme", /name="viewport"/.t
 var decisionsFeed = C.parseFeed(feed("decisions-feed.json"));
 var projectsFeed = C.parseFeed(feed("projects-feed.json"));
 var teamFeed = C.parseFeed(feed("team-feed.json"));
-check("web: decisions view keeps feed order", JSON.stringify(decisionsFeed.map((c) => c.id)) === JSON.stringify([decisionsFeed[0].id, decisionsFeed[1].id, decisionsFeed[2].id, decisionsFeed[3].id, decisionsFeed[4].id, decisionsFeed[5].id]));
+// v0.141 (17): the decisions view sorts as the desktop viewer does (dashboard_core.sort_decisions), not in feed order
+function desktopOrder(cards) {
+  const py = 'import json,sys; sys.path.insert(0, sys.argv[1]); import dashboard_core as c;'
+    + ' print(json.dumps([d["_i"] for d in c.sort_decisions(json.loads(sys.argv[2]))]))';
+  const tagged = cards.map((c, i) => Object.assign({}, c, { _i: i }));
+  return JSON.parse(require("child_process").execFileSync("python3", ["-B", "-c", py, path.join(__dirname, "..", "lib", "po"), JSON.stringify(tagged)]).toString());
+}
+const webOrder = (cards) => C.sortDecisions(cards.map((c, i) => Object.assign({}, c, { _i: i }))).map((c) => c._i);
+const mixed = decisionsFeed.concat([
+  { kind: "choice", id: "late", title: "no time", question: "q", options: [{ label: "a" }, { label: "b" }], asked_at: "soon" },
+  { title: "legacy, oldest", asked_at: "2026-10-01T00:00:00Z" },
+  { kind: "choice", id: "tie-1", title: "tie 1", question: "q", options: [{ label: "a" }, { label: "b" }], asked_at: "2026-10-24T14:40:00Z" },
+  { kind: "action", id: "act-old", title: "old action", machine: "m", done_when: "d", steps: [{ text: "s" }], asked_at: "2026-10-01T00:00:00Z" },
+  { kind: "nonsense", id: "u1", title: "unformatted" }]).reverse();
+check("web: v0.141 the decisions view sorts Choices first, then Actions, the rest last, oldest asked first",
+  eq(C.sortDecisions(decisionsFeed).map((c) => C.decisionShape(c)), ["choice", "choice", "choice", "action", "legacy", "unformatted"]),
+  C.sortDecisions(decisionsFeed).map((c) => c.id).join(" "));
+check("web: v0.141 the web and desktop sorts give the same order (example feed, ties, unreadable times, every kind)",
+  eq(webOrder(decisionsFeed), desktopOrder(decisionsFeed)) && eq(webOrder(mixed), desktopOrder(mixed)),
+  JSON.stringify([webOrder(mixed), desktopOrder(mixed)]));
+check("web: v0.141 sortDecisions leaves the feed itself in its order", decisionsFeed[0].kind === undefined && decisionsFeed[1].id === "ask-0707");
+// (17) every card kind carries its thread link (http(s) only)
+const shapes = {};
+mixed.forEach((c) => { shapes[C.decisionShape(c)] = true; });
+const linked = mixed.map((c) => Object.assign({}, c, { thread_url: "https://chat.example.org/t/" + (c.id || "x") }));
+check("web: v0.141 every card kind (choice, action, unformatted, legacy) gets its thread link",
+  Object.keys(shapes).length === 4 && linked.every((c) => C.decisionCard(c, NOW).thread === c.thread_url), Object.keys(shapes).join(" "));
+check("web: v0.141 no thread link for a scheme that runs code or reads local data, no host, text or nothing",
+  ["javascript" + ":alert(1)", "JavaScript://x%0aalert(1)", "vbscript://x", "data:text/html,x", "data://x", "file:///etc/passwd", "blob://x",
+    "about://blank", "mailto:a@b", "https://", "not a url", "chat://a b", "", null].every((u) => C.decisionCard({ thread_url: u }, NOW).thread === ""));
+check("web: v0.141 http(s) and a chat app's own deep link are links, trimmed",
+  C.decisionCard({ thread_url: " http://h/t/1 " }, NOW).thread === "http://h/t/1"
+  && C.decisionCard({ thread_url: "chat://message?channel=c1&id=e1&thread=r1" }, NOW).thread === "chat://message?channel=c1&id=e1&thread=r1");
+check("web: v0.141 the page and the desktop accept the same thread links",
+  ["https://h/t", "chat://m?x=1", "javascript" + "://x", "data://x", "mailto:a@b", "https://", "x y"].every((u) =>
+    C.threadUrl(u) === JSON.parse(require("child_process").execFileSync("python3", ["-B", "-c",
+      "import json,sys; sys.path.insert(0, sys.argv[1]); import dashboard_core as c; print(json.dumps(c.thread_link(sys.argv[2])))",
+      path.join(__dirname, "..", "lib", "po"), u]).toString())));
+check("web: v0.141 the example legacy (LOOK) card links its thread", C.decisionCard(decisionsFeed[0], NOW).thread === "https://chat.example.org/t/8f2c41");
 check("web: projects view keeps feed order", JSON.stringify(projectsFeed.map((c) => c.project)) === JSON.stringify(projectsFeed.map((c) => c.project)));
-var sortedTeam = C.team_sort(teamFeed);
-check("web: team view sorts warning agents before non-warning", sortedTeam[0].agent === "bo" && sortedTeam[1].agent === "di" && sortedTeam[2].agent === "ada" && sortedTeam[3].agent === "cy");
-check("web: team view keeps feed order within groups", JSON.stringify(sortedTeam.map((c) => c.agent)) === JSON.stringify(["bo", "di", "ada", "cy"]));
+var sortedTeam = C.team_sort(teamFeed, NOW);
+// v0.142: di is at its usage limit, so it has no idle warning and keeps its feed place
+check("web: team view sorts warning agents before non-warning", sortedTeam[0].agent === "bo" && sortedTeam[1].agent === "ada" && sortedTeam[2].agent === "cy" && sortedTeam[3].agent === "di");
+check("web: team view keeps feed order within groups", JSON.stringify(sortedTeam.map((c) => c.agent)) === JSON.stringify(["bo", "ada", "cy", "di"]));
+check("web: v0.142 the example Team feed's usage differs per agent, so each card keeps its own", C.teamUsage(teamFeed) === "");
 
 // ---- answering (v0.116) ----
 const { execFileSync } = require("child_process");
@@ -331,4 +457,75 @@ const pyHeld = JSON.parse(execFileSync("python3", ["-B", "-c", 'import json,sys,
   path.join(__dirname, "..", "lib", "po"), JSON.stringify([lookCard].concat(held.map(([, c]) => c)))]).toString());
 check("web: lookReady agrees with the desktop viewer's look_ready on every fixture", JSON.stringify(pyHeld) === JSON.stringify([lookCard].concat(held.map(([, c]) => c)).map((c) => C.lookReady(c, lookNow)[0])), JSON.stringify(pyHeld));
 check("web: a card that is not a look card is never held", C.holdLooks(decisionsFeed, lookNow).length === decisionsFeed.length);
+
+// v0.139: the project switch
+const swFeed = [Object.assign({}, proj[0], { active: false }), Object.assign({}, proj[0], { active: true }), proj[0], Object.assign({}, proj[0], { active: "no" })];
+const swCards = swFeed.map((p) => C.projectCard(p, NOW));
+check("web: v0.139 projectCard of an inactive project carries active false and the `inactive` badge", swCards[0].active === false && swCards[0].badge === "inactive", JSON.stringify(swCards[0]));
+check("web: v0.139 projectCard of an active project carries active true and no badge", swCards[1].active === true && swCards[1].badge === "");
+check("web: v0.139 a feed without the key (or a non-boolean) still renders: active null, no badge, the old card",
+  swCards[2].active === null && swCards[2].badge === "" && swCards[3].active === null && eq(swCards[2], C.projectCard(Object.assign({}, proj[0], { active: undefined }), NOW)), JSON.stringify(swCards[2]));
+const swBody = C.projectActiveBody("orchard", false, "0b7e3c1a-5d2f-4a8e-9c61-3f0d2b8a7e41", new Date(Date.UTC(2026, 10, 4, 2, 0, 0)));
+check("web: v0.139 projectActiveBody is the desktop viewer's body",
+  eq(swBody, { answer_id: "0b7e3c1a-5d2f-4a8e-9c61-3f0d2b8a7e41", kind: "project-active", project: "orchard", active: false, answered_at: "2026-11-04T02:00:00Z", client: "po-dashboard" }), JSON.stringify(swBody));
+const pySw = JSON.parse(execFileSync("python3", ["-I", "-c",
+  "import sys, json; sys.path.insert(0, sys.argv[1]); import dashboard_core as c; print(json.dumps(sorted(c.project_active_body('orchard', False, 'x'))))",
+  path.join(__dirname, "..", "lib", "po")]).toString());
+check("web: v0.139 the web body has the same fields as the desktop viewer's project_active_body", eq(pySw, Object.keys(swBody).sort()), JSON.stringify(pySw));
+check("web: v0.139 switchShown keeps a pending switch until the feed shows it or its hold runs out",
+  C.switchShown(true, { active: false, at: 1000 }, 2000) === false && C.switchShown(true, { active: false, at: 1000 }, 1000 + C.SWITCH_HOLD_MS) === true &&
+  C.switchShown(false, null, 0) === false && C.switchShown(true, { active: true, at: 1000 }, 2000) === true);
+check("web: v0.139 switchSettled: the feed agrees or the hold ran out",
+  C.switchSettled(false, { active: false, at: 1000 }, 1001) && C.switchSettled(true, { active: false, at: 0 }, C.SWITCH_HOLD_MS) && !C.switchSettled(true, { active: false, at: 1000 }, 1001) && C.switchSettled(true, null, 0));
+check("web: v0.139 switchResult is empty on 200/201 and says why otherwise",
+  C.switchResult(201, null) === "" && C.switchResult(200, null) === "" && C.switchResult(404, "unknown project") === "not switched: unknown project" &&
+  C.switchResult(401, null).indexOf("check the device token") > 0 && C.switchResult(0, "timeout") === "not switched: timeout" && C.switchResult(500, "<b>x</b>") === "not switched: status 500");
+check("web: v0.139 the page shows the badge as text and the switch as a role=switch button with aria-checked and its state in words",
+  /if \(badge\) top\.appendChild\(el\("span", "badge", badge\)\)/.test(appJs) && appJs.indexOf('setAttribute("role", "switch")') > 0 &&
+  appJs.indexOf('setAttribute("aria-checked"') > 0 && appJs.indexOf('shown ? "active" : "off"') > 0);
+check("web: v0.139 no switch is drawn for a feed without the key", appJs.indexOf("var row = d.active !== null ? switchRow(d) : null;") > 0);
+check("web: v0.139 the switch posts on the answer path with the device token and stays off without them",
+  /var req = sinkRequest\(body\);/.test(appJs) && appJs.indexOf("b.disabled = !answerUrl || !tokenSet()") > 0);
+check("web: v0.139 the switch is a 44 px target and the knob edge holds 3:1 in both schemes",
+  /\.switch \{[^}]*min-height: 44px/.test(css) && [light, Object.assign({}, light, dark)].every((v) => ratio(v.text, v.line) >= 3 && ratio(v.muted, v.bg) >= 3),
+  [light, Object.assign({}, light, dark)].map((v) => ratio(v.text, v.line).toFixed(2)).join(" "));
+// v0.140: the Release button
+const rlFeed = [{ project: "orchard", release: "release-23", items: [
+  { item: "v1", status: "DONE", released: true }, { item: "v2", status: "DONE" }, { item: "v3", status: "DONE (tag v3)" },
+  { item: "v4", status: "DONE", released: true, setup_open: 1 }, { item: "v5", status: "TODO" }, { item: "v7", status: "done", released: false }] },
+  { project: "grove", release: "release-23", items: [{ item: "v1", status: "DONE", released: true }] },
+  { project: "meadow", release: null, items: [{ item: "v1", status: "DONE" }] },
+  { project: "heath", release: "release-23", active: false, items: [{ item: "v1", status: "DONE" }] }];
+const rlViews = rlFeed.map((p) => C.releaseView(p, true));
+check("web: v0.140 releaseView: the dialog title carries N (DONE, not released) and the last release name",
+  rlViews[0].n === 3 && rlViews[0].title === "Release orchard: 3 DONE items since release-23" && rlViews[0].enabled && rlViews[0].why === "", JSON.stringify(rlViews[0]));
+check("web: v0.140 releaseView: off at N = 0, saying why", rlViews[1].n === 0 && !rlViews[1].enabled && rlViews[1].why === "nothing to release: no DONE item since release-23", JSON.stringify(rlViews[1]));
+check("web: v0.140 releaseView: singular, and no release yet said in words", rlViews[2].title === "Release meadow: 1 DONE item since the start (no release yet)", rlViews[2].title);
+check("web: v0.140 releaseView: an inactive project's button stays on", rlViews[3].enabled === true);
+check("web: v0.140 releaseView: without a sink it is off and says read-only", !C.releaseView(rlFeed[0], false).enabled && C.releaseView(rlFeed[0], false).why === "read-only: no answer URL");
+const pyRl = JSON.parse(execFileSync("python3", ["-I", "-c",
+  "import sys, json; sys.path.insert(0, sys.argv[1]); import dashboard_core as c; print(json.dumps([c.release_view(p) for p in c.parse_projects(sys.argv[2])]))",
+  path.join(__dirname, "..", "lib", "po"), JSON.stringify(rlFeed)]).toString());
+check("web: v0.140 releaseView agrees with the desktop viewer's release_view on every fixture", eq(pyRl, rlViews), JSON.stringify(pyRl));
+const rlBody = C.releaseBody("orchard", "line one\nline two ", "0b7e3c1a-5d2f-4a8e-9c61-3f0d2b8a7e41", new Date(Date.UTC(2026, 10, 4, 2, 0, 0)));
+check("web: v0.140 releaseBody is the desktop viewer's body, the note as typed",
+  eq(rlBody, { answer_id: "0b7e3c1a-5d2f-4a8e-9c61-3f0d2b8a7e41", kind: "release-request", project: "orchard", note: "line one\nline two ", answered_at: "2026-11-04T02:00:00Z", client: "po-dashboard" }), JSON.stringify(rlBody));
+const pyRb = JSON.parse(execFileSync("python3", ["-I", "-c",
+  "import sys, json; sys.path.insert(0, sys.argv[1]); import dashboard_core as c; print(json.dumps(sorted(c.release_body('orchard', '', 'x'))))",
+  path.join(__dirname, "..", "lib", "po")]).toString());
+check("web: v0.140 the web body has the same fields as the desktop viewer's release_body", eq(pyRb, Object.keys(rlBody).sort()), JSON.stringify(pyRb));
+check("web: v0.140 releaseReady: at most 2000 characters of the trimmed note", C.releaseReady("  " + "x".repeat(2000) + "\n") && !C.releaseReady("x".repeat(2001)) && C.releaseReady(""));
+check("web: v0.140 releaseResult says sent on 200/201 and why otherwise",
+  C.releaseResult(201, null) === C.RELEASE_SENT && C.releaseResult(200, null) === C.RELEASE_SENT && C.releaseResult(400, "note too long") === "not sent: note too long" &&
+  C.releaseResult(401, null).indexOf("check the device token") > 0 && C.releaseResult(0, "timeout") === "not sent: timeout" && C.releaseResult(500, "<b>x</b>") === "not sent: status 500");
+check("web: v0.140 every card gets a Release row; the dialog posts on the answer path with the device token, one POST at a time",
+  appJs.indexOf("card.appendChild(releaseRow(p));") > 0 && /var req = sinkRequest\(C\.releaseBody\(name, box\.value, sent\.aid, new Date\(\)\)\);/.test(appJs) &&
+  appJs.indexOf("go.disabled = sent.sending ||") > 0 && appJs.indexOf("if (sent.sending || !C.releaseReady(box.value)) return;") > 0);
+check("web: v0.140 releaseKeySends: Ctrl+Enter or Cmd+Enter sends the note; plain Enter, Shift+Enter and a composing Enter do not",
+  C.releaseKeySends({ key: "Enter", ctrlKey: true }) && C.releaseKeySends({ key: "Enter", metaKey: true }) &&
+  !C.releaseKeySends({ key: "Enter" }) && !C.releaseKeySends({ key: "Enter", shiftKey: true }) &&
+  !C.releaseKeySends({ key: "Enter", ctrlKey: true, isComposing: true }) && !C.releaseKeySends({ key: "a", ctrlKey: true }) && !C.releaseKeySends(null));
+check("web: v0.140 the note's keydown sends through the Release button (so a disabled or sending Release ignores it)",
+  /box\.addEventListener\("keydown", function \(e\) \{\s*if \(!C\.releaseKeySends\(e\)\) return;\s*e\.preventDefault\(\);\s*go\.click\(\);/.test(appJs));
+check("web: v0.140 the Release button is a 44 px target", /\.release \{[^}]*min-height: 44px/.test(css));
 console.log("BLOCK-END web-core");

@@ -130,3 +130,7 @@ po-kit ships in releases that bundle several items. Each release's
 `CHANGELOG.md` entry has **Agents** lines (what agents must now do) and
 **Adopt** lines (optional manifest keys a project may turn on, by its PO's
 admin commit).
+
+## Memory write-back
+
+At a retry, a hang, a rollback, a refused action, a second attempt at the same step, or a ruling received (a rule on how the team works, not a decision about one product), the task is not done until a memory proposal is filed or "nothing new learned" is written in the report. A memory reads "next time X, do Y, because Z", carries when it stops applying, and a shipped-feature summary or a project decision is a changelog or project-record line, not a memory.

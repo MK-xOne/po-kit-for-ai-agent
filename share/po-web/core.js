@@ -85,11 +85,28 @@
     return Math.floor(h / 24) + "d ago";
   }
 
-  // item_label(group, filter): "v0.99" or "demo v0.99" when All is chosen.
+  // item_label(group, filter): "v0.99" or "demo v0.99" when All is chosen. An event with no item ("" or "-") names
+  // the project alone (v0.146: never "demo v-"); the "v" comes from itemRef, so a value already starting "v" keeps it.
   function item_label(group, filter) {
-    var label = "v" + group.item;
-    if (!filter && group.project) label = group.project + " " + label;
+    var item = str(group.item).trim();
+    var label = item === "-" ? "" : itemRef(item);
+    if (!filter && group.project) label = label ? group.project + " " + label : group.project;
     return label;
+  }
+
+  // itemRef(v) (v0.141): an item as the Team view names it. A bare version ("0.141", from po team) gets its "v"; a value
+  // that already says "project vX" (the team-status feed) is kept as it is, so it never reads "on vproject v1.2".
+  function itemRef(v) {
+    var s = str(v).trim();
+    return /^[0-9]/.test(s) ? "v" + s : s;
+  }
+
+  // eventHead(e) (v0.141): what an Events card head says about its newest event: the result as a mark and a word
+  // (so it is never colour alone) and the kind. mark and word are "" for an event with no result.
+  var RESULT_CUES = { pass: ["✔", "pass"], fail: ["✘", "fail"], skip: ["–", "skip"] };
+  function eventHead(e) {
+    var cue = RESULT_CUES[str(e && e.result)] || ["", str(e && e.result)];
+    return { mark: cue[0], word: cue[1], kind: str(e && e.kind), cls: cue[1] === "pass" ? "ok" : cue[1] === "fail" ? "bad" : "" };
   }
 
   // filter_events(events, project): the events of one project, or all when project is falsy.
@@ -166,8 +183,36 @@
         .filter(Boolean).join(", "),
       asked: asked ? "asked " + asked : "",
       question: str(card.question),
-      options: options
+      options: options,
+      thread: threadUrl(card.thread_url)
     };
+  }
+
+  // threadUrl(v) (v0.141): the card's thread link, as dashboard_core.thread_link decides: http(s) with a host, or a chat
+  // app's own deep link (`<scheme>://...`, letters only) whose scheme is not one that runs code or shows local data.
+  var LINK_BLOCKED_SCHEMES = ["javascript", "vbscript", "data", "file", "blob", "about", "filesystem", "view-source", "chrome",
+    "resource", "jar"];
+  function threadUrl(v) {
+    var s = typeof v === "string" ? v.trim() : "";
+    var m = /^([A-Za-z][A-Za-z0-9+.-]*):\/\/(.)/.exec(s);
+    var scheme = m ? m[1].toLowerCase() : "";
+    if (scheme === "http" || scheme === "https") {
+      try { return new URL(s).host ? s : ""; } catch (e) { return ""; }
+    }
+    return /^[a-z]+$/.test(scheme) && LINK_BLOCKED_SCHEMES.indexOf(scheme) < 0 && !/\s/.test(s) ? s : "";
+  }
+
+  // sortDecisions(cards) (v0.141): the desktop viewer's order (dashboard_core.sort_decisions): Choices, then Actions,
+  // then unformatted and legacy; inside a group the oldest asked first, a card without a readable asked_at last;
+  // stable.
+  var DECISION_GROUP = { choice: 0, action: 1, unformatted: 2, legacy: 2 };
+  function sortDecisions(cards) {
+    return cards.map(function (c, i) {
+      var t = typeof c.asked_at === "string" ? Date.parse(c.asked_at) : NaN;
+      return { c: c, i: i, g: DECISION_GROUP[decisionShape(c)], t: isNaN(t) ? Infinity : t };
+    }).sort(function (a, b) {
+      return a.g - b.g || (a.t === b.t ? 0 : a.t < b.t ? -1 : 1) || a.i - b.i;
+    }).map(function (x) { return x.c; });
   }
 
   // bannerText(lastOk, now): "" when the last fetch worked or nothing was ever fetched, else the banner words.
@@ -179,34 +224,43 @@
     return "not updated " + (a === "just now" ? "just now" : a);
   }
 
-  // usage_words(usage, limit_until, now): human-readable usage string from the feed's
-  // usage {five_hour, seven_day} (parts present only) and limit_until as an ISO time.
-  // Examples: "80% of the 5 h window used, 12% of the 7 d window" and
-  // "limit until 5:46 PM" (today) or "limit until 5:46 PM Nov 1" (another day).
-  function usage_words(usage, limit_until, now) {
+  var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+  // clockText(t, now): the one time format of the dashboard (v0.142, the same as the desktop's clock_text):
+  // "7:00 PM EST", then " Nov 30" when t is not today (and " 2027" when not this year); the viewer's zone, named.
+  function clockText(t, now) {
+    var h = t.getHours(), mm = String(t.getMinutes()).padStart(2, "0");
+    var zone = (t.toLocaleTimeString("en-US", { timeZoneName: "short" }).match(/\s([A-Za-z][\w+:-]*)$/) || ["", ""])[1];
+    var text = (h % 12 || 12) + ":" + mm + " " + (h >= 12 ? "PM" : "AM") + (zone ? " " + zone : "");
+    var sameDay = t.getFullYear() === now.getFullYear() && t.getMonth() === now.getMonth() && t.getDate() === now.getDate();
+    if (sameDay) return text;
+    return text + " " + MONTHS[t.getMonth()] + " " + t.getDate() + (t.getFullYear() === now.getFullYear() ? "" : " " + t.getFullYear());
+  }
+
+  // usage_words(usage): human-readable usage string from the feed's usage {five_hour, seven_day} (parts present
+  // only), e.g. "80% of the 5 h window used, 12% of the 7 d window". The limit is the agent's state (limitText).
+  function usage_words(usage) {
     var parts = [];
     if (usage && Number.isFinite(usage.five_hour)) parts.push(Math.round(usage.five_hour * 100) + "% of the 5 h window used");
     if (usage && Number.isFinite(usage.seven_day)) parts.push(Math.round(usage.seven_day * 100) + "% of the 7 d window");
-    var text = parts.join(", ");
-    if (limit_until) {
-      var t = typeof limit_until === "string" ? new Date(limit_until) : null;
-      if (t && !isNaN(t)) {
-        var h12 = t.getHours();
-        var ampm = h12 >= 12 ? "PM" : "AM";
-        var hh = h12 % 12 || 12;
-        var mm = String(t.getMinutes()).padStart(2, "0");
-        var timeStr = hh + ":" + mm + " " + ampm;
-        var today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-        var limitDay = new Date(t.getFullYear(), t.getMonth(), t.getDate());
-        var limitText = "limit until " + timeStr;
-        if (limitDay.getTime() !== today.getTime()) {
-          var months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-          limitText += " " + months[t.getMonth()] + " " + t.getDate();
-        }
-        text = text ? text + ", " + limitText : limitText;
-      }
-    }
-    return text;
+    return parts.join(", ");
+  }
+
+  // limitText(agent, now): "LIMIT until 7:00 PM EST Nov 30" while limit_until is still ahead, "" otherwise (v0.142:
+  // one line, one format, instead of the feed's state and a second "limit until" line).
+  function limitText(agent, now) {
+    var t = agent && typeof agent.limit_until === "string" ? new Date(agent.limit_until) : null;
+    if (!t || isNaN(t) || t <= now) return "";
+    return "LIMIT until " + clockText(t, now);
+  }
+
+  // teamUsage(agents): the usage every agent with one shows (one subscription), said once above the Team cards;
+  // "" when none has usage or they differ (each card then keeps its own).
+  function teamUsage(agents) {
+    var seen = {};
+    (Array.isArray(agents) ? agents : []).forEach(function (a) { var u = usage_words(a && a.usage); if (u) seen[u] = true; });
+    var keys = Object.keys(seen);
+    return keys.length === 1 ? keys[0] : "";
   }
 
   // split_owns(owns, working_on): splits an agent's owns list into working-on items
@@ -224,21 +278,25 @@
     return {all: owns.slice()};
   }
 
-  // team_warning(agent): returns the warning text for an idle agent that still owns
-  // items, or null when no warning applies.
-  function team_warning(agent) {
+  // team_warning(agent, now): the warning for an idle agent that still owns items, naming the cause (v0.142), or
+  // null. None while it works or owns nothing, and none at its usage limit (its LIMIT line is the cause). The FREE
+  // flag says its items wait on someone else; otherwise it owns them and is on none.
+  function team_warning(agent, now) {
     if (typeof agent.state === "string" && /^working\b/i.test(agent.state.trim())) return null;
     var owns = Array.isArray(agent.owns) ? agent.owns : [];
     if (owns.length === 0) return null;
-    return "idle, owns " + owns.length + " item" + (owns.length === 1 ? "" : "s");
+    if (limitText(agent, now || new Date())) return null;
+    var n = owns.length + " item" + (owns.length === 1 ? "" : "s");
+    if (agent.free === true) return "idle: its " + n + (owns.length === 1 ? " waits" : " wait") + " on someone else";
+    return "idle, owns " + n + " and works on none";
   }
 
   // team_sort(agents): warning agents first, stable otherwise.
-  function team_sort(agents) {
+  function team_sort(agents, now) {
     if (!Array.isArray(agents) || agents.length < 2) return agents.slice();
     return agents.slice().sort(function (a, b) {
-      var wa = team_warning(a) ? 0 : 1;
-      var wb = team_warning(b) ? 0 : 1;
+      var wa = team_warning(a, now) ? 0 : 1;
+      var wb = team_warning(b, now) ? 0 : 1;
       return wa - wb;
     });
   }
@@ -246,6 +304,7 @@
   var DOING_WORDS = ["DOING", "PAUSED", "BLOCKED"];  // the words the GTK Projects card counts as DOING
   var DEFAULT_STALL_MINUTES = 30;
   var MAX_DOING_LINES = 5;
+  var STALLED = ", stalled";  // v0.142: a stalled line says so in words, not by its colour alone
 
   // statusWord(status): the first word, upper-cased, trailing punctuation stripped ("DONE (no change)" is DONE).
   function statusWord(status) {
@@ -266,8 +325,8 @@
 
   // doingLines(items, now, stallMinutes): the DOING items of one project as lines `v0.99 - budy - 2m ago`
   // (item, its first agent, the age of its own last event; the owner is left out when there is none). A line
-  // is stalled when that event is older than stallMinutes; an item with no readable event time says `no events`
-  // and is stalled. At most 5 lines; the rest is `more`, shown as `+n more`.
+  // is stalled when that event is older than stallMinutes, and its text then ends in `, stalled`; an item with no
+  // readable event time says `no events` and is stalled. At most 5 lines; the rest is `more`, shown as `+n more`.
   function doingLines(items, now, stallMinutes) {
     var limit = (typeof stallMinutes === "number" && stallMinutes >= 0 ? stallMinutes : DEFAULT_STALL_MINUTES) * 60000;
     var lines = [];
@@ -276,9 +335,19 @@
       var owner = Array.isArray(it.agents) && it.agents.length ? str(it.agents[0]) : "";
       var t = typeof it.last_event === "string" ? new Date(it.last_event) : null;
       var known = t !== null && !isNaN(t);
+      var h = it.idle_hours;
+      if (typeof h === "number" && isFinite(h) && h >= 0) {  // v0.130: the producer's idle time wins over the last event's age
+        h = Math.floor(h);
+        lines.push({
+          text: ["v" + str(it.item), owner, h < 1 ? "active" : "idle " + h + "h"].filter(Boolean).join(" - ") + (h >= 2 ? STALLED : ""),
+          stalled: h >= 2
+        });
+        return;
+      }
+      var stalled = known ? now - t > limit : true;
       lines.push({
-        text: ["v" + str(it.item), owner, known ? relative_time(it.last_event, now) : "no events"].filter(Boolean).join(" - "),
-        stalled: known ? now - t > limit : true
+        text: ["v" + str(it.item), owner, known ? relative_time(it.last_event, now) : "no events"].filter(Boolean).join(" - ") + (stalled ? STALLED : ""),
+        stalled: stalled
       });
     });
     return { lines: lines.slice(0, MAX_DOING_LINES), more: Math.max(0, lines.length - MAX_DOING_LINES) };
@@ -286,7 +355,9 @@
 
   // projectCard(p, now, stallMinutes): what the Projects view shows for one project, matching the GTK card:
   // the release label (muted `no release`), the count line, the muted `setup open N` and `n not in a filter: ...`
-  // lines, `feed error` for a project with an error (greyed), and its DOING lines.
+  // lines, GREY_REASON for a project with an error (greyed, and saying why), and its DOING lines. active (v0.139) is the feed's
+  // true/false, null when the feed has no `active` key (then no switch and no badge); badge is `inactive` when false.
+  var GREY_REASON = "greyed: this project's feed failed, so its counts may be out of date";  // v0.141: why, in words
   function projectCard(p, now, stallMinutes) {
     var items = Array.isArray(p.items) ? p.items.filter(isObj) : [];
     var c = { TODO: 0, DOING: 0, DONE: 0, RELEASED: 0 };
@@ -306,11 +377,107 @@
       countLine: ["TODO", "DOING", "DONE", "RELEASED"].map(function (k) { return k + " " + c[k]; }).join("  "),
       setup: setup ? "setup open " + setup : "",
       lost: lost.length ? lost.length + " not in a filter: " + lost.join(", ") : "",
-      error: error ? "feed error" : "", grey: !!error,
+      error: error ? GREY_REASON : "", grey: !!error,
+      active: typeof p.active === "boolean" ? p.active : null,
+      badge: p.active === false ? "inactive" : "",
       doing: doingLines(items, now, stallMinutes)
     };
   }
 
+  // ---- the project switch (v0.139): posted on the answer path, the same sink and token --------------------
+
+  var PROJECT_ACTIVE = "project-active";
+  var SWITCH_HOLD_MS = 180000;  // a switched card shows the new state this long while the (cached) feed catches up
+
+  // projectActiveBody(project, active, answerId, now): the body that switches a project on or off.
+  function projectActiveBody(project, active, answerId, now) {
+    return {
+      answer_id: answerId,
+      kind: PROJECT_ACTIVE,
+      project: str(project),
+      active: active === true,
+      answered_at: now.toISOString().replace(/\.\d{3}Z$/, "Z"),
+      client: CLIENT
+    };
+  }
+
+  // switchShown(feedActive, pending, nowMs): the position the switch shows: the pending {active, at} while the feed
+  // does not show it yet (until SWITCH_HOLD_MS after it was sent), else the feed's.
+  function switchShown(feedActive, pending, nowMs) {
+    if (pending && nowMs - pending.at < SWITCH_HOLD_MS && pending.active !== feedActive) return pending.active;
+    return feedActive;
+  }
+
+  // switchSettled(feedActive, pending, nowMs): may the pending switch be dropped (the feed agrees, or the hold ran out).
+  function switchSettled(feedActive, pending, nowMs) {
+    return !pending || pending.active === feedActive || nowMs - pending.at >= SWITCH_HOLD_MS;
+  }
+
+  // switchResult(status, reason): "" when the switch went through (200/201), else what the card says.
+  function switchResult(status, reason) {
+    var why = typeof reason === "string" && REASON_RE.test(reason.trim()) ? reason.trim() : "";
+    if (status === 200 || status === 201) return "";
+    if (status === 401 || status === 403) return "not switched: refused (" + status + "), check the device token";
+    if (status === 429) return "not switched: rate limit, try again in a moment";
+    if (status === 0) return "not switched: " + (why || "unreachable");
+    return "not switched: " + (why || "status " + status);
+  }
+
+
+  // ---- the release button (v0.140): it ASKS, on the answer path, the same sink and token ------------------
+
+  var RELEASE_REQUEST = "release-request";
+  var RELEASE_NOTE_MAX = 2000;  // characters of the trimmed note; the receiver refuses more (400 `note too long`)
+  var RELEASE_SENT = "release asked \u00b7 sent";
+
+  // unreleasedDone(items): the DONE items (any DONE status word) the feed does not mark released.
+  function unreleasedDone(items) {
+    return (Array.isArray(items) ? items : []).filter(function (it) {
+      return isObj(it) && statusWord(it.status) === "DONE" && it.released !== true;
+    }).length;
+  }
+
+  // releaseView(p, sink): {n, title, enabled, why} of a card's Release button, as the desktop viewer's release_view:
+  // title `Release <project>: N DONE items since <last release>`; off, saying why, at N = 0 or without a sink.
+  function releaseView(p, sink) {
+    var name = str(p && p.project);
+    var n = unreleasedDone(p && p.items);
+    var rel = p && typeof p.release === "string" && p.release.trim() ? p.release.trim() : "the start (no release yet)";
+    var why = !sink ? "read-only: no answer URL" : n === 0 ? "nothing to release: no DONE item since " + rel : "";
+    return { n: n, title: "Release " + name + ": " + n + " DONE item" + (n === 1 ? "" : "s") + " since " + rel,
+      enabled: !why, why: why };
+  }
+
+  // releaseBody(project, note, answerId, now): the body that asks for a release; the note goes as typed.
+  function releaseBody(project, note, answerId, now) {
+    return {
+      answer_id: answerId,
+      kind: RELEASE_REQUEST,
+      project: str(project),
+      note: typeof note === "string" ? note : "",
+      answered_at: now.toISOString().replace(/\.\d{3}Z$/, "Z"),
+      client: CLIENT
+    };
+  }
+
+  // releaseReady(note): may Release be pressed (the trimmed note within RELEASE_NOTE_MAX).
+  function releaseReady(note) { return String(note || "").trim().length <= RELEASE_NOTE_MAX; }
+
+  // releaseKeySends(ev): does this keydown in the note send it (Ctrl+Enter, or Cmd+Enter on a Mac), as the
+  // desktop viewer's answer box; never while an input method is composing.
+  function releaseKeySends(ev) {
+    return !!ev && ev.key === "Enter" && (!!ev.ctrlKey || !!ev.metaKey) && !ev.isComposing;
+  }
+
+  // releaseResult(status, reason): RELEASE_SENT when it went through (200/201), else `not sent: <why>`.
+  function releaseResult(status, reason) {
+    var why = typeof reason === "string" && REASON_RE.test(reason.trim()) ? reason.trim() : "";
+    if (status === 200 || status === 201) return RELEASE_SENT;
+    if (status === 401 || status === 403) return "not sent: refused (" + status + "), check the device token";
+    if (status === 429) return "not sent: rate limit, try again in a moment";
+    if (status === 0) return "not sent: " + (why || "unreachable");
+    return "not sent: " + (why || "status " + status);
+  }
 
   // ---- answering (v0.116): the same body the desktop viewer's on_send_answer posts ----------------------
 
@@ -526,11 +693,17 @@
     VIEWS: VIEWS, parseFeed: parseFeed, eventsToday: eventsToday, isWorking: isWorking, teamWorking: teamWorking,
     counts: counts, toggleLabel: toggleLabel, viewFromHash: viewFromHash, visibleViews: visibleViews, age: age,
     relative_time: relative_time, group_events: group_events, item_label: item_label, filter_events: filter_events,
+    itemRef: itemRef, eventHead: eventHead, threadUrl: threadUrl, sortDecisions: sortDecisions, GREY_REASON: GREY_REASON,
     decisionCard: decisionCard, bannerText: bannerText, usage_words: usage_words, split_owns: split_owns,
+    clockText: clockText, limitText: limitText, teamUsage: teamUsage,
     team_warning: team_warning, team_sort: team_sort,
     MAX_TEXT: MAX_TEXT, decisionShape: decisionShape, isLook: isLook, lookReady: lookReady, holdLooks: holdLooks,
     installedFor: installedFor, newAnswerId: newAnswerId, answerReady: answerReady, answerParams: answerParams,
-    answerBody: answerBody, answerRequest: answerRequest, answerResult: answerResult
+    answerBody: answerBody, answerRequest: answerRequest, answerResult: answerResult,
+    projectActiveBody: projectActiveBody, switchShown: switchShown, switchSettled: switchSettled, switchResult: switchResult,
+    SWITCH_HOLD_MS: SWITCH_HOLD_MS,
+    unreleasedDone: unreleasedDone, releaseView: releaseView, releaseBody: releaseBody, releaseReady: releaseReady,
+    releaseResult: releaseResult, releaseKeySends: releaseKeySends, RELEASE_NOTE_MAX: RELEASE_NOTE_MAX, RELEASE_SENT: RELEASE_SENT
   };
   if (typeof module === "object" && module.exports) module.exports = api;
   else root.PoCore = api;

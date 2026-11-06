@@ -107,14 +107,37 @@ po_split_tabs() {
 	PO_F+=("$rest")
 }
 
+# po_status_json: the DOING items as JSON, `[{"item":"0.9","idle_hours":3}]`;
+# idle_hours is the whole hours of the same idle time the report shows, null
+# when the item has no worktree.
+po_status_json() {
+	local rec v h sep='' out='['
+	while IFS= read -r rec; do
+		[[ -n $rec ]] || continue
+		po_split_tabs "$rec"
+		[[ ${PO_F[1]} == "$PO_LIVE_STATUS" ]] || continue
+		v=${PO_F[0]}
+		po_item_lines "$v" idle >/dev/null
+		h=null
+		[[ -z $PO_IDLE_SECS ]] || h=$((PO_IDLE_SECS / 3600))
+		out+="$sep{\"item\":$(po_json_str "$v"),\"idle_hours\":$h}"
+		sep=,
+	done < <(po_open_items)
+	printf '%s]\n' "$out"
+}
+
 po_cmd_status() {
-	local idle_limit=''
+	local idle_limit='' json=0
 	while (($# > 0)); do
 		case $1 in
 		--idle)
 			(($# >= 2)) && [[ $2 =~ ^[0-9]+$ ]] || po_usage_die "--idle needs a whole number of minutes"
 			idle_limit=$((10#$2 * 60))
 			shift 2
+			;;
+		--json)
+			json=1
+			shift
 			;;
 		*) po_usage_die "status: unknown argument '$1'" ;;
 		esac
@@ -126,6 +149,10 @@ po_cmd_status() {
 	po_worktrees_load
 	po_backlog_load
 	layout_dir="${PO_MAIN_WT%/}/$(po_get layout.worktrees)"
+	((json == 0)) || {
+		po_status_json
+		return 0
+	}
 	tag=$(po_latest_tag "$main")
 
 	printf 'repo      %s\n' "$PO_MAIN_WT"
