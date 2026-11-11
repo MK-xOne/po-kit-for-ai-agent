@@ -10,7 +10,7 @@
 #   open, close     the founding and closing boundaries; plan only without --commit
 #   kickoff <version> the mechanical half of an item's founding brief (read-only)
 #   report [--note <text>]... the item report: files, the fresh stamp, PROPOSED notes
-#   events [--all] [--json] [--archived] | --archive-now
+#   events [--all] [--json] [--archived] | --trend [--days <n>] [--json] | --archive-now
 #                           the gate event log, newest first (read-only except --archive-now)
 #   team [--json]   the Team-view feed: roster, state, owned items, free (read-only)
 #   dispatch --plan|--commit  give the ready items to the free eligible agents
@@ -113,7 +113,7 @@ commands:
                     the newest stamp verbatim, the notes numbered as
                     PROPOSED; exit 4, nothing on stdout, unless a stamp
                     names this HEAD and is newer than every changed file
-  events [--all] [--json] [--archived] | --archive-now
+  events [--all] [--json] [--archived] | --trend [--days <n>] [--json] | --archive-now
                     the gate event log kept in the git dir (po-events.jsonl):
                     every po stamp run, pass or fail, and every open and
                     close --commit; the last 10, newest first, as a table
@@ -122,7 +122,10 @@ commands:
                     keeps the last [events] live_days days (default 10);
                     older events live in po-events-archive.jsonl, shown by
                     --archived; --archive-now moves them at once (they also
-                    move whenever a stamp, open or close logs an event)
+                    move whenever a stamp, open or close logs an event);
+                    --trend sums the PASS stamps per local day (last 14
+                    days, or --days <n>): tests, median test leg, ms per
+                    test, load, then the change
   dispatch --plan | --commit
                     give each ready item (po ready) the first free agent
                     (po team) eligible for it, in [dispatch] order, one item

@@ -239,6 +239,7 @@ po_cmd_close() {
 	po_setup_plan_line
 	[[ ${PO_MANIFEST[close.memory]:-false} != true ]] ||
 		printf "memory    file a proposal or record 'nothing new learned' with the close body\\n"
+	po_close_budget_flag "$version" "$tag"
 	printf '\nSTEPS\n'
 	local s=1 tagmsg="$tag: $title" tagat
 	tagat=$(po_short "$tip")
@@ -340,6 +341,22 @@ po_cmd_close() {
 		exit 7
 	fi
 	((setupcode == 0)) || exit 7
+}
+
+# po_close_budget_flag <version> <tag>: a flag line when the item's newest
+# passing stamp event took longer than [stamp] slow_after (default 300), the
+# PO's cue to ask for a trimmed or tiered gate. No event, or one without the
+# run's seconds (unknown, never 0), prints nothing. Information only.
+po_close_budget_flag() {
+	local file line re='"legs":\[.*\],"seconds":([0-9]+),"(tests|load1|detail)"' s budget
+	file=$(po_events_file) && [[ -s $file ]] || return 0
+	line=$(grep -F "\"kind\":\"stamp\",\"item\":$(po_json_str "$1")," -- "$file" |
+		grep -F '"result":"pass","agent":' | tail -n 1) || return 0
+	[[ $line =~ $re ]] || return 0
+	s=$((10#${BASH_REMATCH[1]}))
+	budget=$((10#${PO_MANIFEST[stamp.slow_after]:-300}))
+	((s > budget)) || return 0
+	printf 'flag: item %s gate took %s, over budget %s\n' "$2" "$(po_event_secs "$s")" "$(po_event_secs "$budget")"
 }
 
 # po_close_tag <tag> <message> <commit> <where> <owed>: tag <commit> as

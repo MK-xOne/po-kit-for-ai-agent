@@ -72,7 +72,10 @@ is never the live `po`.
    `examples/rust.po.toml` (cargo) or `examples/python.po.toml` (pytest).
 2. Keep a backlog table in `docs/BACKLOG.md` with an item column and a
    `Status` column (`TODO`, `DOING`, `DONE`, ...), and item specs whose
-   headings read `## v1.2 — Title — STATUS` in `[layout] specs_dir`.
+   headings read `## v1.2 — Title — STATUS` in `[layout] specs_dir`. A pipe in
+   a cell is written `\|` or sits inside one backtick span closed on the same
+   row (GitHub itself does not protect backticks, so only `\|` renders right
+   there too).
 3. `po status` shows open items. `po open next "Title"` (dry run) shows what
    founding the next item would do; add `--commit` to do it. In the item's
    worktree, `po stamp` runs the gate and prints the evidence block;
@@ -140,7 +143,8 @@ the same from any worktree.
   is later overridden by a corrected line for the same item (last wins).
   `--json` prints a JSON array; `--explain` prints per-candidate exclusion
   reasons to stderr. Exit 0 always for a readable list; a malformed line is
-  reported with its line number and skipped. Read-only.
+  reported with its line number and skipped. Exit 1 when `[ready] file` is not set or
+  names no file (`po dispatch` likewise, its line prefixed `po dispatch:`). Read-only.
 - `po prune` — worktrees and branches merged into main, minus the main
   worktree, open items' branches, and anything dirty, locked or outside
   `[layout] worktrees` (each listed with its reason). `--commit` removes
@@ -154,12 +158,27 @@ the same from any worktree.
   HEAD <sha> (<branch>)  dirty <n>
   gate PASS: check/test/clippy/fmt   tests <n> passed
   diffstat vs merge-base(main): <summary>
+  tests vs merge-base(main): +<A> -<R>   # with [stamp] test_files and test_def
+  flag: code changed, no test removed or rewritten (PO: check for pins on replaced behaviour)
   prepare ran: <line>               # one per [stamp] prepare line
   bin sha256 <hash> (<path>)        # with --bin
   ```
 
   Optional `[stamp] prepare` lines run first (see below), so a format-only
   failure cannot happen.
+
+  With `[stamp] test_files` and `test_def` set (see below), the `tests vs
+  merge-base` line counts the test definitions the item adds (A) and removes
+  (R): the lines of `git diff <merge-base> HEAD -- <test_files>` that match
+  `test_def`, added and removed. A rewritten definition counts in both, so a
+  test replaced by a better one shows as a retirement. When the same diff
+  changes a file outside `test_files` and outside the docs (`*.md`, `docs/`,
+  `CHANGELOG.md`) and R is 0, the `flag:` line follows: the item changed code
+  and retired or rewrote no test, so the PO checks at verify that no test
+  still pins the behaviour it replaced. The flag is information only: the
+  exit code and the stamp file are as without it, and a diff that changes
+  only docs or tests never gets it. Like the diffstat, both lines read the
+  committed HEAD, not uncommitted changes.
 
   The count is the sum of every libtest `test result: ok. N passed` line
   (or pytest's summary) the count source prints, and must equal the gate's own
@@ -279,7 +298,7 @@ the same from any worktree.
   changed file newer than it, it exits 4 and prints nothing on stdout. It
   never runs the gate and posts nothing; the tag comes from the branch
   name via `[layout] branch`.
-- `po events [--all] [--json] [--archived]` or `po events --archive-now` — the gate event log, read-only (but for `--archive-now`). `po stamp`
+- `po events [--all] [--json] [--archived]`, `po events --trend [--days <n>] [--json]` or `po events --archive-now` — the gate event log, read-only (but for `--archive-now`). `po stamp`
   appends one event per run, pass or fail, and `po open` and `po close` one
   each after a complete `--commit`, to `po-events.jsonl` in the repository's
   common git dir (shared by every worktree, never tracked, never dirt).
@@ -288,7 +307,10 @@ the same from any worktree.
   directory name), `result` (`pass`, `fail`), `agent` (`$BUZZ_AGENT`, else the
   user), `legs` (each leg's `name`, `result`: `pass`, `fail`, or `skip` when
   an earlier leg failed, and, on a stamp, `seconds`), for a stamp the run's
-  own `seconds`, and `detail` (why a stamp failed). A failed stamp
+  own `seconds`, for a passing stamp `tests` (the number its gate block
+  prints as `tests N passed`) and `load1` (the first field of
+  `/proc/loadavg` when the run ended, left out when it cannot be read), and
+  `detail` (why a stamp failed). A failed stamp
   also has the failing leg's `tail` (its last 40 lines, redacted, one string
   with `\n` between lines) and `log` (the absolute path of the run's full
   output, null when it could not be written); see `po stamp`. Logging never
@@ -323,6 +345,28 @@ the same from any worktree.
   no exit code changes. **The trigger:** when a gate goes over about 5
   minutes (the `slow` mark), the PO specs a fast per-item gate and runs the
   full suite nightly and before each release. Those tiers are not built.
+
+  **The trend.** `po events --trend [--days <n>] [--json]` (read-only; the
+  live log and the archive both, an event in both counted once; default 14
+  days; it combines with no other option but `--json`) sums the PASS stamps
+  per local day, newest first, so the gate's growth reads without raw JSON:
+
+      DAY         STAMPS  TESTS  TEST-LEG  PER-TEST  LOAD
+      2026-11-10  3       120    1m00s     500 ms    3.00
+      2026-11-09  2       -      42s       -         -
+      2026-11-05  2       100    40s       400 ms    1.50
+      change since 2026-11-05: tests +20 (+20%), test leg +20 s (+50%), per test +100 ms
+
+  `TESTS` is the day's highest `tests`, `TEST-LEG` the median seconds of the
+  leg named `test`, `PER-TEST` that median over the day's median `tests` in
+  ms, `LOAD` the median `load1`; `-` when no stamp of the day has the value
+  (older events have no `tests` or `load1`). The last line compares the
+  oldest and the newest day with a `TESTS` value (`change: - (fewer than two
+  days with a TESTS value)` when there is one). Open, close and failed stamp
+  events are left out; with none in the window it prints `no stamps in the
+  last <n> days` and exits 0. `--json` prints an array of one object per
+  day: `day`, `stamps`, `tests`, `test_leg` (seconds), `per_test_ms`,
+  `load1`, null for `-`.
 - `po open <version|next> [<title>]` — the founding boundary. A new number
   must be latest founded + 1 (`next`), an epoch step with `--epoch`
   (1.10.0, 2.0.0), or the next insert in the `insert_segment`-th segment
@@ -441,9 +485,19 @@ the same from any worktree.
   `prepare` leg failed with its tail (the output of every line so far) and
   the full output in the stamp log. Absent or `[]`, `po stamp` is
   unchanged. A value that is not an array of quoted strings, or any key
-  under `[stamp]` other than `prepare` and `slow_after`, is a manifest error
-  (2); `po doctor` lists the key as `adopt [stamp] prepare` for a manifest
-  without it.
+  under `[stamp]` other than `prepare`, `slow_after`, `test_files` and
+  `test_def`, is a manifest error (2); `po doctor` lists the key as `adopt
+  [stamp] prepare` for a manifest without it.
+- `[stamp] test_files` and `[stamp] test_def` — optional, and set together:
+  `test_files` is a one-line array of git pathspecs, path prefixes or globs
+  (`test_files = ["src/", "tests/"]`), the files that hold the tests;
+  `test_def` one extended regular expression (`grep -E`) that matches one
+  line per test definition (`test_def = "#\\[test\\]"` for Rust; in the
+  manifest a `\` is written `\\`). With both, `po stamp` adds the `tests vs
+  merge-base` line and, when it applies, the `flag:` line to the block (see
+  `po stamp` above). With neither, the block is unchanged. One without the
+  other, an empty `test_files`, an empty `test_def` or one that is not a
+  valid extended regular expression is a manifest error (2).
 - `[events] live_days` — an optional integer, days (default 10): events older
   than this leave `po-events.jsonl` for `po-events-archive.jsonl` (see `po
   events`). Anything but an integer is a manifest error (2); `po doctor` lists
@@ -462,9 +516,18 @@ the same from any worktree.
   command in its own transient user scope to detect processes it leaves
   behind. `false` (or `PO_STAMP_NO_SCOPE=1`) is for hosts without a user
   systemd.
-- `[stamp] slow_after` — an optional integer, seconds (default 300): a stamp
+- `[stamp] slow_after` — an optional integer, seconds (default 300): the
+  project's gate time budget; set it per project in its manifest. A stamp
   run that took longer is marked `slow` in `po events` and in the
-  dashboard. Information only.
+  dashboard, and its gate block gains the line
+  `gate time: 6m01s, over budget 5m00s (slow_after)` after `diffstat` and
+  the `tests vs merge-base` lines (the same seconds as its event; at or
+  under the budget the block is unchanged). `po close <v>` (dry run and
+  `--commit`) prints `flag: item <tag> gate took 6m01s, over budget 5m00s`
+  when the item's newest passing stamp event took longer; no such event, or
+  one without `seconds`, prints nothing. Information only: no exit code
+  changes and nothing is blocked. A flagged close is the PO's cue for the
+  `slow` trigger (`po events` above): a trimmed or tiered gate.
 - The backlog edits both make are status words only — a spec heading's
   status word, a table row's Status cell, the one status word after the
   item's id in BACKLOG prose (`v1.9.11 parser TODO` → `DOING`; a close
@@ -541,7 +604,7 @@ the same from any worktree.
   empty `owner_column` cell in its own admin commit (a cell already naming
   another agent is refused, exit 3), so `po team` sees the agent as busy and
   a repeated run gives no agent a second item. Needs `python3`.
-- `po lint-founding [--ready <file>] [--project <name>] [--agents <a,b>]` — read-only check of what a founding commit left on main, one `file:line: finding` per line, exit 0 clean (no output) or 1 with findings: a backlog row or item heading without its status as one ALL-CAPS word; an open item without a spec heading under `[layout] specs_dir` (skipped when it is `.`); a ready-file line (`[ready] file` or `--ready`) that is not valid JSON, names an item absent from the backlog or HELD, PAUSED or BLOCKED, names an agent outside the roster, `[dispatch] order` and `--agents`, or repeats an identical line. DOING and DONE lines are history and pass; the last line for an item wins.
+- `po lint-founding [--ready <file>] [--project <name>] [--agents <a,b>]` — read-only check of what a founding commit left on main, one `file:line: finding` per line, exit 0 clean (no output) or 1 with findings: a backlog row or item heading without its status starting with one ALL-CAPS word (`DONE (note)` is DONE); an open item without a spec heading under `[layout] specs_dir` (skipped when it is `.`); a ready-file line (`[ready] file` or `--ready`) that is not valid JSON, names an item absent from the backlog or HELD, PAUSED or BLOCKED, names an agent outside the roster, `[dispatch] order` and `--agents`, or repeats an identical line. DOING and DONE lines are history and pass; the last line for an item wins.
 - `po serve [--bind <addr>] [--port <n>]` — a small read-only web viewer of the
   gate events, for a screen you leave open. `/` shows the last 10 events, newest on top,
   one row each: result (symbol and word), item, project, kind, checks (each
@@ -551,7 +614,7 @@ the same from any worktree.
   300), time, and a note icon when the event has a
   detail (its tooltip and aria-label are the detail, then, for a failed
   stamp, the failing leg's tail and the log's path); each row links to `/all`,
-  the full list, in the same layout; `/events.json` is the same data as JSON (live events only; it answers with an `ETag`, a hash of the whole feed, and `304 Not Modified` with no body to a matching `If-None-Match`; `?since=<time>` returns only the events at or after that time, and those with no time, marked `X-Po-Since: partial`, while a request without it is marked `X-Po-Since: full`, so `po-dashboard` fetches it conditionally and incrementally), `/archive.json` the archive in the same shape (`po events --archived --json`, read-only, on the same loopback rule), and `/team.json` is `po team --json`. The pages poll it every
+  the full list, in the same layout; `/events.json` is the same data as JSON (live events only; it answers with an `ETag`, a hash of the whole feed, and `304 Not Modified` with no body to a matching `If-None-Match`; `?since=<time>` returns only the events at or after that time, and those with no time, marked `X-Po-Since: partial`, while a request without it is marked `X-Po-Since: full`, so `po-dashboard` fetches it conditionally and incrementally), `/archive.json` every archived event, in the same shape (`po events --archived --all --json`, read-only, on the same loopback rule), and `/team.json` is `po team --json`. The pages poll it every
   few seconds and redraw in place; times are UTC in the data and shown in the
   browser's local time. Every field is HTML-escaped. It reads events only by
   running `po events --json` (so it needs a po that has `po events`) and needs
@@ -712,7 +775,10 @@ the same from any worktree.
   for every kind. Each kind has a badge and colour (Choice the accent, Action the `warn`
   colour); a `kind` entry with an unknown kind, a missing `id` or a missing or malformed
   field shows as `unformatted` in the error colour, so it stays visible. An entry without
-  `kind` displays as before. An action may also carry `"requires": {"package": "<file name>",
+  `kind` displays as before. An action card that breaks the six card rules (one command or click per step,
+  no `&&`, `;` or newline chain, `sudo` only as the first word of a step of its own, an `expect` on every step,
+  no `<placeholder>`, a one-line `done_when` of at most 120 characters that asks for "pass", and one `machine`)
+  also shows as `unformatted`. An action may also carry `"requires": {"package": "<file name>",
   "sha256": "<64 lowercase hex>"}`, the build the look needs: `package` is a plain file name (no
   `/`, no `<`, no whitespace), and a malformed `requires` makes the entry `unformatted`. The card
   shows `build: <package>`; the dashboard, not the asker, writes the install: above each project's

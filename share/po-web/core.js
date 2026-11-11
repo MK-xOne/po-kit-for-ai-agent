@@ -168,7 +168,7 @@
   // decisionCard(card, now): what the Decisions view shows for one card. Every field is plain text for
   // textContent; options are the choice card's, the recommended one marked.
   function decisionCard(card, now) {
-    var kind = str(card.kind) || "look";
+    var kind = str(card.kind) || (isLook(card) ? "look" : "");  // v0.155: a kindless card that is not a look card has no badge
     var options = Array.isArray(card.options) ? card.options.filter(isObj).map(function (o) {
       return { label: str(o.label), description: str(o.description), recommended: o.recommended === true };
     }) : [];
@@ -517,6 +517,7 @@
       if (!isObj(st[j]) || !text(st[j].text) || !optionalText(st[j].command)) return "unformatted";
     }
     if ("requires" in card && requiresOf(card) === null) return "unformatted";
+    if (cardRuleProblems(card).length) return "unformatted";
     return "action";
   }
 
@@ -543,6 +544,58 @@
       var hit = VAGUE_RE.exec(t);
       if (hit && !QUOTED_RE.test(t)) out.push("step " + n + " is vague");
     });
+    return out;
+  }
+
+  // The rules of dashboard_core.card_rule_problems, same order and wording (kept in step by the cross-check test).
+  function chains(s) {
+    if (typeof s !== "string") return false;
+    if (s.indexOf("\n") >= 0) return true;
+    var single = false, dbl = false, bt = false;
+    for (var k = 0; k < s.length; k++) {
+      var ch = s.charAt(k);
+      if (single) { if (ch === "'") single = false; continue; }
+      if (dbl) { if (ch === '"') dbl = false; continue; }
+      if (bt) { if (ch === "`") bt = false; continue; }
+      if (ch === "'") single = true;
+      else if (ch === '"') dbl = true;
+      else if (ch === "`") bt = true;
+      else if (ch === ";") return true;
+      else if (ch === "&" && s.charAt(k + 1) === "&") return true;
+      else if (ch === "|" && s.charAt(k + 1) === "|") return true;
+    }
+    return false;
+  }
+
+  function cardRuleProblems(card) {
+    var out = [];
+    var entry = isObj(card) ? card : {};
+    if (entry.kind !== "action") return out;
+    var steps = Array.isArray(entry.steps) ? entry.steps : [];
+    if (!steps.length) out.push("no steps");
+    var placeholder = /<[A-Za-z][^<>\n]*[A-Za-z0-9._-]>/;
+    steps.forEach(function (st, i) {
+      var n = i + 1;
+      if (!isObj(st)) { out.push("step " + n + " is not an object"); return; }
+      var vals = [typeof st.text === "string" ? st.text : "", typeof st.command === "string" ? st.command : ""];
+      if (chains(vals[0]) || chains(vals[1])) out.push("step " + n + " chains commands: one command per step");
+      for (var a = 0; a < 2; a++) {
+        if (/\bsudo\b/i.test(vals[a]) && (vals[a].trim().split(/\s+/)[0].toLowerCase() !== "sudo" || chains(vals[a]))) {
+          out.push("step " + n + ": sudo must be a step of its own, first word");
+          break;
+        }
+      }
+      if (!text(st.expect)) out.push("step " + n + " has no expect");
+      for (var b = 0; b < 2; b++) {
+        var mm = placeholder.exec(vals[b]);
+        if (mm) { out.push("step " + n + " holds a placeholder " + mm[0]); break; }
+      }
+    });
+    var dw = entry.done_when;
+    if (typeof dw !== "string" || !dw.trim() || dw.indexOf("\n") >= 0 || dw.length > 120 || dw.toLowerCase().indexOf("pass") < 0)
+      out.push('done_when must be one line asking for "pass" or the name of what failed');
+    var machine = entry.machine;
+    if (typeof machine !== "string" || !machine.trim() || machine.indexOf("\n") >= 0) out.push("machine must name one machine");
     return out;
   }
 
@@ -697,7 +750,7 @@
     decisionCard: decisionCard, bannerText: bannerText, usage_words: usage_words, split_owns: split_owns,
     clockText: clockText, limitText: limitText, teamUsage: teamUsage,
     team_warning: team_warning, team_sort: team_sort,
-    MAX_TEXT: MAX_TEXT, decisionShape: decisionShape, isLook: isLook, lookReady: lookReady, holdLooks: holdLooks,
+    MAX_TEXT: MAX_TEXT, decisionShape: decisionShape, cardRuleProblems: cardRuleProblems, isLook: isLook, lookReady: lookReady, holdLooks: holdLooks,
     installedFor: installedFor, newAnswerId: newAnswerId, answerReady: answerReady, answerParams: answerParams,
     answerBody: answerBody, answerRequest: answerRequest, answerResult: answerResult,
     projectActiveBody: projectActiveBody, switchShown: switchShown, switchSettled: switchSettled, switchResult: switchResult,

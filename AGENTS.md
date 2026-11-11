@@ -76,9 +76,18 @@ can show it as a card. The ask carries an `id` (the ask's own message id) and it
   description; the recommended option first and marked `recommended`. The two-way
   approve or deny becomes a two-option choice, e.g. `Approve the import screen?` with
   `Approve (recommended): ships as specified` and `Deny: back to spec`.
-- **Action:** the machine, numbered steps with one thing per step and every command in its
-  own `command` field, and `done_when`: what the person answering should see if it worked, e.g.
-  `On the build host: 1. restart the viewer ... done when the page shows the new tag`.
+- **Action:** the machine, numbered steps and `done_when`, following six rules. A card that
+  breaks one is refused by `ask-mk` and shown as `unformatted` on the dashboard.
+  1. One command or one click per step; never a chain (`&&`, `||`, `;` or a newline), and a
+     pipeline counts as one command.
+  2. `sudo` is the first word of a step of its own, never inside a chain.
+  3. Every step has an `expect`: what the person should see after it.
+  4. Nothing to fill in: no placeholders such as `<package>`.
+  5. `done_when` is one line of at most 120 characters asking for "pass", or the name of what failed.
+  6. `machine` names exactly one machine; a card on two machines is two cards.
+
+  Example: machine `the build host`; step 1 `restart the viewer`, expect `no output`; step 2 `open the
+  page`, expect `the page shows the new tag`; `done_when` `Answer "pass", or the step that failed.`
 
 An action holds only commands that run as written: no placeholders such as `<package>`.
 If an input is not ready (a file not yet delivered, a package not yet built), do not post

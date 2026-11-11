@@ -1,0 +1,56 @@
+{
+ "kind": "action",
+ "machine": "the laptop",
+ "steps": [
+  {
+   "text": "mkdir -p ~/viewer-look",
+   "expect": "No output."
+  },
+  {
+   "text": "cd ~/viewer-look",
+   "expect": "No output; the prompt now ends in viewer-look."
+  },
+  {
+   "text": "gh release download pre-1.13.1.r2 -R owner/viewer -p \"viewer-1.13.0-1-x86_64.pkg.tar.zst\" -p SHA256SUMS --clobber",
+   "expect": "No output and no error; ls shows both files."
+  },
+  {
+   "text": "sha256sum -c SHA256SUMS --ignore-missing",
+   "expect": "One line: viewer-1.13.0-1-x86_64.pkg.tar.zst: OK"
+  },
+  {
+   "text": "sudo pacman -U viewer-1.13.0-1-x86_64.pkg.tar.zst",
+   "expect": "Asks for your password, then ends with the install finishing and no error."
+  },
+  {
+   "text": "Quit Viewer completely, then start it again.",
+   "expect": "Viewer opens to its normal start page."
+  },
+  {
+   "text": "In Viewer, open Disney+ and start a title.",
+   "expect": "The title plays video; no \"cannot be shown\" page."
+  },
+  {
+   "text": "In Viewer, open Netflix and start a title.",
+   "expect": "The title plays video; no \"cannot be shown\" page."
+  },
+  {
+   "text": "In Viewer, open Apple TV and start a title.",
+   "expect": "The title plays video; no \"cannot be shown\" page."
+  },
+  {
+   "text": "In Viewer, open TSN and click Live.",
+   "expect": "Live plays, or a one-line notice appears; never a blank viewport."
+  },
+  {
+   "text": "In Viewer, go to 127.0.0.1:1",
+   "expect": "A page with its own title saying the connection was refused, and a Retry button."
+  },
+  {
+   "text": "In Viewer, go to http://nonexistent.invalid",
+   "expect": "A page with its own title saying the host name is unknown, and a Retry button."
+  }
+ ],
+ "done_when": "Answer \"pass\", or the name of the site that failed.",
+ "fixtures": []
+}

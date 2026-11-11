@@ -25,9 +25,14 @@ po_cmd_ready() {
 	done
 
 	local file
-	file=$(po_get ready.file 2>/dev/null || true)
-	if [[ -z $file ]]; then
-		po_die "no [ready] file configured in po.toml"
+	if [[ -z ${PO_MANIFEST[ready.file]+x} ]]; then
+		printf 'po: no [ready] file configured in po.toml\n' >&2
+		exit 1
+	fi
+	file=${PO_MANIFEST[ready.file]}
+	if [[ ! -f $file ]]; then
+		printf 'po: ready file %s not found\n' "$file" >&2
+		exit 1
 	fi
 	local project_filter=""
 	project_filter="${PO_MANIFEST[project.name]:-}"

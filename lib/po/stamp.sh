@@ -135,6 +135,15 @@ po_stamp_seconds() {
 	PO_EVENT_SECONDS=$(($(date +%s) - PO_STAMP_START))
 }
 
+# po_stamp_load1: the machine's one-minute load average (the first field of
+# /proc/loadavg) as a JSON number; nothing when it cannot be read.
+po_stamp_load1() {
+	local l rest
+	read -r l rest </proc/loadavg 2>/dev/null || return 0
+	[[ $l =~ ^[0-9]+(\.[0-9]+)?$ ]] && printf '%s' "$l"
+	return 0
+}
+
 # po_stamp_legs_json [<failing leg index>]: the legs array body for the event
 # log; the failing leg carries "tail", its output's last lines.
 po_stamp_legs_json() {
@@ -441,6 +450,41 @@ po_stamp_sum_pytest() {
 	PO_SUM_LINES=1
 }
 
+# po_stamp_hunk_lines <+|->: the added (+) or removed (-) lines of the diff
+# on stdin, without their marker; file headers are not hunk lines.
+po_stamp_hunk_lines() {
+	awk -v m="$1" '
+		/^diff --git / { hunk = 0; next }
+		/^@@/ { hunk = 1; next }
+		hunk && substr($0, 1, 1) == m { print substr($0, 2) }'
+}
+
+# po_stamp_test_counts <wt> <merge-base> <head> <main>: the block's line
+# "tests vs merge-base(<main>): +A -R", A and R the lines the diff adds and
+# removes in [stamp] test_files that match test_def (a rewritten definition
+# counts in both), then the flag line when the same diff changes a file that
+# is neither a test file nor docs and removes no definition. Information only.
+po_stamp_test_counts() {
+	local wt=$1 mb=$2 head=$3 main=$4 def=${PO_MANIFEST[stamp.test_def]} p diff a r code
+	local -a tf=() notest=()
+	while IFS= read -r p; do
+		[[ -z ${p//[[:blank:]]/} ]] || tf+=("$p") notest+=(":(exclude)$p")
+	done <<<"${PO_MANIFEST[stamp.test_files]}"
+	# -U0: no context lines; a hunk's content lines are those after its @@.
+	# The definitions are matched by grep -E, as the manifest checked them.
+	diff=$(git -C "$wt" diff --no-color --no-ext-diff -U0 "$mb" "$head" -- "${tf[@]}") ||
+		po_die "could not diff $mb..$head for [stamp] test_files"
+	a=$(po_stamp_hunk_lines + <<<"$diff" | grep -cE -- "$def") || true
+	r=$(po_stamp_hunk_lines - <<<"$diff" | grep -cE -- "$def") || true
+	printf 'tests vs merge-base(%s): +%s -%s\n' "$main" "$a" "$r"
+	((r == 0)) || return 0
+	code=$(git -C "$wt" diff --name-only --no-ext-diff "$mb" "$head" -- . "${notest[@]}" \
+		':(exclude)*.md' ':(exclude)docs/' ':(exclude)CHANGELOG.md') ||
+		po_die "could not diff $mb..$head for the code-change flag"
+	[[ -z $code ]] ||
+		printf 'flag: code changed, no test removed or rewritten (PO: check for pins on replaced behaviour)\n'
+}
+
 po_cmd_stamp() {
 	local bin='' wt=$PO_INVOKE_WT
 	while (($# > 0)); do
@@ -508,6 +552,8 @@ po_cmd_stamp() {
 	diffstat=$(git -C "$wt" diff --shortstat "$mb" "$head")
 	diffstat=${diffstat# }
 	[[ -n $diffstat ]] || diffstat='no changes'
+	local tcount=''
+	[[ -z ${PO_MANIFEST[stamp.test_files]+x} ]] || tcount=$(po_stamp_test_counts "$wt" "$mb" "$head" "$main")
 
 	printf 'po stamp: gate in %s at %s\n' "$wt" "$head" >&2
 	local gate_sum=0 gate_lines=0 test_sum=0 test_lines=0 off=0 leg_start
@@ -599,6 +645,15 @@ po_cmd_stamp() {
 		bin_line=$(printf 'bin sha256 %s (%s)' "${sum%% *}" "$shown")
 	fi
 
+	# The run's time, taken once: the block's line and the event carry the
+	# same seconds. Over [stamp] slow_after (the project's gate time budget)
+	# the block says so; at or under it the block is unchanged.
+	local over='' budget
+	po_stamp_seconds
+	budget=$((10#${PO_MANIFEST[stamp.slow_after]:-300}))
+	((PO_EVENT_SECONDS <= budget)) ||
+		over="gate time: $(po_event_secs "$PO_EVENT_SECONDS"), over budget $(po_event_secs "$budget") (slow_after)"
+
 	local legs block
 	legs=$(
 		IFS=/
@@ -608,6 +663,8 @@ po_cmd_stamp() {
 		printf 'HEAD %s (%s)  dirty %s\n' "$head" "$branch" "$dirty"
 		printf 'gate PASS: %s   tests %s passed\n' "$legs" "$tests"
 		printf 'diffstat vs merge-base(%s): %s\n' "$main" "$diffstat"
+		[[ -z $tcount ]] || printf '%s\n' "$tcount"
+		[[ -z $over ]] || printf '%s\n' "$over"
 		for line in "${prep[@]}"; do printf 'prepare ran: %s\n' "$line"; done
 		[[ -z $bin_line ]] || printf '%s\n' "$bin_line"
 	)
@@ -627,7 +684,8 @@ po_cmd_stamp() {
 		po_stamp_fail "could not write ${file##*/}"
 	fi
 	po_stamp_cleanup
-	po_stamp_seconds
+	# shellcheck disable=SC2034 # read by po_event_log
+	PO_EVENT_TESTS=$tests PO_EVENT_LOAD1=$(po_stamp_load1)
 	po_event_log stamp "$PO_STAMP_ITEM" pass "$(po_stamp_legs_json)" ''
 	printf '%s\n' "$block"
 	printf 'po stamp: wrote %s\n' "$file" >&2

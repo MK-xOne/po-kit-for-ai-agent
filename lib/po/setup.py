@@ -34,13 +34,13 @@ COLUMNS = ["#", "machine", "command", "who", "check"]
 
 
 def split_row(line):
-    """The cells of a table row; a | inside backticks or written \\| is not a separator."""
+    """The cells of a table row; a | inside a closed backtick span or written \\| is not a separator."""
     s = line.strip()
     if s.startswith("|"):
         s = s[1:]
     if s.endswith("|") and not s.endswith("\\|"):
         s = s[:-1]
-    cells, cur, tick = [], "", False
+    cells, cur = [], ""
     i = 0
     while i < len(s):
         c = s[i]
@@ -49,8 +49,13 @@ def split_row(line):
             i += 2
             continue
         if c == "`":
-            tick = not tick
-        if c == "|" and not tick:
+            # a code span protects its pipes only when it is closed on this row
+            j = s.find("`", i + 1)
+            if j > 0:
+                cur += "`" + s[i + 1:j].replace("\\|", "|") + "`"
+                i = j + 1
+                continue
+        if c == "|":
             cells.append(cur.strip())
             cur = ""
         else:

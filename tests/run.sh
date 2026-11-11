@@ -27,6 +27,7 @@ TMP=$(mktemp -d)
 RUN_DONE=0
 trap 'rc=$?; rm -rf "$TMP"; if ((RUN_DONE == 0)); then printf "RUN-ABORTED\n"; exit "$((rc == 0 ? 1 : rc))"; fi' EXIT
 export PROJECTS_FEED_CACHE_DIR="$TMP/pf-cache" # projects-feed state never lands in a real cache dir
+export SNAPSHOT_DIR="$TMP/status-snap" SNAPSHOT_TTL=0 # v0.151: the producers never read a real snapshot, and none is reused unless a test sets a TTL
 pass=0 fail=0 nblocks=0
 
 ok() {
@@ -381,14 +382,17 @@ git -C "$S" commit -q --allow-empty -m "main moves on"
 
 # stamp_manifest <leg>...: the good manifest plus a gate, each leg as
 # "name=command"; COUNT_CMD overrides the test count command, PREPARE is
-# the raw value of [stamp] prepare.
+# the raw value of [stamp] prepare, TEST_FILES and TEST_DEF those of
+# [stamp] test_files and test_def.
 stamp_manifest() {
 	local leg
 	{
 		printf '%s' "$GOOD_MANIFEST"
-		[[ -z ${PREPARE:-}${SLOW_AFTER:-} ]] || printf '[stamp]\n'
+		[[ -z ${PREPARE:-}${SLOW_AFTER:-}${TEST_FILES:-}${TEST_DEF:-} ]] || printf '[stamp]\n'
 		[[ -z ${PREPARE:-} ]] || printf 'prepare = %s\n' "$PREPARE"
 		[[ -z ${SLOW_AFTER:-} ]] || printf 'slow_after = %s\n' "$SLOW_AFTER"
+		[[ -z ${TEST_FILES:-} ]] || printf 'test_files = %s\n' "$TEST_FILES"
+		[[ -z ${TEST_DEF:-} ]] || printf 'test_def = %s\n' "$TEST_DEF"
 		printf '[gate]\ntest_count_cmd = "%s"\n' "${COUNT_CMD:-sh ./fake-test.sh 2>&1}"
 		[[ -z ${SENTINEL:-} ]] || printf 'run_sentinel = "required"\n'
 		[[ -z ${TEST_FORMAT:-} ]] || printf 'test_format = "%s"\n' "$TEST_FORMAT"
@@ -2289,8 +2293,8 @@ jfield() { python3 -I -c 'import json,sys; print(json.loads(sys.argv[1])[sys.arg
 first=$(grep -m1 '"result":"pass"' "$SLOG")
 [[ $(jfield "$first" kind) == stamp && $(jfield "$first" item) == 1.0.3 && $(jfield "$first" project) == stamp &&
 	$(jfield "$first" detail) == '' ]] &&
-	python3 -I -c 'import json,sys,re; e=json.loads(sys.argv[1]); assert list(e)==["time","kind","item","project","result","agent","legs","seconds","detail"]; assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", e["time"]); assert [(l["name"],l["result"]) for l in e["legs"]]==[(n,"pass") for n in ("check","test","clippy","fmt")] and all(list(l)==["name","result","seconds"] for l in e["legs"])' "$first" &&
-	ok "events: a passing stamp logs time (UTC), kind, item, project, result, every leg and the seconds taken" || bad "pass event" "$first"
+	python3 -I -c 'import json,sys,re; e=json.loads(sys.argv[1]); assert list(e)==["time","kind","item","project","result","agent","legs","seconds","tests","load1","detail"]; assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", e["time"]); assert [(l["name"],l["result"]) for l in e["legs"]]==[(n,"pass") for n in ("check","test","clippy","fmt")] and all(list(l)==["name","result","seconds"] for l in e["legs"])' "$first" &&
+	ok "events: a passing stamp logs time (UTC), kind, item, project, result, every leg, the seconds taken, the test count and the load" || bad "pass event" "$first"
 fail1=$(grep -m1 '"clippy","result":"fail"' "$SLOG")
 [[ -n $fail1 && $(jfield "$fail1" result) == fail && $(jfield "$fail1" detail) == *"gate leg 'clippy'"* ]] &&
 	python3 -I -c 'import json,sys; e=json.loads(sys.argv[1]); assert [l["result"] for l in e["legs"]]==["pass","pass","fail","skip"], e["legs"]' "$fail1" &&
@@ -2406,6 +2410,17 @@ out=$(ar_run --archived --json 2>&1)
 [[ $out == *older* && $out != *young* && $(wc -l <<<"$out") == 1 ]] && ok "archive: --archived --json shows the archive" || bad "archived json" "$out"
 out=$(ar_run --archived 2>&1)
 [[ $out == TIME* && $out == *open* ]] && ok "archive: --archived prints the table" || bad "archived table" "$out"
+# v0.153: 60 archived events (more than the default cut of 10): --all returns every one, newest first
+{ for i in $(seq 1 60); do ar_ev $((900000 + i * 10)) "bulk$i"; done; } >"$AARC.bulk"
+cp "$AARC" "$AARC.keep"
+cat "$AARC.bulk" >>"$AARC"
+out=$(ar_run --archived --all --json 2>&1)
+[[ $(grep -c . <<<"$out") == 61 && $(head -1 <<<"$out") == *bulk60* && $(tail -1 <<<"$out") == *older* ]] &&
+	ok "archive: --archived --all --json returns every archived event, newest first" || bad "archived all json" "$(wc -l <<<"$out")"
+out=$(ar_run --archived --json 2>&1)
+[[ $(grep -c . <<<"$out") == 10 ]] && ok "archive: --archived --json without --all keeps the newest 10" || bad "archived json cut" "$(wc -l <<<"$out")"
+cp "$AARC.keep" "$AARC"
+rm -f "$AARC.bulk" "$AARC.keep"
 before=$(cat "$AARC")
 out=$(ar_run --archive-now 2>&1)
 [[ $out == *'archived 0 events'* && "$(cat "$AARC")" == "$before" ]] && ok "archive: a second --archive-now moves nothing" || bad "archive rerun" "$out"
@@ -2587,6 +2602,211 @@ grep -qF '"legs":[{"name":"lint","result":"pass"}],"detail":""' <<<"$out" && gre
 	ok "time taken: --json carries the raw keys and leaves an old event as it is" || bad "events json seconds"
 sed -i '/"project":"\(oldfmt\|mid\|long\)"/d' "$SLOG"
 
+# ---- stamp and close: a gate over the time budget (item v0.170) -----------
+# [stamp] slow_after (default 300) is the project's gate time budget: a run
+# over it adds `gate time: ..., over budget ... (slow_after)` to the block, and
+# po close flags the item's newest passing stamp event when it was over.
+# secs_fmt <n>: whole seconds as the block writes them (57s, 4m12s, 1h02m03s).
+secs_fmt() {
+	if (($1 >= 3600)); then printf '%dh%02dm%02ds' $(($1 / 3600)) $(($1 % 3600 / 60)) $(($1 % 60))
+	elif (($1 >= 60)); then printf '%dm%02ds' $(($1 / 60)) $(($1 % 60))
+	else printf '%ds' "$1"; fi
+}
+# A stubbed clock: each bare `date +%s` reads 301 s later than the one
+# before, so any run that reads it twice is past the default 300 s budget.
+mkdir -p "$TMP/clock-bin"
+cat >"$TMP/clock-bin/date" <<EOF
+#!/bin/sh
+if [ "\$*" = "+%s" ]; then
+	n=\$(cat "$TMP/clock-now" 2>/dev/null || $(command -v date) +%s)
+	n=\$((n + 301))
+	echo "\$n" >"$TMP/clock-now"
+	echo "\$n"
+else
+	exec $(command -v date) "\$@"
+fi
+EOF
+chmod +x "$TMP/clock-bin/date"
+rm -f "$W"/gate-*.txt
+SLOW_AFTER=1 stamp_manifest check=true "test=sleep 2; sh ./fake-test.sh"
+blk=$("$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>/dev/null)
+sec=$(jfield "$(tail -1 "$SLOG")" seconds)
+want="gate time: $(secs_fmt "$sec"), over budget 1s (slow_after)"
+[[ $sec -ge 2 && $(sed -n 4p <<<"$blk") == "$want" && $(sed -n 4p "$W/gate-1.txt") == "$want" ]] &&
+	ok "budget: slow_after = 1 and a 2 s leg add the exact 'gate time ... over budget 1s (slow_after)' line, its seconds the event's" ||
+	bad "budget line (event seconds $sec)" "$blk"$'\n--- want line 4\n'"$want"
+rm -f "$W"/gate-*.txt
+stamp_manifest "${STD_LEGS[@]}"
+blk=$("$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>/dev/null)
+want=$(
+	printf 'HEAD %s (item-v1.0.3)  dirty 0\n' "$(git -C "$W" rev-parse HEAD)"
+	printf 'gate PASS: check/test/clippy/fmt   tests 5 passed\n'
+	printf 'diffstat vs merge-base(main): %s\n' "$(git -C "$W" diff --shortstat "$(git -C "$W" merge-base main HEAD)" HEAD | sed 's/^ //')"
+)
+[[ $blk == "$want" ]] && ok "budget: a fast run under the default 300 s leaves the block as it was" ||
+	bad "budget fast block" "$blk"$'\n--- want\n'"$want"
+rm -f "$W"/gate-*.txt "$TMP/clock-now"
+blk=$(PATH="$TMP/clock-bin:$PATH" "$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>/dev/null)
+sec=$(jfield "$(tail -1 "$SLOG")" seconds)
+want="gate time: $(secs_fmt "$sec"), over budget 5m00s (slow_after)"
+[[ $sec -gt 300 && $(sed -n 4p <<<"$blk") == "$want" ]] &&
+	ok "budget: slow_after unset and a clock past 300 s add the line with the 5m00s default budget" ||
+	bad "budget default line (event seconds $sec)" "$blk"$'\n--- want line 4\n'"$want"
+rm -f "$W"/gate-*.txt "$TMP/clock-now"
+
+# po close: the flag reads the item's newest passing stamp event.
+B170=$TMP/b170
+make_brepo "$B170"
+W170=$B170/.wt/item-v1.0.3
+L170=$B170/.git/po-events.jsonl
+rm -f "$W170"/gate-*.txt
+PATH="$TMP/clock-bin:$PATH" "$PO" -C "$W170" --manifest "$BM" stamp >/dev/null 2>&1
+sec=$(jfield "$(tail -1 "$L170")" seconds)
+want="flag: item v1.0.3 gate took $(secs_fmt "$sec"), over budget 5m00s"
+out=$("$PO" -C "$B170" --manifest "$BM" close 1.0.3 2>&1)
+code=$?
+[[ $code == 0 && $sec -gt 300 ]] && grep -qxF "$want" <<<"$out" && grep -q 'DRY RUN' <<<"$out" &&
+	ok "budget: po close's dry run flags a stamp over the budget, exit 0" || bad "close flag (exit $code, seconds $sec)" "$out"$'\n--- want\n'"$want"
+rm -f "$W170"/gate-*.txt "$TMP/clock-now"
+"$PO" -C "$W170" --manifest "$BM" stamp >/dev/null 2>&1
+out=$("$PO" -C "$B170" --manifest "$BM" close 1.0.3 2>&1)
+code=$?
+[[ $code == 0 && $out != *'flag: item '* ]] && grep -q 'DRY RUN' <<<"$out" &&
+	ok "budget: after a fast stamp (the newest) po close prints no flag" || bad "close no flag after fast (exit $code)" "$out"
+cp "$L170" "$TMP/l170.keep"
+printf '%s\n' \
+	'{"time":"2026-11-10T10:00:00Z","kind":"stamp","item":"1.0.3","project":"b170","result":"fail","agent":"x","legs":[{"name":"check","result":"pass","seconds":900}],"seconds":900,"detail":"slow and failed","log":null}' \
+	'{"time":"2026-11-10T10:01:00Z","kind":"stamp","item":"1.0.4","project":"b170","result":"pass","agent":"x","legs":[{"name":"check","result":"pass","seconds":900}],"seconds":900,"tests":1,"detail":""}' >"$L170"
+out=$("$PO" -C "$B170" --manifest "$BM" close 1.0.3 2>&1)
+code=$?
+[[ $code == 0 && $out != *'flag: item '* ]] &&
+	ok "budget: an item with only a failed stamp over the budget (and another item's slow pass) gets no flag" || bad "close flag failed stamp (exit $code)" "$out"
+printf '%s\n' \
+	'{"time":"2026-10-20T10:00:00Z","kind":"stamp","item":"1.0.3","project":"b170","result":"pass","agent":"x","legs":[{"name":"check","result":"pass"}],"detail":""}' >"$L170"
+out=$("$PO" -C "$B170" --manifest "$BM" close 1.0.3 2>&1)
+code=$?
+[[ $code == 0 && $out != *'flag: item '* ]] &&
+	ok "budget: an old passing event without seconds is unknown, never 0: no flag" || bad "close flag old event (exit $code)" "$out"
+: >"$L170"
+out=$("$PO" -C "$B170" --manifest "$BM" close 1.0.3 2>&1)
+code=$?
+[[ $code == 0 && $out != *'flag: item '* ]] && ok "budget: no stamp event at all: no flag" || bad "close flag no event (exit $code)" "$out"
+cp "$TMP/l170.keep" "$L170"
+{ cat "$BM"; printf '\n[stamp]\nslow_after = 1\n'; } >"$TMP/b170.toml"
+rm -f "$W170"/gate-*.txt
+"$PO" -C "$W170" --manifest "$TMP/b170.toml" stamp >/dev/null 2>&1
+printf '%s\n' '{"time":"2026-11-10T10:02:00Z","kind":"stamp","item":"1.0.3","project":"b170","result":"pass","agent":"x","legs":[{"name":"check","result":"pass","seconds":2}],"seconds":2,"tests":1,"detail":""}' >>"$L170"
+out=$("$PO" -C "$B170" --manifest "$TMP/b170.toml" close 1.0.3 --commit 2>&1)
+code=$?
+[[ $code == 0 ]] && grep -qxF 'flag: item v1.0.3 gate took 2s, over budget 1s' <<<"$out" && [[ -n $(git -C "$B170" tag -l v1.0.3) ]] &&
+	ok "budget: po close --commit prints the flag against the project's slow_after and still closes" || bad "close --commit flag (exit $code)" "$out"
+
+# ---- events: test count, load and the trend (item v0.168) ------------------
+# A passing stamp's event carries "tests" (the gate block's number) and "load1"
+# (/proc/loadavg's first field) after the run's seconds; a failed one has
+# neither. `po events --trend` sums PASS stamps per local day.
+rm -f "$W"/gate-*.txt
+stamp_manifest "${STD_LEGS[@]}"
+blk=$("$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>/dev/null)
+tc=$(sed -n 's/^gate PASS: .*   tests \([0-9]*\) passed$/\1/p' <<<"$blk")
+tl=$(tail -1 "$SLOG")
+[[ -n $tc ]] && python3 -I -c 'import json,sys; e=json.loads(sys.argv[1]); assert e["result"]=="pass"; assert list(e)==["time","kind","item","project","result","agent","legs","seconds","tests","load1","detail"], list(e); assert e["tests"]==int(sys.argv[2]), (e["tests"], sys.argv[2]); assert isinstance(e["load1"], (int, float)) and e["load1"] >= 0, e["load1"]' "$tl" "$tc" &&
+	ok "trend: a passing stamp's event carries tests equal to the gate block's number and a numeric load1, after seconds" || bad "stamp tests/load1" "$blk"$'\n'"$tl"
+rm -f "$W"/gate-*.txt
+stamp_manifest check=true "test=sh ./fake-test.sh" "clippy=exit 3" fmt=true
+"$PO" -C "$W" --manifest "$TMP/s.toml" stamp >/dev/null 2>&1
+tl=$(tail -1 "$SLOG")
+python3 -I -c 'import json,sys; e=json.loads(sys.argv[1]); assert e["result"]=="fail"; assert "tests" not in e and "load1" not in e, list(e)' "$tl" &&
+	ok "trend: a failed stamp's event has neither tests nor load1" || bad "fail tests/load1" "$tl"
+stamp_manifest "${STD_LEGS[@]}"
+rm -f "$W"/gate-*.txt
+printf '%s\n' \
+	'{"time":"2026-10-20T10:00:00Z","kind":"stamp","item":"1.0.1","project":"oldkeys","result":"pass","agent":"x","legs":[{"name":"lint","result":"pass"}],"detail":""}' \
+	'{"time":"2026-10-20T10:01:00Z","kind":"stamp","item":"1.0.1","project":"newkeys","result":"pass","agent":"x","legs":[{"name":"lint","result":"pass","seconds":61}],"seconds":252,"tests":9,"load1":1.5,"detail":""}' >>"$SLOG"
+out=$("$PO" -C "$S" --manifest "$TMP/s.toml" events --all 2>&1 | table)
+grep -qE 'oldkeys +pass +x +- +lint:pass$' <<<"$out" && grep -qE 'newkeys +pass +x +4m12s +lint:pass\(1m01s\)$' <<<"$out" &&
+	ok "trend: plain po events lists an old event without the keys with -, and reads the time of one with them" || bad "events with tests/load1" "$out"
+sed -i '/"project":"\(oldkeys\|newkeys\)"/d' "$SLOG"
+
+# Fixture: three days with stamps in the window (two live, one archived), one
+# day outside it, a failed stamp, an open and a close. TZ=UTC; the clock is
+# 2026-11-10 12:00 UTC.
+TR=$TMP/trend
+make_repo "$TR"
+TRLOG=$TR/.git/po-events.jsonl
+TRARC=$TR/.git/po-events-archive.jsonl
+TRNOW=$(date -u -d 2026-11-10T12:00:00Z +%s)
+tr_ev() { # <time> <result> <test leg seconds|-> [<tests> <load1>]
+	local leg='{"name":"lint","result":"pass","seconds":2}' extra=''
+	[[ $3 == - ]] || leg+=',{"name":"test","result":"pass","seconds":'$3'}'
+	[[ -z ${4:-} ]] || extra=',"tests":'$4',"load1":'$5
+	printf '{"time":"%s","kind":"stamp","item":"1.0.1","project":"demo","result":"%s","agent":"a","legs":[%s],"seconds":99%s,"detail":""}\n' \
+		"$1" "$2" "$leg" "$extra"
+}
+{
+	tr_ev 2026-10-20T09:00:00Z pass 10 50 0.10
+	tr_ev 2026-11-05T09:00:00Z pass 30 100 1.00
+	tr_ev 2026-11-05T10:00:00Z pass 50 100 2.00
+} >"$TRARC"
+{
+	tr_ev 2026-11-05T10:00:00Z pass 50 100 2.00 # also in the archive: counted once
+	tr_ev 2026-11-09T08:00:00Z pass 40
+	tr_ev 2026-11-09T09:00:00Z pass 44
+	tr_ev 2026-11-10T01:00:00Z pass 50 120 2.00
+	tr_ev 2026-11-10T02:00:00Z fail 999
+	printf '{"time":"2026-11-10T02:30:00Z","kind":"open","item":"9","project":"demo","result":"pass","agent":"a","legs":[],"detail":""}\n'
+	tr_ev 2026-11-10T03:00:00Z pass 70 120 4.00
+	printf '{"time":"2026-11-10T03:30:00Z","kind":"close","item":"9","project":"demo","result":"pass","agent":"a","legs":[],"detail":""}\n'
+	tr_ev 2026-11-10T04:00:00Z pass 60 118 3.00
+} >"$TRLOG"
+tr_run() { TZ=UTC PO_EVENTS_NOW=$TRNOW "$PO" -C "$TR" --manifest "$TMP/s.toml" events "$@"; }
+want='DAY         STAMPS  TESTS  TEST-LEG  PER-TEST  LOAD
+2026-11-10  3       120    1m00s     500 ms    3.00
+2026-11-09  2       -      42s       -         -
+2026-11-05  2       100    40s       400 ms    1.50
+change since 2026-11-05: tests +20 (+20%), test leg +20 s (+50%), per test +100 ms'
+sha=$(cat "$TRLOG" "$TRARC" | sha256sum)
+out=$(tr_run --trend 2>&1)
+code=$?
+[[ $code == 0 && $out == "$want" ]] &&
+	ok "trend: three days from the log and the archive -> the exact table, medians, ms per test and the change line" || bad "trend table (exit $code)" "$out"
+[[ $(sed -n 3p <<<"$out") == '2026-11-09  2       -      42s       -         -' ]] &&
+	ok "trend: a day whose stamps have no tests key shows - in TESTS and PER-TEST (no divide by zero)" || bad "trend no tests" "$out"
+[[ $(sed -n 2p <<<"$out") == '2026-11-10  3       120    1m00s     500 ms    3.00' ]] &&
+	ok "trend: open, close and failed stamp events are not counted" || bad "trend ignores" "$out"
+[[ $(tr_run --trend --days 14 2>&1) == "$want" && $(cat "$TRLOG" "$TRARC" | sha256sum) == "$sha" ]] &&
+	ok "trend: --days 14 is the default, and the trend changes no file" || bad "trend --days 14"
+out=$(tr_run --trend --days 2 2>&1)
+[[ $out == 'DAY         STAMPS  TESTS  TEST-LEG  PER-TEST  LOAD
+2026-11-10  3       120    1m00s     500 ms    3.00
+2026-11-09  2       -      42s       -         -
+change: - (fewer than two days with a TESTS value)' ]] &&
+	ok "trend: --days 2 shows today and yesterday only; one day with tests has no change to show" || bad "trend --days 2" "$out"
+out=$(tr_run --trend --json 2>&1)
+python3 -I -c '
+import json, sys
+got = json.loads(sys.argv[1])
+want = [
+    {"day": "2026-11-10", "stamps": 3, "tests": 120, "test_leg": 60, "per_test_ms": 500, "load1": 3.0},
+    {"day": "2026-11-09", "stamps": 2, "tests": None, "test_leg": 42, "per_test_ms": None, "load1": None},
+    {"day": "2026-11-05", "stamps": 2, "tests": 100, "test_leg": 40, "per_test_ms": 400, "load1": 1.5},
+]
+assert got == want, got
+' "$out" && ok "trend: --json is an array of one object per day matching the table, null for -" || bad "trend --json" "$out"
+TE=$TMP/trend-empty
+make_repo "$TE"
+printf '{"time":"2026-11-10T02:30:00Z","kind":"open","item":"9","project":"demo","result":"pass","agent":"a","legs":[],"detail":""}\n' >"$TE/.git/po-events.jsonl"
+out=$(TZ=UTC PO_EVENTS_NOW=$TRNOW "$PO" -C "$TE" --manifest "$TMP/s.toml" events --trend 2>&1)
+code=$?
+[[ $code == 0 && $out == 'no stamps in the last 14 days' ]] &&
+	ok "trend: no PASS stamp in the window -> no stamps in the last 14 days, exit 0" || bad "trend empty (exit $code)" "$out"
+out=$(TZ=UTC PO_EVENTS_NOW=$TRNOW "$PO" -C "$TE" --manifest "$TMP/s.toml" events --trend --json 2>&1)
+[[ $out == '[]' ]] && ok "trend: --json with no stamps is an empty array" || bad "trend empty json" "$out"
+expect "trend: --trend --archive-now is a usage error" 1 'trend combines only with --days and --json' -- -C "$TR" --manifest "$TMP/s.toml" events --trend --archive-now
+expect "trend: --trend --all is a usage error" 1 'trend combines only with --days and --json' -- -C "$TR" --manifest "$TMP/s.toml" events --trend --all
+expect "trend: --days without --trend is a usage error" 1 'days needs --trend' -- -C "$TR" --manifest "$TMP/s.toml" events --days 3
+expect "trend: --days 0 is a usage error" 1 'days takes a whole number of days, 1 or more' -- -C "$TR" --manifest "$TMP/s.toml" events --trend --days 0
+
 # ---- stamp: prepare lines (item AA) -----------------------------------------
 # A formatter fixes the tree before the gate looks at it.
 rm -f "$W"/gate-*.txt "$TMP/order"
@@ -2648,6 +2868,92 @@ expect "prepare: a value that is not an array is a manifest error" 2 'not an arr
 mf '[stamp]\nprepares = ["x"]\n[gate]\ncommand = "true"\n'
 expect "prepare: another key under [stamp] is a manifest error" 2 "unknown key 'prepares' in \[stamp\]" -- -C "$W" --manifest "$TMP/s.toml" stamp
 rm -f "$W"/gate-*.txt "$W/messy.txt" "$TMP/order"
+stamp_manifest "${STD_LEGS[@]}"
+
+# ---- stamp: tests added and removed (v0.169) -------------------------------
+# [stamp] test_files and test_def: the block counts the test definitions the
+# item's diff adds and removes, and flags a code change that removes none.
+# One fixture repo; each case is a branch off main with its own worktree.
+TC=$TMP/tcount
+make_repo "$TC"
+cp "$S/fake-test.sh" "$TC/"
+mkdir -p "$TC/tests" "$TC/src"
+printf 'case "one"\ncase "two"\ncase "three"\nhelper() { :; }\n' >"$TC/tests/t.sh"
+printf 'echo code\n' >"$TC/src/c.sh"
+git -C "$TC" add -A && git -C "$TC" commit -qm "tests and code"
+TC_FLAG='flag: code changed, no test removed or rewritten (PO: check for pins on replaced behaviour)'
+# tc_case <name> <shell run in the new worktree>: a branch c-<name> off main,
+# the shell's changes committed on it (none: the branch stays at main).
+tc_case() {
+	local wt=$TC/.wt/c-$1
+	git -C "$TC" worktree add -q "$wt" -b "c-$1" main
+	(cd "$wt" && eval "$2")
+	git -C "$wt" add -A
+	git -C "$wt" diff --cached --quiet || git -C "$wt" commit -qm "c-$1"
+	TCW=$wt
+}
+# tc_want <extra block line>...: today's three lines for TCW, then the extras.
+tc_want() {
+	printf 'HEAD %s (%s)  dirty 0\n' "$(git -C "$TCW" rev-parse HEAD)" "$(git -C "$TCW" symbolic-ref --short HEAD)"
+	printf 'gate PASS: test   tests 5 passed\n'
+	local ds
+	ds=$(git -C "$TCW" diff --shortstat "$(git -C "$TCW" merge-base main HEAD)" HEAD | sed 's/^ //')
+	printf 'diffstat vs merge-base(main): %s\n' "${ds:-no changes}"
+	[[ $# == 0 ]] || printf '%s\n' "$@"
+}
+# tc_is <test name> <extra block line>...: stamp TCW, the block is exactly tc_want's.
+tc_is() {
+	local name=$1 out code want
+	shift
+	out=$("$PO" -C "$TCW" --manifest "$TMP/s.toml" stamp 2>"$TMP/tc.err")
+	code=$?
+	want=$(tc_want "$@")
+	[[ $code == 0 && $out == "$want" && $(<"$(compgen -G "$TCW/gate-*.txt" | tail -1)") == "$want" ]] &&
+		ok "$name" || bad "$name (exit $code)" "$out"$'\n--- want\n'"$want"$'\n--- stderr\n'"$(tail -5 "$TMP/tc.err")"
+}
+TC_ADD3='printf '\''case "four"\ncase "five"\ncase "six"\n'\'' >>tests/t.sh; printf '\''echo more\ncase "not a test file"\n'\'' >>src/c.sh'
+tc_case add3 "$TC_ADD3"
+stamp_manifest "test=sh ./fake-test.sh"
+tc_is "test counts: keys unset, the block is today's three lines, nothing more"
+TEST_FILES='["tests/"]' TEST_DEF='"^case \""' stamp_manifest "test=sh ./fake-test.sh"
+tc_is "test counts: 3 definitions added with a code change -> +3 -0 and the flag line, exactly; a definition outside test_files does not count" \
+	'tests vs merge-base(main): +3 -0' "$TC_FLAG"
+tc_case add2rm1 'sed -i "/^case \"two\"/d" tests/t.sh; printf '\''case "four"\ncase "five"\n'\'' >>tests/t.sh; echo more >>src/c.sh'
+tc_is "test counts: 2 added, 1 removed, with a code change -> +2 -1, no flag" 'tests vs merge-base(main): +2 -1'
+tc_case rewrite 'sed -i "s/^case \"two\"/case \"two, better\"/" tests/t.sh; echo more >>src/c.sh'
+tc_is "test counts: a rewritten definition (one line changed) counts in both -> +1 -1, no flag" 'tests vs merge-base(main): +1 -1'
+tc_case nondef 'echo "other() { :; }" >>tests/t.sh; sed -i "/^helper/d" tests/t.sh; echo more >>src/c.sh'
+tc_is "test counts: lines in test_files that define no test count for nothing; a code change then gets the flag" \
+	'tests vs merge-base(main): +0 -0' "$TC_FLAG"
+tc_case docs 'echo more >>README.md; mkdir -p docs/notes; echo x >docs/notes/n.txt; echo y >CHANGELOG.md; mkdir sub; echo z >sub/NOTES.md'
+tc_is "test counts: a docs-only diff (*.md, docs/, CHANGELOG.md) -> +0 -0, no flag" 'tests vs merge-base(main): +0 -0'
+tc_case testsonly 'printf '\''case "four"\ncase "five"\n'\'' >>tests/t.sh; printf '\''case "x"\n'\'' >tests/u.sh'
+TEST_FILES='["tests/*.sh"]' TEST_DEF='"^case \""' stamp_manifest "test=sh ./fake-test.sh"
+tc_is "test counts: a tests-only diff counts its definitions (test_files as a glob) -> +3 -0, no flag" 'tests vs merge-base(main): +3 -0'
+tc_case rust 'printf '\''#[test]\nfn a() {}\n#[test]\nfn b() {}\n#[tests]\n'\'' >tests/r.rs; echo "[test]" >>src/c.sh'
+TEST_FILES='["tests/"]' TEST_DEF='"^#\\[test\\]$"' stamp_manifest "test=sh ./fake-test.sh"
+tc_is "test counts: a test_def with backslash escapes is matched as grep -E reads it -> +2 -0, the flag" \
+	'tests vs merge-base(main): +2 -0' "$TC_FLAG"
+tc_case nodiff ':'
+tc_is "test counts: no diff -> +0 -0, no flag" 'tests vs merge-base(main): +0 -0'
+mkdir -p "$TC/more" && printf 'case "m1"\ncase "m2"\n' >"$TC/more/m.sh"
+git -C "$TC" add -A && git -C "$TC" commit -qm "a second test path"
+tc_case multipath 'sed -i "/^case \"m2\"/d" more/m.sh; printf '\''case "four"\n'\'' >>tests/t.sh; echo more >>src/c.sh'
+TEST_FILES='["tests/", "more/"]' TEST_DEF='"^case \""' stamp_manifest "test=sh ./fake-test.sh"
+tc_is "test counts: every test_files path counts; a removal in the second path -> +1 -1, no flag" 'tests vs merge-base(main): +1 -1'
+TCW=$TC/.wt/c-add3
+rm -f "$TCW"/gate-*.txt
+TEST_DEF='"^case \""' stamp_manifest "test=sh ./fake-test.sh"
+expect "test counts: test_def without test_files is a manifest error, exit 2" 2 'test_def and test_files go together' -- -C "$TCW" --manifest "$TMP/s.toml" stamp
+TEST_FILES='["tests/"]' stamp_manifest "test=sh ./fake-test.sh"
+expect "test counts: test_files without test_def is a manifest error, exit 2" 2 'test_def and test_files go together' -- -C "$TCW" --manifest "$TMP/s.toml" stamp
+TEST_FILES='"tests/"' TEST_DEF='"^case \""' stamp_manifest "test=sh ./fake-test.sh"
+expect "test counts: test_files that is not an array is a manifest error" 2 'not an array|must be an array' -- -C "$TCW" --manifest "$TMP/s.toml" stamp
+TEST_FILES='[]' TEST_DEF='"^case \""' stamp_manifest "test=sh ./fake-test.sh"
+expect "test counts: an empty test_files is a manifest error" 2 'test_files needs at least one path' -- -C "$TCW" --manifest "$TMP/s.toml" stamp
+TEST_FILES='["tests/"]' TEST_DEF='"(ok"' stamp_manifest "test=sh ./fake-test.sh"
+expect "test counts: a test_def that is not a valid ERE is a manifest error" 2 'test_def is not a valid extended regular expression' -- -C "$TCW" --manifest "$TMP/s.toml" stamp
+[[ -z $(compgen -G "$TCW/gate-*.txt") ]] && ok "test counts: a manifest error writes no stamp file" || bad "test counts: manifest error wrote a stamp" "$(ls "$TCW")"
 stamp_manifest "${STD_LEGS[@]}"
 
 # ---- releases and adopters (item K) ---------------------------------------
@@ -2825,7 +3131,10 @@ PY
 cat >"$SV/bin/po" <<'EOF'
 #!/usr/bin/env bash
 [[ $1 == events && $* == *--json* ]] || { echo "fake po: unexpected: $*" >&2; exit 9; }
-if [[ $* == *--archived* ]]; then cat "$FAKE_ARCHIVE"; else cat "$FAKE_EVENTS"; fi
+# like the real po: without --all only the newest 10 (here: 1) come back
+if [[ $* == *--archived* ]]; then
+	if [[ $* == *--all* ]]; then cat "$FAKE_ARCHIVE"; else tail -n 1 "$FAKE_ARCHIVE"; fi
+else cat "$FAKE_EVENTS"; fi
 EOF
 chmod +x "$SV/bin/po"
 # the archive the fake serves: two older events, oldest first like the real file
@@ -3847,7 +4156,7 @@ check("dashboard decisions: v0.141 no link for a scheme that runs code or reads 
 check("dashboard decisions: v0.141 every card kind with an http(s) thread_url gets the link (choice, action, unformatted, legacy)",
       all(c.thread_link_markup(c.decision_row(dict(e, thread_url="https://h/t/9"), now)["thread_url"]) for e in
           [{"kind": "choice", "id": "a", "question": "q", "options": [{"label": "x"}, {"label": "y"}]},
-           {"kind": "action", "id": "b", "machine": "m", "done_when": "d", "steps": [{"text": "s"}]}, {"kind": "z", "id": "c"}, {}]))
+           {"kind": "action", "id": "b", "machine": "m", "done_when": "pass", "steps": [{"text": "s", "expect": "x"}]}, {"kind": "z", "id": "c"}, {}]))
 check("dashboard decisions: short_title cuts at 80 and keeps short text", c.short_title("x" * 100) == "x" * 80 and c.short_title("abc") == "abc" and c.short_title(None) == "")
 check("dashboard decisions: a long title is cut in the row", len(c.decision_row({"title": "y" * 120}, now)["title"]) == 80)
 check("dashboard decisions: check lines show kind item project title waiting asked and the URL when there is one",
@@ -3869,7 +4178,7 @@ check("dashboard answers: the body for a long-label choice has the same shape as
       set(_short_b) == set(_long_b) and _long_b["option"] == _long["options"][0]["label"] and {k: v for k, v in _long_b.items() if k != "option"} == {k: v for k, v in _short_b.items() if k != "option"})
 # v0.36: kinds, group order, the Actions filter.
 CH = {"kind": "choice", "id": "a1", "question": "Approve?", "options": [{"label": "Yes", "recommended": True}, {"label": "No", "description": "back to spec"}]}
-AC = {"kind": "action", "id": "a2", "machine": "host", "steps": [{"text": "restart", "command": "systemctl restart x"}, {"text": "look"}], "done_when": "it is up"}
+AC = {"kind": "action", "id": "a2", "machine": "host", "steps": [{"text": "restart", "command": "systemctl restart x", "expect": "no output"}, {"text": "look", "expect": "it is up"}], "done_when": "pass"}
 check("dashboard decisions: a choice is a choice", c.decision_shape(CH) == "choice")
 check("dashboard decisions: an action is an action", c.decision_shape(AC) == "action")
 check("dashboard decisions: no kind is legacy", c.decision_shape({"item": "1"}) == "legacy")
@@ -3892,7 +4201,7 @@ check("dashboard decisions: a choice row carries the kind, id, question and opti
       gr["kind"] == "choice" and gr["id"] == "a1" and gr["question"] == "Approve?" and gr["options"] == [{"label": "Yes", "description": "", "recommended": True}, {"label": "No", "description": "back to spec", "recommended": False}])
 ar = c.decision_row(dict(AC, item="g"), now)
 check("dashboard decisions: an action row carries the machine, numbered steps with their commands, and done_when",
-      ar["kind"] == "action" and ar["machine"] == "host" and ar["steps"] == [{"n": 1, "text": "restart", "command": "systemctl restart x", "expect": ""}, {"n": 2, "text": "look", "command": "", "expect": ""}] and ar["done_when"] == "it is up")
+      ar["kind"] == "action" and ar["machine"] == "host" and ar["steps"] == [{"n": 1, "text": "restart", "command": "systemctl restart x", "expect": "no output"}, {"n": 2, "text": "look", "command": "", "expect": "it is up"}] and ar["done_when"] == "pass")
 check("dashboard decisions: an unformatted row has no kind fields", "options" not in c.decision_row(dict(CH, kind="poll"), now) and c.decision_row(dict(CH, kind="poll"), now)["kind"] == "unformatted")
 check("dashboard decisions: the key stays project and item, not the id", c.decision_key(dict(CH, project="p", item="1")) == ("p", "1"))
 kl = c.decision_check_lines([dict(CH, item="g4", project="p", title="T", waiting_for="w", asked_at="2026-10-24T09:00:00Z"), {"item": "g2", "project": "p", "title": "T", "waiting_for": "w", "asked_at": "2026-10-24T08:00:00Z"}], now, utc)
@@ -3936,7 +4245,7 @@ check("dashboard install: an action without requires has requires None", c.decis
 check("dashboard install: an action with a bad requires is unformatted, as other bad fields",
       all(c.decision_shape(dict(AC, requires=bad)) == "unformatted" for bad in (dict(RQ, package="<pkg>"), dict(RQ, package="a/b"), dict(RQ, sha256="x"), {}, "pkg", None)))
 def card(item, req, at, project="orchard"):
-    return dict(AC, id="id-" + item, project=project, item=item, asked_at=at, steps=[{"text": "look at the sidebar"}], **({"requires": req} if req else {}))
+    return dict(AC, id="id-" + item, project=project, item=item, asked_at=at, steps=[{"text": "look at the sidebar", "expect": "the sidebar shows"}], **({"requires": req} if req else {}))
 agree = [card("1.9.39", RQ, "2026-10-29T10:00:00Z"), card("1.9.49", RQ, "2026-10-29T11:00:00Z"), card("1.10.7", RQ, "2026-10-29T12:00:00Z")]
 pl = c.install_plan(agree, "/home/me/pkgs")
 check("dashboard install: cards agreeing give one block with both commands and no mark",
@@ -4112,7 +4421,7 @@ for bad_url in ("ftp://h/x", "file:///etc/passwd", "notaurl"):
     except c.DashboardError:
         check("dashboard answers: %s is refused" % bad_url, True)
 _check_entry_choice = {"id": "ask-0707", "project": "harbor", "item": "0.7", "kind": "choice", "question": "?", "options": [{"label": "Yes", "description": "", "recommended": True}, {"label": "No", "description": ""}]}
-_check_entry_action = {"id": "ask-0205", "project": "orchard", "item": "2.5", "kind": "action", "machine": "m", "done_when": "d", "steps": [{"text": "s", "command": ""}]}
+_check_entry_action = {"id": "ask-0205", "project": "orchard", "item": "2.5", "kind": "action", "machine": "m", "done_when": "pass", "steps": [{"text": "s", "command": "", "expect": "x"}]}
 _b = c.answer_body(_check_entry_choice, "0b7e3c1a-5d2f-4a8e-9c61-3f0d2b8a7e41", option="Yes", text="")
 check("dashboard answers: answer_body for a choice without text",
       _b["answer_id"] == "0b7e3c1a-5d2f-4a8e-9c61-3f0d2b8a7e41" and _b["id"] == "ask-0707" and _b["project"] == "harbor" and _b["item"] == "0.7"
@@ -4869,6 +5178,67 @@ print("BLOCK-END dashboard-core")
 
 PY
 
+# v0.159: the card rules (card_rule_problems), one case per rule, and the reference card passes unchanged
+block card-rules python3 -B -I - "$DBLIB" <<'PY'
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import dashboard_core as c
+
+def check(name, cond, detail=""):
+    print("%s\t%s\t%s" % ("ok" if cond else "FAIL", name, detail.replace("\n", " | ")))
+
+REF = json.load(open(sys.argv[1] + "/../../tests/fixtures/card-v1.9.64.1.json"))
+DW = 'Answer "pass", or the name of the site that failed.'
+CH = "step 1 chains commands: one command per step"
+SU = "step 1: sudo must be a step of its own, first word"
+DWP = 'done_when must be one line asking for "pass" or the name of what failed'
+
+def card(steps, done_when=DW, machine="the laptop"):
+    return {"kind": "action", "id": "c1", "machine": machine, "steps": steps, "done_when": done_when}
+
+def st(text="t", command=None, expect="x"):
+    s = {"text": text}
+    if command is not None:
+        s["command"] = command
+    if expect is not None:
+        s["expect"] = expect
+    return s
+
+check("v0.159 card rules: the reference card (v1.9.64.1 shape) has no problem", c.card_rule_problems(REF) == [], str(c.card_rule_problems(REF)))
+check("v0.159 card rules: the reference card is an Action", c.decision_shape(dict(REF, id="ref-1")) == "action")
+CASES = [
+    ("R1 && in a command", card([st(command="a && b")]), [CH]),
+    ("R1 ; in a text", card([st(text="do a; then b")]), [CH]),
+    ("R1 ; inside single quotes is not a chain", card([st(command="echo 'a ; b'")]), []),
+    ("R1 ; inside double quotes is not a chain", card([st(command='echo "a ; b"')]), []),
+    ("R1 ; inside backticks is not a chain", card([st(command="echo `a ; b`")]), []),
+    ("R1 newline in a command", card([st(command="a\nb")]), [CH]),
+    ("R1 one pipe is not a chain", card([st(command="x | y")]), []),
+    ("R1 || is a chain", card([st(command="a || b")]), [CH]),
+    ("R2 sudo after a pipe", card([st(command="echo hi | sudo tee f")]), [SU]),
+    ("R1 and R2 sudo a && b", card([st(command="sudo a && b")]), [CH, SU]),
+    ("R2 sudo pacman -U f alone passes", card([st(command="sudo pacman -U f")]), []),
+    ("R3 a step without expect", card([st(expect=None)]), ["step 1 has no expect"]),
+    ("R3 a blank expect", card([st(expect="  ")]), ["step 1 has no expect"]),
+    ("R4 a placeholder", card([st(command="pacman -U <package>")]), ["step 1 holds a placeholder <package>"]),
+    ("R5 done_when on two lines", card([st()], "pass\nor name it"), [DWP]),
+    ("R5 done_when of 121 characters", card([st()], "pass" + "x" * 117), [DWP]),
+    ("R5 done_when of 120 characters passes", card([st()], "pass" + "x" * 116), []),
+    ("R5 done_when without pass", card([st()], "the page shows the new tag"), [DWP]),
+    ("R5 done_when with PASS in capitals", card([st()], "Answer PASS"), []),
+    ("R6 an empty machine", card([st()], machine=""), ["machine must name one machine"]),
+    ("R6 a machine on two lines", card([st()], machine="a\nb"), ["machine must name one machine"]),
+    ("a choice card has no problem", {"kind": "choice", "question": "q", "options": [{"label": "a"}, {"label": "b"}]}, []),
+]
+for name, cd, want in CASES:
+    got = c.card_rule_problems(cd)
+    check("v0.159 card rules: " + name, got == want, "%s != %s" % (got, want))
+for name, cd, want in CASES:
+    if want and cd["kind"] == "action":
+        check("v0.159 card rules: unformatted on the dashboard: " + name, c.decision_shape(cd) == "unformatted")
+print("BLOCK-END card-rules")
+PY
+
 # v0.87: the feeds are fetched conditionally (ETag, 304, ?since=) and never twice at once.
 block dashboard-feeds python3 -B -I - "$DBLIB" "$DB" "$(dirname "$PO")/../README.md" <<'PY'
 import hashlib, http.server, json, os, subprocess, sys, tempfile, threading, time
@@ -5159,7 +5529,7 @@ out2=$(XDG_CONFIG_HOME="$TMP/cfg" python3 -B "$DB" --url "$CHK_URL" --decisions-
 # v0.69: --install-dir / PO_DASHBOARD_INSTALL_DIR; --check prints the Install block after the decisions.
 sha=$(printf '%064d' 0)
 # v0.81: a look card is shown (and so makes the block) only when ready: checked, fixtures stated, build installed.
-printf '[{"project":"orchard","item":"1.9.39","title":"Look","waiting_for":"a look","asked_at":"2026-10-29T10:00:00Z","kind":"action","id":"i1","machine":"laptop","steps":[{"text":"open the Bookmarks menu","expect":"three bookmarks"}],"done_when":"seen","requires":{"package":"a-1-1-x86_64.pkg.tar.zst","sha256":"%s"},"fixtures":[],"checked_by":"rev","check_sha256":"%s","ready":{"build":"a 1-1","checked_at":"%s"}}]\n' "$sha" "$sha" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$TMP/install.json"
+printf '[{"project":"orchard","item":"1.9.39","title":"Look","waiting_for":"a look","asked_at":"2026-10-29T10:00:00Z","kind":"action","id":"i1","machine":"laptop","steps":[{"text":"open the Bookmarks menu","expect":"three bookmarks"}],"done_when":"pass","requires":{"package":"a-1-1-x86_64.pkg.tar.zst","sha256":"%s"},"fixtures":[],"checked_by":"rev","check_sha256":"%s","ready":{"build":"a 1-1","checked_at":"%s"}}]\n' "$sha" "$sha" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$TMP/install.json"
 out=$(env -u PO_DASHBOARD_INSTALL_DIR python3 -B "$DB" --url "$CHK_URL" --decisions-url "$TMP/install.json" --install-dir /x/pkgs --check 2>&1)
 [[ $(tail -3 <<<"$out") == "install | orchard | a-1-1-x86_64.pkg.tar.zst
 install | orchard | cd /x/pkgs && sha256sum -c <<< '$sha  a-1-1-x86_64.pkg.tar.zst'
@@ -5559,7 +5929,7 @@ PY
 		cat >"$TMP/drafts-feed.json" <<'JSON'
 [{"project":"p","item":"1","title":"c","waiting_for":"a ruling","asked_at":"2026-10-24T09:00:00Z","kind":"choice","id":"d-choice","question":"Ok?","options":[{"label":"Yes"},{"label":"No"}]},
  {"project":"p","item":"2","title":"t","waiting_for":"a ruling","asked_at":"2026-10-24T10:00:00Z","kind":"choice","id":"d-text"},
- {"project":"p","item":"3","title":"a","waiting_for":"a block","asked_at":"2026-10-24T11:00:00Z","kind":"action","id":"d-action","machine":"m","steps":[{"text":"one"},{"text":"two"}],"done_when":"done"}]
+ {"project":"p","item":"3","title":"a","waiting_for":"a block","asked_at":"2026-10-24T11:00:00Z","kind":"action","id":"d-action","machine":"m","steps":[{"text":"one","expect":"x"},{"text":"two","expect":"y"}],"done_when":"pass"}]
 JSON
 		# helper
 		out=$(XDG_CONFIG_HOME="$TMP/xdg-drafts" timeout 60 python3 -I - "$DB" "$SV/events.json" "$TMP/drafts-feed.json" 2>/dev/null <<'PY'
@@ -5702,7 +6072,7 @@ PY
 		done
 		# v0.97: Send on a look card reads the installed build in the worker thread; a slow pacman never holds the main loop.
 		mkdir -p "$TMP/slow-bin" && printf '#!/bin/sh\nsleep 3\necho "a 1-1"\n' >"$TMP/slow-bin/pacman" && chmod +x "$TMP/slow-bin/pacman"
-		printf '[{"project":"p","item":"1","title":"Look","waiting_for":"a look","asked_at":"2026-10-29T10:00:00Z","kind":"action","id":"sl1","machine":"laptop","steps":[{"text":"open the Bookmarks menu","expect":"three bookmarks"}],"done_when":"seen","requires":{"package":"a-1-1-x86_64.pkg.tar.zst","sha256":"%s"},"fixtures":[],"checked_by":"rev","check_sha256":"%s","ready":{"build":"a 1-1","checked_at":"%s"}}]\n' "$sha" "$sha" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$TMP/slow-feed.json"
+		printf '[{"project":"p","item":"1","title":"Look","waiting_for":"a look","asked_at":"2026-10-29T10:00:00Z","kind":"action","id":"sl1","machine":"laptop","steps":[{"text":"open the Bookmarks menu","expect":"three bookmarks"}],"done_when":"pass","requires":{"package":"a-1-1-x86_64.pkg.tar.zst","sha256":"%s"},"fixtures":[],"checked_by":"rev","check_sha256":"%s","ready":{"build":"a 1-1","checked_at":"%s"}}]\n' "$sha" "$sha" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$TMP/slow-feed.json"
 		# helper
 		out=$(PATH="$TMP/slow-bin:$PATH" XDG_CONFIG_HOME="$TMP/xdg-slow" timeout 60 python3 -I - "$DB" "$SV/events.json" "$TMP/slow-feed.json" 2>&1 <<'PY'
 import gc, http.server, importlib.machinery, importlib.util, os, sys, threading, time
@@ -5762,7 +6132,7 @@ PY
 		# v0.63: the Decisions toggle hides the choice cards and keeps the action cards; the choice is saved next to the Actions one.
 		cat >"$TMP/toggle-feed.json" <<'JSON'
 [{"project":"p","item":"1","title":"c","waiting_for":"a ruling","asked_at":"2026-10-24T09:00:00Z","kind":"choice","id":"t-choice","question":"Ok?","options":[{"label":"Yes"},{"label":"No"}]},
- {"project":"p","item":"3","title":"a","waiting_for":"a block","asked_at":"2026-10-24T11:00:00Z","kind":"action","id":"t-action","machine":"m","steps":[{"text":"one"},{"text":"two"}],"done_when":"done"}]
+ {"project":"p","item":"3","title":"a","waiting_for":"a block","asked_at":"2026-10-24T11:00:00Z","kind":"action","id":"t-action","machine":"m","steps":[{"text":"one","expect":"x"},{"text":"two","expect":"y"}],"done_when":"pass"}]
 JSON
 		# helper
 		out=$(XDG_CONFIG_HOME="$TMP/xdg-toggle" timeout 60 python3 -I - "$DB" "$SV/events.json" "$TMP/toggle-feed.json" "$TMP/xdg-toggle" 2>&1 <<'PY'
@@ -6152,6 +6522,31 @@ if grep -q "depends" <<<"$out" || grep -q "missing note" <<<"$out" || grep -q "a
 # malformed line reported with line number
 if grep -q "malformed line" <<<"$out"; then ok "ready: malformed line reported"; else bad "ready: malformed line reported" "$out"; fi
 # last-line-wins: corrected third title present already checked
+# v0.149: no [ready] file, or one missing on disk, is a configuration error
+# (exit 1) that says why, for ready and for dispatch.
+grep -v '^file = "ready.jsonl"$' "$R2/po.toml" | sed '/^\[ready\]$/d' >"$TMP/ready-none.toml"
+for args in "" "--json" "--explain"; do
+	# shellcheck disable=SC2086
+	out=$("$PO" -C "$R2" --manifest "$TMP/ready-none.toml" ready $args 2>"$TMP/ready-err"); code=$?
+	[[ $code == 1 && -z $out && $(cat "$TMP/ready-err") == 'po: no [ready] file configured in po.toml' ]] &&
+		ok "ready ${args:-(plain)}: no [ready] file exits 1 naming [ready] file on stderr" ||
+		bad "ready ${args:-(plain)} no [ready] (exit $code)" "$out / $(cat "$TMP/ready-err")"
+done
+for mode in --plan --commit; do
+	out=$("$PO" -C "$R2" --manifest "$TMP/ready-none.toml" dispatch $mode 2>"$TMP/ready-err"); code=$?
+	[[ $code == 1 && -z $out && $(cat "$TMP/ready-err") == 'po dispatch: no [ready] file configured in po.toml' ]] &&
+		ok "dispatch $mode: no [ready] file exits 1, one 'po dispatch:' line on stderr, stdout empty" ||
+		bad "dispatch $mode no [ready] (exit $code)" "$out / $(cat "$TMP/ready-err")"
+done
+sed 's|^file = "ready.jsonl"$|file = "gone.jsonl"|' "$R2/po.toml" >"$TMP/ready-gone.toml"
+out=$("$PO" -C "$R2" --manifest "$TMP/ready-gone.toml" ready 2>"$TMP/ready-err"); code=$?
+[[ $code == 1 && -z $out && $(cat "$TMP/ready-err") == 'po: ready file gone.jsonl not found' ]] &&
+	ok "ready: a [ready] file missing on disk exits 1 naming the path" || bad "ready missing file (exit $code)" "$out / $(cat "$TMP/ready-err")"
+out=$("$PO" -C "$R2" --manifest "$TMP/ready-gone.toml" dispatch --plan 2>"$TMP/ready-err"); code=$?
+[[ $code == 1 && -z $out && $(cat "$TMP/ready-err") == 'po dispatch: ready file gone.jsonl not found' ]] &&
+	ok "dispatch --plan: a [ready] file missing on disk exits 1 naming the path" || bad "dispatch missing file (exit $code)" "$out / $(cat "$TMP/ready-err")"
+git -C "$R2" status --porcelain | grep -q . && bad "ready/dispatch config errors changed the repo" "$(git -C "$R2" status --porcelain)" ||
+	ok "ready/dispatch config errors change nothing in the repo"
 # [project] name (v0.46): the manifest accepts it, and po ready keeps the
 # shared file's lines for this project and those that name none.
 printf '{"item":"v1.0.5","title":"ours","project":"alpha"}\n{"item":"v1.0.5","title":"theirs","project":"beta"}\n' >"$TMP/ready-shared.jsonl"
@@ -6473,6 +6868,88 @@ out=$(hrel --json 2>&1)
 	ok "released: an untagged DONE heading in specs_dir with no admin: <v> DONE commit is judged by its heading's last change; 5.1 done after the release is not released and does not match 5.10" ||
 	bad "released headings" "$out"
 
+# ---- po released: one git scan, a bounded number of git calls (v0.152) ------
+# 13 DONE items: v1.1-v1.3 tagged under the release (v1.1 annotated), v1.4
+# tagged after it, v1.5 tagged on a side branch (its admin commit before the
+# release is not tried); v2.1, v2.2 (subject and row with text after DONE) and
+# v2.4 (bare `admin: 2.4 DONE`) have admin commits before the release, v2.3
+# after it, v2.6 a bare one before and a `v` one after (the `v` form wins);
+# v3.1 and the heading v3.3 were last touched before the release, v3.2 after.
+# The expected list is the unchanged code's answer on this repo (v0.151).
+SR=$TMP/relrepo-scan
+git init -q -b main "${SR:?}"
+[[ $(git -C "$SR" rev-parse --show-toplevel 2>/dev/null) == "$SR" ]] || { printf 'released scan tests: SR is not its own repo: %s\n' "$SR" >&2; exit 2; }
+sr() { git -C "$SR" "$@"; }
+sr config user.name t
+sr config user.email t@example.invalid
+mkdir -p "$SR/docs/backlog"
+printf '%s' "$GOOD_MANIFEST" >"$SR/po.toml"
+sr_rows() {
+	local v st
+	{
+		printf '# Backlog\n\n| Item | Title | Status | Spec |\n|---|---|---|---|\n'
+		for v in 1.1 1.2 1.3 1.4 1.5 2.1 2.2 2.3 2.4 2.6 3.1 3.2 9.0 "$@"; do
+			st=TODO
+			[[ " $SR_DONE " == *" $v "* ]] && st=DONE
+			[[ $v == 2.2 && $st == DONE ]] && st='DONE (no change needed: dup)'
+			printf '| v%s | Item %s | %s | backlog/v3.md |\n' "$v" "$v" "$st"
+		done
+	} >"$SR/docs/BACKLOG.md"
+}
+SR_DONE=''
+sr_rows
+printf '## v3.3 — Heading — TODO\n' >"$SR/docs/backlog/v3.md"
+sr add -A && sr commit -qm base
+SR_DONE='1.1 1.2 1.3 1.5 2.1 2.2 2.4 2.6 3.1'
+sr_rows
+printf '## v3.3 — Heading — DONE\n' >"$SR/docs/backlog/v3.md"
+sr commit -qam 'rows done'
+sr tag -a -m one v1.1 && sr tag v1.2 && sr tag v1.3
+for _s in 'admin: v1.5 DONE' 'admin: v2.1 DONE' 'admin: v2.2 DONE (tag skipped)' 'admin: 2.4 DONE' 'admin: 2.6 DONE' 'admin: v2.3 DONEX not a done subject'; do
+	sr commit -q --allow-empty -m "$_s"
+done
+sr checkout -q -b side && sr commit -q --allow-empty -m side && sr tag v1.5 && sr checkout -q main
+sr tag -a -m rel release-1
+SR_DONE="$SR_DONE 1.4 2.3 3.2"
+sr_rows
+sr commit -qam 'rows after'
+sr tag v1.4
+sr commit -q --allow-empty -m 'admin: v2.3 DONE'
+sr commit -q --allow-empty -m 'admin: v2.6 DONE'
+rel_m 'source = "tag"'
+srel() { "$PO" -C "$SR" --manifest "$TMP/rel.toml" released "$@"; }
+SR_WANT='{"source":"tag","release":"release-1","released":["1.1","1.2","1.3","2.1","2.2","2.4","3.1","3.3"]}'
+out=$(srel --json 2>&1)
+[[ $out == "$SR_WANT" ]] &&
+	ok "v0.152 released: one scan gives the unchanged code's list on 13 DONE items (tagged, side-branch tag, admin before/after, bare and v forms, touched rows, a heading)" ||
+	bad "v0.152 released golden" "$out"
+[[ $out == *'"2.2"'* ]] && ok "v0.152 released: a DONE row with text after DONE is still read" || bad "v0.152 released DONE text" "$out"
+[[ $out != *'"2.3"'* && $out != *'"2.6"'* ]] &&
+	ok "v0.152 released: an untagged item whose DONE commit is after the release is not released" || bad "v0.152 released DONE after" "$out"
+# A counting git on PATH: the calls after the backlog load (its last call is
+# `cat-file --batch`) are the scan's own, at most 6, and ten more DONE items
+# add none.
+GW=$TMP/gitcount
+mkdir -p "$GW"
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >>"%s/calls"\nexec %s "$@"\n' "$GW" "$(command -v git)" >"$GW/git"
+chmod +x "$GW/git"
+: >"$GW/calls"
+out=$(PATH=$GW:$PATH srel --json 2>&1)
+n_all=$(wc -l <"$GW/calls")
+n_scan=$(sed -n '/^cat-file --batch$/,$p' "$GW/calls" | sed 1d | wc -l)
+[[ $out == "$SR_WANT" && $(grep -c '^cat-file --batch$' "$GW/calls") == 1 && $n_scan -le 6 ]] &&
+	ok "v0.152 released: the scan makes at most 6 git calls ($n_scan after the backlog load, $n_all in all)" ||
+	bad "v0.152 released git calls" "scan=$n_scan all=$n_all out=$out $(cat "$GW/calls")"
+SR_DONE="$SR_DONE 4.1 4.2 4.3 4.4 4.5 4.6 4.7 4.8 4.9 4.10"
+sr_rows 4.1 4.2 4.3 4.4 4.5 4.6 4.7 4.8 4.9 4.10
+sr commit -qam 'ten more'
+for _v in 4.1 4.2 4.3 4.4 4.5; do sr commit -q --allow-empty -m "admin: v$_v DONE"; done
+: >"$GW/calls"
+out=$(PATH=$GW:$PATH srel --json 2>&1)
+[[ $out == "$SR_WANT" && $(wc -l <"$GW/calls") == "$n_all" ]] &&
+	ok "v0.152 released: ten more DONE items after the release make no more git calls" ||
+	bad "v0.152 released git calls grow" "was $n_all, now $(wc -l <"$GW/calls") out=$out"
+
 # po status without python3 fails clearly and leaves no temp dir (v0.99)
 NOPY=$TMP/nopy-bin
 NOPYTMP=$TMP/nopy-tmp
@@ -6569,6 +7046,41 @@ out=$("$PO" -C "$LF" lint-founding 2>&1); code=$?
 	ok "lint-founding: an open item with no spec section is a finding; a DONE one would not be" || bad "lint-founding missing spec (exit $code)" "$out"
 git -C "$LF" reset -q --hard HEAD~1
 
+# v0.150: the status is the cell's or segment's first word, as for po's other readers.
+sed -i 's/^| v1.1 | One | DONE |$/| v1.1 | One | DONE (no change needed: x) |/; s/^## v1.1 — One — DONE$/## v1.1 — One — DONE (note)/' "$LF/docs/BACKLOG.md" "$LF/docs/specs/v1.md"
+git -C "$LF" commit -qam "statuses with notes"
+out=$("$PO" -C "$LF" lint-founding 2>&1); code=$?
+[[ $code == 0 && -z $out ]] &&
+	ok "lint-founding: a status cell 'DONE (no change needed: x)' and a heading segment 'DONE (note)' are clean" ||
+	bad "lint-founding status with a note (exit $code)" "$out"
+git -C "$LF" reset -q --hard HEAD~1
+sed -i 's/^| v1.3 | Three | TODO |$/| v1.3 | Three | DOING (waiting) |/; /^## v1.3 — Three — TODO$/,/^Spec three.$/d' "$LF/docs/BACKLOG.md" "$LF/docs/specs/v1.md"
+git -C "$LF" commit -qam "doing with a note, no spec"
+out=$("$PO" -C "$LF" lint-founding 2>&1); code=$?
+[[ $code == 1 && $out == 'docs/BACKLOG.md:7: v1.3 (DOING) has no spec section under docs/specs' ]] &&
+	ok "lint-founding: 'DOING (waiting)' is DOING: with no spec heading it is an open item without a spec" ||
+	bad "lint-founding DOING with a note (exit $code)" "$out"
+git -C "$LF" reset -q --hard HEAD~1
+sed -i 's/^| v1.1 | One | DONE |$/| v1.1 | One | done |/' "$LF/docs/BACKLOG.md"
+git -C "$LF" commit -qam "lowercase status"
+out=$("$PO" -C "$LF" lint-founding 2>&1); code=$?
+[[ $code == 1 && $out == "docs/BACKLOG.md:5: v1.1: status 'done' is missing or not one ALL-CAPS word" ]] &&
+	ok "lint-founding: a lowercase status 'done' is still a finding with today's message" || bad "lint-founding lowercase status (exit $code)" "$out"
+git -C "$LF" reset -q --hard HEAD~1
+sed -i 's/^| v1.1 | One | DONE |$/| v1.1 | One | (DONE) later |/' "$LF/docs/BACKLOG.md"
+git -C "$LF" commit -qam "no leading caps word"
+out=$("$PO" -C "$LF" lint-founding 2>&1); code=$?
+[[ $code == 1 && $out == "docs/BACKLOG.md:5: v1.1: status '(DONE) later' is missing or not one ALL-CAPS word" ]] &&
+	ok "lint-founding: a cell whose first word is not ALL-CAPS is still a finding" || bad "lint-founding no leading caps word (exit $code)" "$out"
+git -C "$LF" reset -q --hard HEAD~1
+sed -i 's/^## v1.2 — Two — TODO$/## v1.2 — Two — TODO — DONE (note)/' "$LF/docs/specs/v1.md"
+git -C "$LF" commit -qam "two status segments"
+out=$("$PO" -C "$LF" lint-founding 2>&1); code=$?
+[[ $code == 1 && $out == 'docs/specs/v1.md:3: v1.2: heading has two status-like segments' ]] &&
+	ok "lint-founding: a heading with two ALL-CAPS segments (one with a note) is still two status-like segments" ||
+	bad "lint-founding two segments (exit $code)" "$out"
+git -C "$LF" reset -q --hard HEAD~1
+
 # 3. ready-file lines
 git -C "$LF" status --short >/dev/null
 cat >"$LF/ready.jsonl" <<'JL'
@@ -6600,6 +7112,122 @@ LF_BEFORE=$(git -C "$LF" rev-parse HEAD)
 [[ $(git -C "$LF" rev-parse HEAD) == "$LF_BEFORE" ]] &&
 	ok "lint-founding writes nothing" || bad "lint-founding wrote"
 expect "lint-founding: an unknown argument is a usage error" 1 'unknown argument' -- -C "$LF" lint-founding --nope
+
+# ---- row split (v0.160): one rule for a pipe in a table cell ------------------
+# Three splitters read a table row: po_split_row (lib/po/backlog.sh), split_row
+# (lib/po/setup.py) and cells() (the python in lib/po/lint.sh). Each fixture row
+# goes through all three; every one must give the expected cells.
+RS=$TMP/rowsplit
+mkdir -p "$RS"
+US=$'\x1f'
+# shellcheck disable=SC2016 # the backticks are fixture text
+{
+	printf '%s\t%s\n' '| a | b | c |' "a${US}b${US}c"
+	printf '%s\t%s\n' '   | a | b |' "a${US}b"
+	printf '%s\t%s\n' '| a | `x|y` | c |' "a${US}\`x|y\`${US}c"
+	printf '%s\t%s\n' '| a | x\|y | c |' "a${US}x|y${US}c"
+	printf '%s\t%s\n' '| `a|b` | `c` | d |' "\`a|b\`${US}\`c\`${US}d"
+	printf '%s\t%s\n' '| a | `b | c |' "a${US}\`b${US}c"
+	printf '%s\t%s\n' '| a | b\|' "a${US}b|"
+	printf '%s\t%s\n' '| a |  | c |' "a${US}${US}c"
+	printf '%s\t%s\n' '| `a|b` | `c|d` | e | f | `g|h` |' "\`a|b\`${US}\`c|d\`${US}e${US}f${US}\`g|h\`"
+} >"$RS/fixtures.tsv"
+rs_bash() { # the bash splitter, one line per row
+	(
+		set +u
+		# shellcheck source=/dev/null
+		source "$KITROOT/lib/po/backlog.sh"
+		while IFS=$'\t' read -r row _; do
+			po_split_row "$(po_trim "$row")"
+			(
+				IFS=$US
+				printf '%s\n' "${PO_CELLS[*]}"
+			)
+		done <"$RS/fixtures.tsv"
+	)
+}
+rs_python() { # setup.py's split_row, then lint.sh's cells() cut out of its source
+	# helper
+	python3 -B -I - "$KITROOT" "$RS/fixtures.tsv" "$1" <<'PY'
+import sys, importlib.util
+kit, fx, which = sys.argv[1:4]
+if which == "setup":
+    spec = importlib.util.spec_from_file_location("po_setup", kit + "/lib/po/setup.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    f = m.split_row
+else:
+    src = open(kit + "/lib/po/lint.sh").read()
+    a = src.index("BT = chr(96)")
+    b = src.index("def decorated")
+    ns = {}
+    exec(src[a:b], ns)
+    f = ns["cells"]
+for line in open(fx).read().split("\n"):
+    if line:
+        print("\x1f".join(f(line.split("\t")[0])))
+PY
+}
+rs_check() {
+	local name=$1 got=$2 want
+	want=$(cut -f2 "$RS/fixtures.tsv")
+	if [[ $got == "$want" ]]; then
+		ok "row split: $name agrees with the expected cells on every fixture row"
+	else
+		bad "row split: $name differs from the expected cells" "$(diff <(printf '%s\n' "$want" | tr "$US" '#') <(printf '%s\n' "$got" | tr "$US" '#'))"
+	fi
+}
+rs_check "po_split_row (backlog.sh)" "$(rs_bash 2>&1)"
+rs_check "split_row (setup.py)" "$(rs_python setup 2>&1)"
+rs_check "cells() (lint.sh)" "$(rs_python lint 2>&1)"
+
+# End to end: a backlog row with a backtick pipe and a backslash-pipe.
+RE=$TMP/rowsplit-e2e
+mkdir -p "$RE/docs"
+git init -q -b main "$RE"
+git -C "$RE" config user.name t
+git -C "$RE" config user.email t@example.invalid
+cat >"$RE/po.toml" <<'TOML'
+[versioning]
+tag = "v{version}"
+
+[layout]
+backlog = "docs/BACKLOG.md"
+specs_dir = "."
+worktrees = ".wt"
+branch = "item-v{version}"
+
+[project]
+name = "rs"
+TOML
+cat >"$RE/docs/BACKLOG.md" <<'MD'
+# Backlog
+
+| Item | Title | Content | Status |
+|---|---|---|---|
+| v1.1 | One | DONE row | DONE |
+| v1.2 | Two | uses `a|b` and x\|y here | DOING |
+MD
+git -C "$RE" add -A
+git -C "$RE" commit -q -m init
+RS_OUT=$("$PO" -C "$RE" status 2>&1)
+RS_CODE=$?
+if ((RS_CODE == 0)) && grep -q 'v1.2' <<<"$RS_OUT"; then
+	ok "row split: po status exits 0 on a row holding a backtick pipe and a backslash-pipe and lists the item"
+else
+	bad "row split: po status on a row with pipes in a cell (exit $RS_CODE)" "$RS_OUT"
+fi
+if RS_LINT=$("$PO" -C "$RE" lint-founding 2>&1) && [[ -z $RS_LINT ]]; then
+	ok "row split: po lint-founding is clean on the same backlog"
+else
+	bad "row split: po lint-founding on the same backlog" "$RS_LINT"
+fi
+RS_BAD=$(sed 's/| DOING |/| x | DOING |/' "$RE/docs/BACKLOG.md" >"$RE/b2" && mv "$RE/b2" "$RE/docs/BACKLOG.md" && git -C "$RE" commit -qam bad && "$PO" -C "$RE" status 2>&1)
+if grep -q 'not a separator' <<<"$RS_BAD" && grep -q 'not a separator' <<<"$("$PO" -C "$RE" lint-founding 2>&1)"; then
+	ok "row split: a row with the wrong cell count says why in po status and po lint-founding"
+else
+	bad "row split: the wrong-count message lacks the pipe sentence" "$RS_BAD"
+fi
 
 # ---- private test blocks (absent from a public snapshot) -------------------
 for _t in "$KITROOT"/private/tests.d/*.sh; do

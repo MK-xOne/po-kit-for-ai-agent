@@ -302,6 +302,9 @@ const cardOf = (title) => `[...document.querySelectorAll("article.card")].find((
     await b.send("Page.reload");
     await b.until("document.querySelectorAll('article.card button.head').length > 0");
 
+    check("web-browser: v0.155 a card without kind has no .kind element; a card with a kind keeps its badge",
+      await b.evaluate(`(() => { const nok = ${cardOf("Pick the storage format for snapshots")}, ch = ${cardOf("Choose the cache policy")};
+        return !nok.querySelector("h2 .kind") && ch.querySelector("h2 .kind").textContent === "choice"; })()`));
     // the sink goes away: the draft stays and the card says `not sent: <class>`
     sink.p.kill();
     await sleep(300);

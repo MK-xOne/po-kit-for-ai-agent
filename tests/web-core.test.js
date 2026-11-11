@@ -74,11 +74,13 @@ check("web: a clock-skewed future time is just now", C.age("2026-11-01T15:05:00Z
 
 // decision cards
 const look = C.decisionCard(decisions[0], NOW);
-check("web: a card without kind is a look", look.kind === "look" && look.title === "Pick the storage format for snapshots");
+check("web: a card without kind that is not a look card has no badge", look.kind === "" && look.title === "Pick the storage format for snapshots");
 check("web: the card names who waits and when it was asked", look.waiting === "waiting for a ruling, asked by ana" && look.asked.startsWith("asked "), look.waiting + " / " + look.asked);
 const choice = C.decisionCard(decisions[1], NOW);
 check("web: a choice card lists its options with the recommended one marked",
   choice.kind === "choice" && choice.options.length === 2 && choice.options[0].recommended === true && choice.options[1].recommended === false && choice.options[0].label === "Approve");
+check("web: v0.155 kind choice and look keep their badge", C.decisionCard({ kind: "choice" }, NOW).kind === "choice" && C.decisionCard({ kind: "look" }, NOW).kind === "look");
+check("web: v0.155 an empty-string kind is the same as no kind", C.decisionCard({ kind: "", title: "t" }, NOW).kind === "" && C.decisionCard({ title: "t" }, NOW).kind === "");
 check("web: a card with no options has an empty list", C.decisionCard(decisions[3], NOW).options.length === 0);
 const evil = C.decisionCard({ id: "x", title: "<img src=x onerror=alert(1)>", question: "<script>1</script>", options: [{ label: "<b>a</b>" }] }, NOW);
 check("web: C5 a card whose title is <img onerror> stays that literal text", evil.title === "<img src=x onerror=alert(1)>" && evil.question === "<script>1</script>" && evil.options[0].label === "<b>a</b>");
@@ -322,7 +324,7 @@ const mixed = decisionsFeed.concat([
   { kind: "choice", id: "late", title: "no time", question: "q", options: [{ label: "a" }, { label: "b" }], asked_at: "soon" },
   { title: "legacy, oldest", asked_at: "2026-10-01T00:00:00Z" },
   { kind: "choice", id: "tie-1", title: "tie 1", question: "q", options: [{ label: "a" }, { label: "b" }], asked_at: "2026-10-24T14:40:00Z" },
-  { kind: "action", id: "act-old", title: "old action", machine: "m", done_when: "d", steps: [{ text: "s" }], asked_at: "2026-10-01T00:00:00Z" },
+  { kind: "action", id: "act-old", title: "old action", machine: "m", done_when: "pass", steps: [{ text: "s", expect: "x" }], asked_at: "2026-10-01T00:00:00Z" },
   { kind: "nonsense", id: "u1", title: "unformatted" }]).reverse();
 check("web: v0.141 the decisions view sorts Choices first, then Actions, the rest last, oldest asked first",
   eq(C.sortDecisions(decisionsFeed).map((c) => C.decisionShape(c)), ["choice", "choice", "choice", "action", "legacy", "unformatted"]),
@@ -434,7 +436,7 @@ check("web: the page makes ids with crypto.getRandomValues (randomUUID needs a s
 // look cards: held unless ready, exactly as the desktop viewer's v0.81 hold
 const SHA = "ab".repeat(32);
 const lookNow = new Date(Date.UTC(2026, 10, 2, 12, 0, 0));
-const lookCard = { kind: "action", id: "look-1", project: "demo", item: "0.9", machine: "the laptop", done_when: "seen",
+const lookCard = { kind: "action", id: "look-1", project: "demo", item: "0.9", machine: "the laptop", done_when: "pass",
   steps: [{ text: "click Bookmarks in the menu bar", expect: "three bookmarks" }], fixtures: [],
   requires: { package: "demo-2.0-1-x86_64.pkg.tar.zst", sha256: SHA }, checked_by: "dev1", check_sha256: SHA,
   ready: { build: "demo 2.0-1", checked_at: "2026-11-02T11:55:00Z" } };
@@ -528,4 +530,28 @@ check("web: v0.140 releaseKeySends: Ctrl+Enter or Cmd+Enter sends the note; plai
 check("web: v0.140 the note's keydown sends through the Release button (so a disabled or sending Release ignores it)",
   /box\.addEventListener\("keydown", function \(e\) \{\s*if \(!C\.releaseKeySends\(e\)\) return;\s*e\.preventDefault\(\);\s*go\.click\(\);/.test(appJs));
 check("web: v0.140 the Release button is a 44 px target", /\.release \{[^}]*min-height: 44px/.test(css));
+// v0.159: the card rules through decisionShape and cardRuleProblems, the same cases as the desktop's `card rules` block
+{
+  const REF = JSON.parse(fs.readFileSync(path.join(__dirname, "fixtures", "card-v1.9.64.1.json"), "utf8"));
+  const DW = 'Answer "pass", or the name of the site that failed.';
+  const card = (steps, done_when, machine) => ({ kind: "action", id: "c1", machine: machine === undefined ? "the laptop" : machine, steps: steps, done_when: done_when === undefined ? DW : done_when });
+  const st = (text, command, expect) => { const s = { text: text === undefined ? "t" : text }; if (command !== undefined) s.command = command; if (expect !== "") s.expect = expect === undefined ? "x" : expect; return s; };
+  check("web: v0.159 the reference card is an action with no rule problem", C.decisionShape(Object.assign({ id: "ref-1" }, REF)) === "action" && C.cardRuleProblems(REF).length === 0);
+  const BAD = [
+    ["&& in a command", card([st("t", "a && b")])], ["; in a text", card([st("do a; then b")])], ["newline in a command", card([st("t", "a\nb")])],
+    ["|| in a command", card([st("t", "a || b")])], ["sudo after a pipe", card([st("t", "echo hi | sudo tee f")])], ["sudo a && b", card([st("t", "sudo a && b")])],
+    ["no expect", card([st("t", undefined, "")])], ["a placeholder", card([st("t", "pacman -U <package>")])],
+    ["done_when on two lines", card([st()], "pass\nor name it")], ["done_when of 121 characters", card([st()], "pass" + "x".repeat(117))],
+    ["done_when without pass", card([st()], "the page shows the new tag")], ["an empty machine", card([st()], DW, "")], ["a machine on two lines", card([st()], DW, "a\nb")]];
+  const GOOD = [
+    ["; inside quotes", card([st("t", "echo 'a ; b'")])], ["one pipe", card([st("t", "x | y")])], ["sudo pacman -U f", card([st("t", "sudo pacman -U f")])],
+    ["done_when of 120 characters", card([st()], "pass" + "x".repeat(116))], ["PASS in capitals", card([st()], "Answer PASS")]];
+  BAD.forEach((b) => check("web: v0.159 " + b[0] + " is unformatted", C.decisionShape(b[1]) === "unformatted" && C.cardRuleProblems(b[1]).length > 0, JSON.stringify(C.cardRuleProblems(b[1]))));
+  GOOD.forEach((g) => check("web: v0.159 " + g[0] + " stays an action", C.decisionShape(g[1]) === "action" && C.cardRuleProblems(g[1]).length === 0, JSON.stringify(C.cardRuleProblems(g[1]))));
+  check("web: v0.159 a choice card has no rule problem", C.cardRuleProblems({ kind: "choice", question: "q", options: [{ label: "a" }, { label: "b" }] }).length === 0);
+  const all = BAD.concat(GOOD).map((x) => x[1]).concat([REF]);
+  const py = "import json,sys; sys.path.insert(0, sys.argv[1]); import dashboard_core as c; print(json.dumps([c.card_rule_problems(d) for d in json.loads(sys.argv[2])]))";
+  const desktop = JSON.parse(require("child_process").execFileSync("python3", ["-B", "-c", py, path.join(__dirname, "..", "lib", "po"), JSON.stringify(all)]).toString());
+  check("web: v0.159 cardRuleProblems gives the desktop's list, same words and order, for every case", eq(all.map((d) => C.cardRuleProblems(d)), desktop), JSON.stringify([all.map((d) => C.cardRuleProblems(d)), desktop]));
+}
 console.log("BLOCK-END web-core");

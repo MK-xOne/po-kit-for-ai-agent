@@ -66,6 +66,16 @@ po_cmd_dispatch() {
 	command -v python3 >/dev/null 2>&1 || po_die "dispatch needs python3"
 
 	local ready team order=''
+	# Checked here, not left to ready: its message would come out unprefixed
+	# and its exit code would be passed on as dispatch's.
+	[[ -n ${PO_MANIFEST[ready.file]+x} ]] || {
+		printf 'po dispatch: no [ready] file configured in po.toml\n' >&2
+		exit 1
+	}
+	[[ -f ${PO_MANIFEST[ready.file]} ]] || {
+		printf 'po dispatch: ready file %s not found\n' "${PO_MANIFEST[ready.file]}" >&2
+		exit 1
+	}
 	ready=$("$PO_SELF" --manifest "$PO_MANIFEST_FILE" ready --json) || exit $?
 	team=$(PO_TEAM_NO_OWNER_OK=1 "$PO_SELF" --manifest "$PO_MANIFEST_FILE" team --json) || exit $?
 	local name sep=''

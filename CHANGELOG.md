@@ -16,14 +16,127 @@ one row per step or per group of steps.
 
 ## Unreleased
 
+## Release 27 (2026-11-10): the gate shows its growth; one rule for table rows; action cards follow six rules
+
+### Setup after install
+
+| # | Machine | Command | Who | Check |
+|---|---|---|---|---|
+| 1 | the host running the dashboard | `systemctl --user restart po-dashboard.service` | the host's operator | `systemctl --user is-active po-dashboard.service` prints `active` |
+
+**Agents:** the PO reads the `tests vs merge-base` line and the slow-gate flag at verify (v0.169, v0.170); build action cards by the six rules in AGENTS.md "Asking the owner" (v0.159); write a pipe in a backlog cell as backslash-pipe or inside one closed backtick span (v0.160). **Adopt:** `[stamp] test_files` and `test_def` (v0.169), `[stamp] slow_after` (v0.170), both optional.
+
+### One rule for splitting a markdown table row (v0.160, 2026-11-10)
+
+- `po_split_row` (`po status`, `kickoff`, `release`, `edit`), the `po lint` cells and the setup table's `split_row` now agree: a pipe separates cells unless it sits inside a backtick span closed on the same row or is written as backslash-pipe; an unclosed backtick is literal. A backlog row with a pipe in backticks no longer kills `po status`. The wrong-cell-count messages say so. GitHub does not protect backticks, so only backslash-pipe renders right there.
+- **Agents**: write a pipe in a backlog cell as backslash-pipe or inside one closed backtick span. **Adopt**: none.
+
+### The host install sweep installs when `install --check` exits 5 (v0.165, 2026-11-10)
+
+- A wanted timer that is inactive (check exit 5, `inactive:` lines) is pending work like exit 3: the sweep runs `install` (main checkout clean) and re-checks, and reports a line that is still `inactive:` as `still pending after install`. Exits 1, 2, 3 and 4 behave as before; exit 4 (no Heartbeat identity) is a different case that `install` cannot fix.
+- **Agents**: none. **Adopt**: none.
+
+### Sleep-cycle wake re-sends every DOING item to its owner (v0.156, 2026-11-10)
+
+- After the agent starts and the hand-over, `wake` posts one `<item> → <owner> · PROMPT (after sleep)` per started agent and DOING item in that item's thread (top level, logged, when no thread root is found), with the worktree and the sleep window; guarded like the hand-over (errors logged, never raised), `--dry-run` sends nothing, a marker keeps a second wake in the same hour from posting twice.
+- **Agents**: none. **Adopt**: none.
+
+### A gate over the time budget is flagged at stamp and close (v0.170, 2026-11-10)
+
+- `[stamp] slow_after` (default 300 s) is the project's gate time budget. A `po stamp` run over it adds `gate time: <time>, over budget <budget> (slow_after)` to its gate block after `diffstat` (and after v0.169's test lines when set), with the same seconds its event carries; at or under the budget the block is byte-identical to before.
+- `po close <v>` (dry run and `--commit`) prints `flag: item <tag> gate took <time>, over budget <budget>` when the item's newest passing stamp event took longer than `slow_after`. No such event, or one without `seconds`, prints nothing. The flag changes no exit code and blocks nothing.
+- **Agents**: a flagged close is the PO's cue to ask for the trim or the tiered gate (README, the `slow` trigger). **Adopt**: none.
+
+### `po stamp` shows the tests an item adds and removes (v0.169, 2026-11-10)
+
+- Two optional `[stamp]` keys, set together: `test_files` (an array of git pathspecs, the files that hold the tests) and `test_def` (one `grep -E` pattern matching one line per test definition). With both, the stamp block gains `tests vs merge-base(<main>): +<A> -<R>` after the diffstat: the definitions the item's diff adds and removes in `test_files` (a rewritten definition counts in both). When the diff also changes a file outside `test_files` and the docs (`*.md`, `docs/`, `CHANGELOG.md`) and R is 0, the line `flag: code changed, no test removed or rewritten (PO: check for pins on replaced behaviour)` follows. Information only: no exit code changes. With neither key the block is as before; one without the other, an empty `test_files` or an invalid `test_def` is a manifest error (2).
+- po-kit's own manifest sets them for `tests/run.sh`.
+- **Agents**: the PO reads the `tests vs merge-base` line and the flag at verify; on the flag, check that no test still pins the behaviour the item replaced. **Adopt**: set `[stamp] test_files` and `test_def`.
+
+### `po events --trend`: the gate's growth per day (v0.168, 2026-11-10)
+
+- A passing `po stamp` event now carries `tests` (the number its gate block prints) and `load1` (the machine's one-minute load average when the run ended, left out when `/proc/loadavg` cannot be read), after the run's `seconds`. A failed stamp and the other kinds have neither; older events stay valid and readers show `-`.
+- `po events --trend [--days <n>] [--json]` sums the PASS stamps of the live log and the archive per local day (default 14 days): stamps, the highest test count, the median test leg, that median per test in ms and the median load, then the change from the oldest to the newest day with a test count.
+- **Agents**: none. **Adopt**: none.
+
+### Action cards follow six rules (v0.159, 2026-11-10)
+
+- An action card must now be followable step by step: R1 one command or click per step (no `&&`, `||`, `;`, newline), R2 `sudo` is a step of its own and its first word, R3 every step has an `expect`, R4 no `<...>` placeholder, R5 `done_when` is one line of at most 120 characters asking for "pass", R6 `machine` names one machine. `card_rule_problems` is mirrored in the dashboard core, the web core, `mk-queue`, `look-check` and `ask-mk`; a card that breaks a rule is shown `unformatted` and `ask-mk`/`mk-queue` refuse it.
+- **Agents**: build action cards by the six rules in AGENTS.md "Asking the owner". **Adopt**: none.
+
+### Web Decisions: no badge on a card without kind (v0.155)
+A card with no `kind` (or an empty one) that is not a look card no longer shows a `LOOK` badge in the web view; the `.kind` element is not created. A card with a `kind` keeps its badge.
+
+### `/archive.json` serves the whole archive (v0.153, 2026-11-09)
+
+- `po serve` ran `po events --archived --json`, which keeps only the newest 10 without `--all`, so `/archive.json` (and the dashboard's Reports previous period) held a fraction of the archive. It now runs `po events --archived --all --json`. `po events` itself is unchanged.
+
+### `po lint-founding` reads the status by its first word (v0.150, 2026-11-09)
+
+- A backlog status cell is now valid when its first word is ALL-CAPS, as `po status`, `po released` and the other readers take it: `DONE (no change needed: ...)` is DONE and `DOING (waiting on v0.2)` is DOING for every later check. A cell with no leading ALL-CAPS word, or an empty one, is still a finding with the same message. Headings already read each segment's first word. po-kit's own main now lints clean (release-25 review R8).
+- **Agents**: none. **Adopt**: none.
+
+### `po released` scans git once; the projects feed caches its answer (v0.152, 2026-11-08)
+
+- `po released` (every form) now computes the released set in a constant number of git calls, whatever the number of DONE items: one `cat-file --batch-check` for the item tags, one `rev-list` of the release, one `log` of main's subjects for the `admin: <v> DONE` commits and, only when an untagged item has no such commit, one `log -p` of the backlog and `specs_dir` for the last change of its row or heading; the rules are joined in text. The rules and the output are unchanged (old and new `--json` were diffed over 39 release tags in four repositories: no difference). On a repository with 410 released items one run went from 910 git calls and 10.5 s to 13 git calls and about 1.4 s, most of what is left being the backlog parse.
+- The host glue's projects feed caches each repository's `po released --json` answer in its cache dir, keyed on the release source and pattern, the main and backlog blob shas, a digest of every tag ref, the github tag and po's `released.sh`; any change recomputes, and a corrupt cache file counts as absent.
+- **Agents**: none. **Adopt**: none.
+
+## Release 26 (2026-11-08): the pending check finds an unanswered report; heartbeat setup is checked
+
+### Setup after install
+
+| # | Machine | Command | Who | Check |
+|---|---|---|---|---|
+| 1 | the build host (private host glue; nothing in the public kit) | create the host glue's Heartbeat keypair and its env file (mode 600), add its pubkey to the agent pubkey list, run the host glue's `install`, then one run of each heartbeat wake script that sends (v0.147, v0.158) | the session on that host | `install --check` passes (exit 0, no `missing:  heartbeat identity` line), `the pending-reports script --all` runs without error, and each wake script's run exits 0, printing `sent N finding(s)` (or nothing when nothing is pending), with no `no Heartbeat identity`, `no DM` or `send ... failed` line |
+
+**Agents:** the heartbeat now raises REPORT WAITING (1 hour) and UNTAGGED REPORT (15 minutes) for a DOING item whose newest REPORT nobody answered (v0.158). **Adopt:** none.
+
+### The pending check finds a report nobody answered (v0.158, 2026-11-08)
+
+- The host glue's pending check gained two findings for a DOING item whose newest REPORT (first line `<item> → <who> · REPORT`) has no first check, no SPEC MET and no FIX? after it: REPORT WAITING at 1 hour (hand the first check to a free checker, or ask for SPEC MET directly), and UNTAGGED REPORT at 15 minutes when the text addresses the PO but carries no p-tag for it. Same hold mechanics as the other findings (2 hours, held until sent). A `local` item, or an item no longer DOING, raises neither.
+- **Agents**: none. **Adopt**: none.
+
+Setup after install:
+
+| # | Machine | Command | Who | Check |
+|---|---|---|---|---|
+| 1 | the build host (private host glue; nothing in the public kit) | run the host glue's `install` (the script is copied into the agents' bin) | the host's operator | `the pending-reports script --all` runs without error |
+
+### `po ready` and `po dispatch` say why when there is no ready file (v0.149, 2026-11-09)
+
+- `po ready` with no `[ready] file` in po.toml exited 2 with no output: the key lookup ran in a command substitution with its stderr dropped, and its abort ended the command before the intended message. It now prints `po: no [ready] file configured in po.toml` and exits 1; a `[ready] file` that names no file prints `po: ready file <path> not found` and exits 1 (it was a Python traceback). `po dispatch --plan` and `--commit` print the same lines prefixed `po dispatch:`, exit 1 and change nothing. With the file present nothing changes (release-25 review R3).
+- **Agents**: none. **Adopt**: none.
+
+### Heartbeat setup is checked and its DM is looked up, not written in (v0.147, 2026-11-07)
+
+- The host glue's `install --check` now lists `missing:  heartbeat identity (<path>)` and exits 4 when the Heartbeat env file (`$HEARTBEAT_ENV`, else its default path in the host user's config) is absent or not mode 600; it never reads the file. Before, a check that compares files only passed while the heartbeat could not sign anything (release-25 review R1).
+- The heartbeat wake scripts no longer carry DM channel ids: one shared lookup, signed as Heartbeat, lists the DMs and takes the one whose participants include the destination (fewest participants first, then the first listed), and opens a DM when none is listed. A destination with no DM, or a send that fails, prints an error line (the send's exit code and the first line of its error output), holds nothing so the next tick retries, and makes the run exit 1; the other destination still goes (release-25 review R2).
+- **Agents**: none. **Adopt**: none.
+
+Setup after install:
+
+| # | Machine | Command | Who | Check |
+|---|---|---|---|---|
+| 1 | the build host (private host glue; nothing in the public kit) | create the host glue's Heartbeat keypair and its env file (mode 600), add its pubkey to the agent pubkey list, run the host glue's `install`, then one run of each heartbeat wake script that sends | the session on that host | the identity check of `install --check` passes (exit 0, no `missing:  heartbeat identity` line), and each wake script's run exits 0, printing `sent N finding(s)` (or nothing when nothing is pending), with no `no Heartbeat identity`, `no DM` or `send ... failed` line |
+
+### Dispatch: a project's first checker never builds its items (v0.157)
+
+The host dispatcher leaves a project's first checker out of that project's build roster and ready lines, and the dev prompt for that project names the first check. Other projects are unchanged.
+
+#### Setup after install
+
+1. On the machine that runs auto-dispatch, install the release package.
+
 ## Release 25 (2026-11-05): dashboard overhaul, project switch and Release button, no bot posts in project channels, release counting
 
 ### Setup after install
 
 | # | Machine | Command | Who | Check |
 |---|---|---|---|---|
-| 1 | the build host (private host glue; nothing in the public kit) | add `[release_due]` / `po-kit = 24` to the sweep config (v0.138), run the host glue's `install`, then restart the units it flags `restart needed` (v0.137, v0.144, v0.145) | the session on that host | `install --check` prints every script as current |
-| 2 | the machine that shows the dashboard | install the release package (`pacman -Q` shows the release build), then restart `po-dashboard` (v0.139 to v0.143, v0.146) | the session on that machine | `po-dashboard` shows the Release button on each Projects card |
+| 1 | the build host (private host glue; nothing in the public kit) | add `[release_due]` / `po-kit = 24` to the sweep config (v0.138), run the host glue's `install`, then `systemctl --user restart answer-receiver.service` (v0.139, v0.140) and the units it flags `restart needed` (v0.137, v0.144, v0.145) | the session on that host | `install --check` prints every script as current |
+| 2 | the machine that shows the dashboard | install the release package (`pacman -Q` shows the release build), then `systemctl --user restart po-dashboard.service` (v0.139 to v0.143, v0.146) | the session on that machine | `po-dashboard` shows the Release button on each Projects card |
+| 3 | the build host (private host glue; nothing in the public kit) | added in 25.1 (v0.144's host step, missing here): create the host glue's Heartbeat keypair and its env file (mode 600), add its pubkey to the agent pubkey list, run the host glue's `install`, then one run of each heartbeat wake script that sends | the session on that host | the identity check of `install --check` passes (exit 0, no `missing:  heartbeat identity` line), and each wake script's run exits 0, printing `sent N finding(s)` (or nothing when nothing is pending), with no `no Heartbeat identity`, `no DM` or `send ... failed` line |
 
 **Agents:** no bot posts into a project channel or thread any more: a stalled item, a QUIET finding or a BLOCKED ping reaches you as a DM or on the dashboard (v0.144, v0.145); QUIET and OWED-by-dev findings are routed to the second PO, the rest to the first (v0.137). A release request from the Projects page carries a note: put it verbatim in the release's close message and notes (v0.140). **Adopt:** a projects-feed producer sets `active` per project (v0.139); an answer receiver handles `project-active` and `release-request`.
 

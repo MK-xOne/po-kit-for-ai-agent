@@ -24,6 +24,11 @@
 # leg's "seconds" (0 for a leg not reached) and, after legs, the run's own
 # "seconds" (prepare plus legs). An event without the keys (an older one, an
 # open or a close) has an unknown time, never 0: readers show it as -.
+# A passing stamp then adds, after the run's "seconds" and before detail,
+# "tests" (the number its gate block prints as `tests N passed`) and "load1"
+# (the first field of /proc/loadavg when the run ended; left out when it
+# cannot be read). A failed stamp and the other kinds have neither; readers
+# show a missing one as -, never 0.
 
 PO_EVENTS_NAME=po-events.jsonl
 PO_EVENTS_ARCHIVE_NAME=po-events-archive.jsonl
@@ -107,12 +112,15 @@ po_event_agent() {
 
 # po_event_log <kind> <item|-> <result> <legs-json> <detail> [<log|->]:
 # append one event; with a sixth argument it has a "log" key, null for -.
-# A non-empty PO_EVENT_SECONDS adds the run's "seconds" key after legs.
+# A non-empty PO_EVENT_SECONDS adds the run's "seconds" key after legs, then
+# a non-empty PO_EVENT_TESTS "tests" and PO_EVENT_LOAD1 "load1".
 # Never fails; a write that fails warns.
-PO_EVENT_SECONDS=''
+PO_EVENT_SECONDS='' PO_EVENT_TESTS='' PO_EVENT_LOAD1=''
 po_event_log() {
 	local kind=$1 item=$2 result=$3 legs=$4 detail=$5 file project line itemj=null logj='' secj=''
 	[[ -z $PO_EVENT_SECONDS ]] || secj=',"seconds":'$PO_EVENT_SECONDS
+	[[ -z $PO_EVENT_TESTS ]] || secj+=',"tests":'$PO_EVENT_TESTS
+	[[ -z $PO_EVENT_LOAD1 ]] || secj+=',"load1":'$PO_EVENT_LOAD1
 	[[ $item == - ]] || itemj=$(po_json_str "$item")
 	if (($# >= 6)); then
 		logj=',"log":null'
@@ -190,7 +198,7 @@ po_event_secs() {
 # the word slow after it when that is over [stamp] slow_after; - when the
 # event has none.
 po_event_took() {
-	local re='"legs":\[.*\],"seconds":([0-9]+),"detail"' s
+	local re='"legs":\[.*\],"seconds":([0-9]+),"(tests|load1|detail)"' s
 	[[ $1 =~ $re ]] || { printf -- '-'; return 0; }
 	s=$((10#${BASH_REMATCH[1]}))
 	po_event_secs "$s"
@@ -237,19 +245,32 @@ po_event_local() {
 }
 
 po_cmd_events() {
-	local all=0 json=0 archived=0 archive_now=0
+	local all=0 json=0 archived=0 archive_now=0 trend=0 days=''
 	while (($# > 0)); do
 		case $1 in
 		--all) all=1 ;;
 		--json) json=1 ;;
 		--archived) archived=1 ;;
 		--archive-now) archive_now=1 ;;
+		--trend) trend=1 ;;
+		--days)
+			(($# >= 2)) || po_usage_die "events: --days needs a number"
+			days=$2
+			shift
+			;;
 		*) po_usage_die "events: unknown argument '$1'" ;;
 		esac
 		shift
 	done
 	local file lines=() line
 	file=$(po_events_file) || po_die "not inside a git repository"
+	if ((trend)); then
+		((!all && !archived && !archive_now)) || po_usage_die "events: --trend combines only with --days and --json"
+		[[ -z $days || $days =~ ^[1-9][0-9]{0,3}$ ]] || po_usage_die "events: --days takes a whole number of days, 1 or more"
+		po_events_trend "${days:-14}" "$json"
+		return 0
+	fi
+	[[ -z $days ]] || po_usage_die "events: --days needs --trend"
 	if ((archive_now)); then
 		((!all && !json && !archived)) || po_usage_die "events: --archive-now takes no other option"
 		local moved
@@ -293,4 +314,112 @@ po_cmd_events() {
 		[[ $line == *'"tail":"'* ]] && po_event_tails "$line"
 	done
 	return 0
+}
+
+# po_events_trend_raw <file>...: time (UTC), tests, load1 and the test leg's
+# seconds of each PASS stamp in the files (- when absent), tab-separated; a
+# line in more than one file, or twice, counts once.
+po_events_trend_raw() {
+	local f
+	for f; do [[ -f $f ]] && cat -- "$f"; done |
+		awk '
+		function val(   m) { m = substr($0, RSTART, RLENGTH); sub(/.*:/, "", m); sub(/[,}]$/, "", m); return m }
+		seen[$0]++ { next }
+		!/^\{"time":"[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z","kind":"stamp",/ { next }
+		index($0, ",\"result\":\"pass\",\"agent\":") == 0 { next }
+		{
+			t = "-"; l = "-"; s = "-"
+			if (match($0, /[0-9],"tests":[0-9]+[,}]/)) t = val()
+			if (match($0, /[0-9],"load1":[0-9]+(\.[0-9]+)?[,}]/)) l = val()
+			if (match($0, /\{"name":"test","result":"pass","seconds":[0-9]+[,}]/)) s = val()
+			print substr($0, 10, 20) "\t" t "\t" l "\t" s
+		}'
+}
+
+# po_events_trend <days> <json 0|1>: PASS stamps of the live log and the
+# archive, one row per local day of the last <days> days, newest first: how
+# many, the highest test count, the median test leg, that median per test (in
+# ms, against the day's median count) and the median load; a value no stamp
+# of the day has is -. Under the table, the change from the oldest to the
+# newest day with a test count. An event in both files counts once.
+po_events_trend() {
+	local days=$1 json=$2 now today first live arch rows kind
+	now=${PO_EVENTS_NOW:-$(date -u +%s)}
+	today=$(date -d "@$now" +%Y-%m-%d) || po_die "could not read the clock"
+	first=$(date -d "$today -$((days - 1)) days" +%Y-%m-%d) || po_die "could not count back $days days"
+	live=$(po_events_file) || po_die "not inside a git repository"
+	arch=$(po_events_archive_file)
+	rows=$(
+		paste <(po_events_trend_raw "$arch" "$live" | cut -f1 | date -f - +%Y-%m-%d) \
+			<(po_events_trend_raw "$arch" "$live" | cut -f2-) |
+			awk -F'\t' -v first="$first" -v today="$today" '
+			function rnd(x) { return x < 0 ? -int(-x + 0.5) : int(x + 0.5) }
+			# median of the space-separated numbers in s, or "" for none
+			function median(s,   a, n, i, j, v) {
+				n = split(s, a, " ")
+				if (n == 0) return ""
+				for (i = 2; i <= n; i++) {
+					v = a[i] + 0
+					for (j = i - 1; j >= 1 && a[j] + 0 > v; j--) a[j + 1] = a[j]
+					a[j + 1] = v
+				}
+				return n % 2 ? a[(n + 1) / 2] + 0 : (a[n / 2] + a[n / 2 + 1]) / 2
+			}
+			$1 < first || $1 > today { next }
+			{
+				n[$1]++
+				if ($2 != "-") { ts[$1] = ts[$1] " " $2; if (!($1 in hi) || $2 + 0 > hi[$1]) hi[$1] = $2 + 0 }
+				if ($3 != "-") ld[$1] = ld[$1] " " $3
+				if ($4 != "-") lg[$1] = lg[$1] " " $4
+			}
+			END {
+				for (d in n) days[++nd] = d
+				for (i = 2; i <= nd; i++) { v = days[i]; for (j = i - 1; j >= 1 && days[j] < v; j--) days[j + 1] = days[j]; days[j + 1] = v }
+				for (i = 1; i <= nd; i++) {
+					d = days[i]
+					mt = median(ts[d]); ml = median(lg[d]); mo = median(ld[d])
+					T = (d in hi) ? hi[d] : "-"
+					L = ml == "" ? "-" : rnd(ml)
+					P = (mt == "" || ml == "" || mt == 0) ? "-" : rnd(ml * 1000 / mt)
+					O = mo == "" ? "-" : sprintf("%.2f", mo)
+					print "row\t" d "\t" n[d] "\t" T "\t" L "\t" P "\t" O
+					if (T != "-") { if (!newest) { newest = d; nT = T; nL = L; nP = P } oldest = d; oT = T; oL = L; oP = P }
+				}
+				if (nd == 0) exit
+				if (oldest == newest) { print "change\tchange: - (fewer than two days with a TESTS value)"; exit }
+				out = sprintf("change since %s: tests %+d (%s)", oldest, nT - oT, pct(nT, oT))
+				out = out ", test leg " ((oL == "-" || nL == "-") ? "-" : sprintf("%+d s (%s)", nL - oL, pct(nL, oL)))
+				out = out ", per test " ((oP == "-" || nP == "-") ? "-" : sprintf("%+d ms", nP - oP))
+				print "change\t" out
+			}
+			function pct(a, b) { return b == 0 ? "-" : sprintf("%+d%%", rnd((a - b) * 100 / b)) }'
+	)
+	if ((json)); then
+		local sep='' d c t l p o
+		printf '['
+		while IFS=$'\t' read -r kind d c t l p o; do
+			[[ $kind == row ]] || continue
+			[[ $t == - ]] && t=null
+			[[ $l == - ]] && l=null
+			[[ $p == - ]] && p=null
+			[[ $o == - ]] && o=null
+			printf '%s{"day":"%s","stamps":%s,"tests":%s,"test_leg":%s,"per_test_ms":%s,"load1":%s}' "$sep" "$d" "$c" "$t" "$l" "$p" "$o"
+			sep=,
+		done <<<"$rows"
+		printf ']\n'
+		return 0
+	fi
+	if [[ $rows != *row* ]]; then
+		printf 'no stamps in the last %s days\n' "$days"
+		return 0
+	fi
+	{
+		printf 'DAY\tSTAMPS\tTESTS\tTEST-LEG\tPER-TEST\tLOAD\n'
+		while IFS=$'\t' read -r kind d c t l p o; do
+			[[ $kind == row ]] || continue
+			[[ $p == - ]] || p="$p ms"
+			printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$d" "$c" "$t" "$(po_event_secs "$l")" "$p" "$o"
+		done <<<"$rows"
+	} | column -t -s $'\t'
+	sed -n 's/^change\t//p' <<<"$rows"
 }

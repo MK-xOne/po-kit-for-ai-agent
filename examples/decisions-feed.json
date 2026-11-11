@@ -9,10 +9,10 @@
   {"project": "orchard", "item": "2.5", "title": "Unblock the release: a key is missing", "waiting_for": "a block to clear", "asked_at": "2026-10-23T18:05:00Z", "thread_url": "https://chat.example.org/t/1b9e07", "kind": "action", "id": "ask-0205", "asked_by": "bo",
    "machine": "the build host",
    "steps": [
-     {"text": "Put the signing key in place", "command": "install -m 600 release.key /etc/orchard/release.key"},
-     {"text": "Restart the viewer"}
+     {"text": "Put the signing key in place", "command": "install -m 600 release.key /etc/orchard/release.key", "expect": "no output"},
+     {"text": "Restart the viewer", "expect": "the page shows the new tag"}
    ],
-   "done_when": "the page shows the new tag"},
+   "done_when": "Answer \"pass\", or the step that failed"},
   {"project": "harbor", "item": "0.8", "title": "Choose the retry limit", "waiting_for": "a ruling", "asked_at": "2026-10-24T16:00:00Z", "kind": "choice", "id": "ask-0808", "asked_by": "bo"},
   {"project": "harbor", "item": "0.9", "title": "Pick the rollout plan", "waiting_for": "a ruling", "asked_at": "2026-10-24T17:00:00Z", "kind": "choice", "id": "ask-0909", "asked_by": "ana", "question": "Which rollout plan?", "options": [{"label": "Roll the change out to every region at once, keep the old path switched on behind a flag for two full weeks, and remove it only after the error budget has stayed green for the whole period and the on-call engineers have signed off in writing on every region ", "recommended": true}, {"label": "Roll out one region at a time, waiting a full day between regions, pausing the whole rollout on any alert at all, and finishing with a cleanup release that removes the old path once every region has been stable for a week and the dashboards agree"}]},
   {"project": "orchard", "item": "2.6", "title": "Choose the cache policy", "waiting_for": "a ruling", "asked_at": "2026-10-24T17:30:00Z", "kind": "choice", "id": "ask-0206", "asked_by": "bo", "question": "Which cache policy?", "options": [{"label": "Short", "description": "entries expire after a minute; cheap to run, more misses under load", "recommended": true}, {"label": "Long", "description": "entries live for a day and are refreshed in the background; fewer misses but stale data is possible for a while after a change"}, {"label": "None"}]}

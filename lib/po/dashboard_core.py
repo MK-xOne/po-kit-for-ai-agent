@@ -1246,6 +1246,8 @@ def decision_shape(entry):
             return "unformatted"
     if "requires" in entry and requires_of(entry) is None:
         return "unformatted"
+    if card_rule_problems(entry):
+        return "unformatted"
     return "action"
 
 
@@ -1487,6 +1489,91 @@ def step_problems(steps):
         hit = VAGUE_RE.search(text)
         if hit and not _QUOTED.search(text):
             out.append("step %d is vague (%r): say exactly where to click or what to type" % (i, hit.group(1).lower()))
+    return out
+
+
+def _chains(s):
+    if not isinstance(s, str):
+        return False
+    if "\n" in s:
+        return True
+    in_single = in_double = in_backtick = False
+    i = 0
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if in_single:
+            if c == "'":
+                in_single = False
+            i += 1
+            continue
+        if in_double:
+            if c == '"':
+                in_double = False
+            i += 1
+            continue
+        if in_backtick:
+            if c == "`":
+                in_backtick = False
+            i += 1
+            continue
+        if c == "'":
+            in_single = True
+        elif c == '"':
+            in_double = True
+        elif c == "`":
+            in_backtick = True
+        elif c == ";":
+            return True
+        elif c == "&" and i + 1 < n and s[i + 1] == "&":
+            return True
+        elif c == "|" and i + 1 < n and s[i + 1] == "|":
+            return True
+        i += 1
+    return False
+
+
+def card_rule_problems(card):
+    """Rules for an action card a human can follow: one command or one click per step, no chains, no sudo
+    inside a chain, an expect on every step, no placeholders, one-line done_when. Empty when fine."""
+    out = []
+    entry = card if isinstance(card, dict) else {}
+    if entry.get("kind") != "action":
+        return out
+    steps = entry.get("steps") if isinstance(entry.get("steps"), list) else []
+    if not steps:
+        out.append("no steps")
+    for i, st in enumerate(steps, 1):
+        if not isinstance(st, dict):
+            out.append("step %d is not an object" % i)
+            continue
+        text = st.get("text") if isinstance(st.get("text"), str) else ""
+        command = st.get("command") if isinstance(st.get("command"), str) else ""
+        for field, val in (("text", text), ("command", command)):
+            if _chains(val):
+                out.append("step %d chains commands: one command per step" % i)
+                break
+        for field, val in (("text", text), ("command", command)):
+            if re.search(r"\bsudo\b", val, re.I):
+                first = val.strip().split()[:1]
+                if not first or first[0].lower() != "sudo" or _chains(val):
+                    out.append("step %d: sudo must be a step of its own, first word" % i)
+                    break
+        if not _text(st.get("expect")):
+            out.append("step %d has no expect" % i)
+        for field, val in (("text", text), ("command", command)):
+            mm = re.search(r"<[A-Za-z][^<>\n]*[A-Za-z0-9._-]>", val)
+            if mm:
+                out.append("step %d holds a placeholder %s" % (i, mm.group(0)))
+                break
+    dw = entry.get("done_when")
+    if not isinstance(dw, str) or not dw.strip() or "\n" in dw:
+        out.append('done_when must be one line asking for "pass" or the name of what failed')
+    elif len(dw) > 120 or "pass" not in dw.lower():
+        out.append('done_when must be one line asking for "pass" or the name of what failed')
+    machine = entry.get("machine")
+    if not isinstance(machine, str) or not machine.strip() or "\n" in machine:
+        out.append("machine must name one machine")
     return out
 
 

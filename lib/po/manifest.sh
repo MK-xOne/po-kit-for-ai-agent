@@ -51,6 +51,8 @@ declare -gA PO_SCHEMA=(
 	[close.memory]=0
 	[stamp.prepare]=0
 	[stamp.slow_after]=0
+	[stamp.test_files]=0
+	[stamp.test_def]=0
 	[events.live_days]=0
 	[release.source]=0
 	[release.pattern]=0
@@ -74,6 +76,7 @@ declare -gA PO_ARRAYS=(
 	[kickoff.preamble]=1
 	[close.checklist]=1
 	[stamp.prepare]=1
+	[stamp.test_files]=1
 	[dispatch.order]=1
 )
 
@@ -205,6 +208,17 @@ po_manifest_load() {
 		po_die "$file: [serve.web] stall_minutes must be an integer (minutes): ${PO_MANIFEST[serve.web.stall_minutes]}"
 	[[ -z ${PO_MANIFEST[stamp.slow_after]+x} || ${PO_MANIFEST[stamp.slow_after]} =~ ^[0-9]+$ ]] ||
 		po_die "$file: [stamp] slow_after must be an integer (seconds): ${PO_MANIFEST[stamp.slow_after]}"
+	[[ ${PO_MANIFEST[stamp.test_files]+x} == "${PO_MANIFEST[stamp.test_def]+x}" ]] ||
+		po_die "$file: [stamp] test_def and test_files go together: set both or neither"
+	[[ -z ${PO_MANIFEST[stamp.test_files]+x} || -n ${PO_MANIFEST[stamp.test_files]//[[:space:]]/} ]] ||
+		po_die "$file: [stamp] test_files needs at least one path"
+	if [[ -n ${PO_MANIFEST[stamp.test_def]+x} ]]; then
+		[[ -n ${PO_MANIFEST[stamp.test_def]} ]] || po_die "$file: [stamp] test_def must not be empty"
+		local rc=0
+		grep -qE -- "${PO_MANIFEST[stamp.test_def]}" </dev/null 2>/dev/null || rc=$?
+		((rc != 2)) ||
+			po_die "$file: [stamp] test_def is not a valid extended regular expression: ${PO_MANIFEST[stamp.test_def]}"
+	fi
 	[[ -z ${PO_MANIFEST[events.live_days]+x} || ${PO_MANIFEST[events.live_days]} =~ ^[0-9]+$ ]] ||
 		po_die "$file: [events] live_days must be an integer (days): ${PO_MANIFEST[events.live_days]}"
 	[[ -z ${PO_MANIFEST[versioning.tag_style]+x} || ${PO_MANIFEST[versioning.tag_style]} == light || ${PO_MANIFEST[versioning.tag_style]} == annotated ]] ||

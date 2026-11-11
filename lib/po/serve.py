@@ -31,7 +31,7 @@ FADE_SECONDS = 60  # a row that appears while the page is open starts 25% darker
 NEW_TEXT = {"light": {"text": "#222222", "muted": "#333333", "pass": "#06471a", "fail": "#7a1610"},
             "dark": {"text": "#f2f2f2", "muted": "#e6e6e6", "pass": "#8ff0b0", "fail": "#ffc2bd"}}
 PO_CMD = ("po", "events", "--all", "--json")
-PO_ARCHIVE_CMD = ("po", "events", "--archived", "--json")
+PO_ARCHIVE_CMD = ("po", "events", "--archived", "--all", "--json")
 TEAM_CMD = ("po", "team", "--json")
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "share", "po-web")
 WEB_FILES = {  # the only files /app/ serves: path -> (file, Content-Type)

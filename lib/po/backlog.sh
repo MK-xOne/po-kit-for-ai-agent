@@ -170,17 +170,51 @@ po_backlog_load() {
 	done
 }
 
-# Split one table row into PO_CELLS (outer pipes dropped, cells trimmed).
+# Split one table row into PO_CELLS (outer pipes dropped, cells trimmed). A pipe
+# separates cells unless it sits in a backtick span closed on the same row, or is
+# written backslash-pipe (a plain pipe in the cell). Same rule as split_row in
+# setup.py and cells() in lint.sh.
 po_split_row() {
-	local row=$1
+	local row=$1 cur='' pre c rest span
 	row=${row#|}
-	row=${row%|}
+	[[ $row == *'\|' ]] || row=${row%|}
 	PO_CELLS=()
-	while [[ $row == *'|'* ]]; do
-		PO_CELLS+=("$(po_trim "${row%%|*}")")
-		row=${row#*|}
+	while :; do
+		pre=${row%%[|\`\\]*}
+		if [[ $pre == "$row" ]]; then
+			cur+=$row
+			break
+		fi
+		cur+=$pre
+		row=${row:${#pre}}
+		c=${row:0:1}
+		row=${row:1}
+		case $c in
+		'|')
+			PO_CELLS+=("$(po_trim "$cur")")
+			cur=''
+			;;
+		\\)
+			if [[ $row == '|'* ]]; then
+				cur+='|'
+				row=${row:1}
+			else
+				cur+=\\
+			fi
+			;;
+		'`')
+			rest=${row#*\`}
+			if [[ $rest != "$row" ]]; then
+				span=${row%%\`*}
+				cur+='`'${span//'\|'/|}'`'
+				row=$rest
+			else
+				cur+='`'
+			fi
+			;;
+		esac
 	done
-	PO_CELLS+=("$(po_trim "$row")")
+	PO_CELLS+=("$(po_trim "$cur")")
 }
 
 po_backlog_tables() {
@@ -221,7 +255,7 @@ po_backlog_tables() {
 		[[ $line =~ ^\|[-:|[:blank:]]+\|$ ]] && continue
 		((status_col >= 0)) || continue
 		((${#PO_CELLS[@]} == width)) ||
-			po_die "$name:$lineno: row has ${#PO_CELLS[@]} cells, header has $width"
+			po_die "$name:$lineno: row has ${#PO_CELLS[@]} cells, header has $width; a pipe inside a code span or written as backslash-pipe is not a separator"
 		local status=${PO_CELLS[status_col]}
 		po_check_status "$status" "$name:$lineno" table
 		id_col=-1

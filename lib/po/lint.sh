@@ -7,9 +7,10 @@
 # finding per line, `<file>:<line>: <what is wrong>`; nothing is printed for a
 # clean backlog. Exit 0 clean, 1 findings.
 #   1. Every backlog table row and every item heading has its status, written
-#      as one ALL-CAPS word (a row of a table with a Status column; a heading
-#      `## <tag-form id> — <title> — <STATUS>`). po's own readers stop at the
-#      first malformed one; this lists them all.
+#      starting with one ALL-CAPS word, which is the status (a row of a table
+#      with a Status column; a heading `## <tag-form id> — <title> — <STATUS>`;
+#      `DONE (note)` is DONE). po's own readers stop at the first malformed
+#      one; this lists them all.
 #   2. Every item that is not DONE has its spec: a heading for it in a *.md
 #      file of [layout] specs_dir, found the way `po kickoff` finds it. Skipped
 #      when specs_dir is the repository root (".": the specs are the backlog
@@ -77,11 +78,35 @@ def git(*args):
     return r.stdout if r.returncode == 0 else None
 
 
+BT = chr(96)  # the backtick, spelled so this single-quoted script holds none
+
+
 def cells(row):
+    # the same rule as split_row in lib/po/setup.py and po_split_row in backlog.sh
     row = row.strip()
     row = row[1:] if row.startswith("|") else row
-    row = row[:-1] if row.endswith("|") else row
-    return [c.strip() for c in row.split("|")]
+    row = row[:-1] if row.endswith("|") and not row.endswith("\\|") else row
+    out, cur, i = [], "", 0
+    while i < len(row):
+        c = row[i]
+        if c == "\\" and row[i + 1:i + 2] == "|":
+            cur += "|"
+            i += 2
+            continue
+        if c == BT:
+            j = row.find(BT, i + 1)
+            if j > 0:
+                cur += BT + row[i + 1:j].replace("\\|", "|") + BT
+                i = j + 1
+                continue
+        if c == "|":
+            out.append(cur.strip())
+            cur = ""
+        else:
+            cur += c
+        i += 1
+    out.append(cur.strip())
+    return out
 
 
 def decorated(word):
@@ -140,13 +165,14 @@ for f in files:
                 continue
             ver = ID.match(cs[idx]).group(1)
             if len(cs) != width:
-                say(where, "%s: row has %d cells, header has %d" % (cs[idx], len(cs), width))
+                say(where, "%s: row has %d cells, header has %d; a pipe inside a code span or written as backslash-pipe is not a separator" % (cs[idx], len(cs), width))
                 continue
             st = cs[status_col]
-            if not CAPS.match(st):
+            word = st.split(None, 1)[0] if st else ""
+            if not CAPS.match(word):
                 say(where, "%s: status %r is missing or not one ALL-CAPS word" % (cs[idx], st))
                 continue
-            status.setdefault(ver, (st, where))
+            status.setdefault(ver, (word, where))
             labels.setdefault(ver, [c for c in cs[:idx] if re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", c)])
             continue
         in_table = False

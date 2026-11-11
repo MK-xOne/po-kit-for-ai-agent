@@ -120,7 +120,7 @@
     head.type = "button";
     head.setAttribute("aria-expanded", expanded[d.key] ? "true" : "false");
     var h = el("h2");
-    h.appendChild(el("span", "kind", d.kind));
+    if (d.kind) h.appendChild(el("span", "kind", d.kind));
     h.appendChild(document.createTextNode(d.title));
     head.appendChild(h);
     head.appendChild(el("div", "meta", [d.project && d.item ? d.project + " " + C.itemRef(d.item) : d.project, d.waiting, d.asked].filter(Boolean).join(" · ")));
