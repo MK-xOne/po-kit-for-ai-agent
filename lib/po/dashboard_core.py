@@ -216,6 +216,59 @@ def merge_since(held, new):
     return list(held or []) + [e for e in new if event_key(e) not in keys]
 
 
+
+def fetch_change(held, last_text, text, events, partial):
+    """What one events fetch changes: (changed, the events to hold, the text to keep). A 304 has events None;
+    a ?since= answer (partial) is merged into the events held; a whole feed changes when its text does."""
+    if events is None:
+        return False, held, last_text
+    if partial:
+        events = merge_since(held, events)
+        changed = len(events) != len(held or [])
+        return changed, events, (None if changed else last_text)  # after a merge the next whole fetch always redraws
+    return text != last_text, events, text
+
+
+# ---- when the Reports view redraws (v0.178) ----------------------------------
+
+REPORTS_TICK_SECONDS = 60  # the range's window moves with the clock: one redraw a minute is enough
+
+
+class ReportsRedraw:
+    """Rebuilding every Reports chart is costly, so it happens only when it shows something new: its events
+    changed, or the clock moved its window (the minute tick), and only while Reports is on screen. Hidden, it
+    is marked dirty and redrawn once when it is shown. redraw() calls the real redraw; visible() says whether
+    Reports is the view on screen. The other callers (range, variant, roster, archive) redraw directly."""
+
+    def __init__(self, redraw, visible):
+        self.redraw_fn, self.visible, self.dirty = redraw, visible, False
+
+    def redraw(self):
+        self.dirty = False
+        self.redraw_fn()
+
+    def fetched(self, changed):
+        """An events fetch: a 304 or an unchanged feed draws nothing."""
+        if changed:
+            self.stale()
+
+    def tick(self):
+        """The minute clock (a GLib timeout callback: returns True to keep it)."""
+        self.stale()
+        return True
+
+    def stale(self):
+        if self.visible():
+            self.redraw()
+        else:
+            self.dirty = True
+
+    def shown(self):
+        """Reports just came on screen: redraw once if anything moved while it was hidden."""
+        if self.dirty and self.visible():
+            self.redraw()
+
+
 # ---- answering decisions (v0.49) --------------------------------------------
 
 
@@ -675,8 +728,9 @@ def team_status(rows, shared=None):
 def team_row(entry, now=None, tz=None):
     """One agent as the strings a team line shows.
 
-    status is one of LIMIT until <time> (kind 'limit', wins over the rest), WORKING... (kind 'working'),
-    FREE (kind 'free', the free flag), else the state as given (kind 'idle')."""
+    status is one of OFF (kind 'off', the agent switched off: `inactive: true`, v0.173; wins over the rest, and
+    a live limit is said after it: `OFF · LIMIT until <time>`), LIMIT until <time> (kind 'limit'), WORKING...
+    (kind 'working'), FREE (kind 'free', the free flag), else the state as given (kind 'idle')."""
     state = str(entry.get("state") or "")
     owns = entry.get("owns")
     owns = [str(o) for o in owns] if isinstance(owns, list) else []
@@ -684,7 +738,9 @@ def team_row(entry, now=None, tz=None):
     model = entry.get("model")
     working = state.strip().upper().startswith("WORKING")
     limit = limit_text(entry, now, tz)
-    if limit:
+    if entry.get("inactive") is True:
+        kind, status = "off", OFF_BADGE + (" \u00b7 " + limit if limit else "")
+    elif limit:
         kind, status = "limit", limit
     elif working:
         kind, status = "working", state
@@ -700,6 +756,26 @@ def team_row(entry, now=None, tz=None):
         "usage": team_usage(entry),
         "now": "" if now_item in (None, "") else str(now_item),
         "owns": ", ".join(owns),
+    }
+
+
+# ---- the agent switch (v0.173) -------------------------------------------------
+# An agent's `inactive` comes from the team feed (the agent switch file); its line's switch posts
+# {answer_id, kind: agent-active, agent, active, answered_at, client} on the answer path (same URL and token).
+AGENT_ACTIVE = "agent-active"
+OFF_BADGE = "OFF"
+AGENT_SWITCH_TARGET_PX = 32  # the switch and its word are one click target at least this tall (P1.10: 24 px)
+
+
+def agent_active_body(agent, active, answer_id):
+    """The POST body that switches an agent on (active True) or off."""
+    return {
+        "answer_id": answer_id,
+        "kind": AGENT_ACTIVE,
+        "agent": str(agent),
+        "active": bool(active),
+        "answered_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "client": CLIENT,
     }
 
 
@@ -987,7 +1063,7 @@ PROJECT_ACTIVE = "project-active"
 INACTIVE_BADGE = "inactive"
 INACTIVE_TEXT = "switched off (inactive): nothing new is opened"
 SWITCH_HOLD_SECONDS = 180  # a switched card shows the new state this long while the (cached) feed catches up
-SWITCH_TARGET_PX = 44  # the switch line (switch, its word, its reason) is one click target at least this tall (P1.10)
+SWITCH_TARGET_PX = 44  # the switch's touch area, and its line, are this tall; only the switch flips (v0.179, was the whole line)
 SWITCH_NO_SINK = "read-only: no answer URL"  # the reason a switch is off without a sink, said on the card
 
 
@@ -2133,6 +2209,10 @@ window.po-dashboard { background-color: %(base)s; color: %(text)s; }
 .po-card switch { border: 1px solid %(muted)s; }
 .po-card switch:checked { border-color: %(accent)s; }
 .po-badge { color: %(muted)s; border: 1px solid %(muted)s; border-radius: 6px; padding: 0 6px; font-size: 12px; }
+.po-off-badge { color: %(muted)s; border: 1px solid %(muted)s; border-radius: 6px; padding: 0 8px; font-size: 12px; font-weight: 700; }
+.po-off .po-text { color: %(muted)s; }
+.po-team switch { border: 1px solid %(muted)s; }
+.po-team switch:checked { border-color: %(accent)s; }
 .po-view { background-color: %(base)s; background-image: none; color: %(text)s; border: 1px solid %(edge)s; border-radius: 14px;
   padding: 8px 16px; box-shadow: 4px 4px 8px %(dark)s, -4px -4px 8px %(light)s; }
 .po-view:checked { background-color: %(accent)s; color: %(on_accent)s; border-color: %(accent)s; font-weight: 700; box-shadow: none; }
@@ -2142,8 +2222,9 @@ window.po-dashboard { background-color: %(base)s; color: %(text)s; }
 .po-dhead:hover { background-color: %(base)s; }
 .po-dhead:focus-visible { outline: 2px solid %(text)s; outline-offset: 2px; }
 .po-subrow { margin: 0 18px 0 18px; }
+/* GTK sizes min-height on the content box: 18 + 2 x 2 padding + 2 x 1 border = a 24 px button (ui-guidelines 1.10) */
 .po-small { background-color: %(base)s; background-image: none; color: %(text)s; border: 1px solid %(edge)s; border-radius: 10px;
-  padding: 2px 12px; min-height: 0; font-size: 12px; box-shadow: 3px 3px 6px %(dark)s, -3px -3px 6px %(light)s; }
+  padding: 2px 12px; min-height: 18px; font-size: 12px; box-shadow: 3px 3px 6px %(dark)s, -3px -3px 6px %(light)s; }
 .po-small:checked { background-color: %(accent)s; color: %(on_accent)s; border-color: %(accent)s; font-weight: 700; box-shadow: none; }
 .po-small:disabled { color: %(muted)s; border-color: %(hairline)s; box-shadow: none; }
 .po-small:focus-visible { outline: 2px solid %(text)s; outline-offset: 2px; }
@@ -2182,6 +2263,8 @@ CONTRAST_PAIRS = [
     (".po-link link", ".po-card", "thread link"),
     (".po-already", ".po-card", "already answered status"),
     (".po-badge", ".po-card", "inactive badge"),
+    (".po-off-badge", ".po-card", "OFF badge of a switched-off agent"),
+    (".po-off .po-text", ".po-card", "muted text of a switched-off agent's line"),
     (".po-view", ".po-view", "view toggle label"),
     (".po-view:checked", ".po-view:checked", "selected view label on its accent fill"),
     (".po-small", ".po-small", "small button label"),

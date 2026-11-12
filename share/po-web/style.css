@@ -100,6 +100,10 @@ main { padding: 10px; display: grid; gap: 10px; grid-template-columns: 1fr; max-
 /* the project switch (v0.139): a 44 px target, the state in words beside the knob; the inactive badge is text */
 .card .badge { display: inline-block; margin-left: 8px; padding: 0 6px; border: 1px solid var(--muted); border-radius: 6px;
   font-size: .75rem; color: var(--muted); vertical-align: middle; }
+/* v0.173: a switched-off agent's card is muted (text, not opacity: it keeps 4.5:1) and says OFF in a text badge */
+.card.off { border-style: dashed; }
+.card.off strong, .card.off .meta { color: var(--muted); }
+.card .badge.off { margin-left: 0; font-weight: 700; }
 .switch-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
 .switch { display: inline-flex; align-items: center; gap: 8px; min-height: 44px; padding: 0 12px 0 6px; font: inherit;
   color: var(--text); background: var(--bg); border: 1px solid var(--muted); border-radius: 22px; cursor: pointer; }

@@ -276,17 +276,6 @@ def plural(n, word):
     return "%d %s%s" % (n, word, "" if n == 1 else "s")
 
 
-def gate_runs_text(data):
-    if not data["total"]:
-        return "Gate runs per agent: none in this range."
-    parts = []
-    for a in data["agents"]:
-        p = sum(x for x, _ in data["series"][a])
-        f = sum(x for _, x in data["series"][a])
-        parts.append("%s %s, %d passed, %d failed" % (a, plural(p + f, "run"), p, f))
-    return "Gate runs per agent, %s to %s: %s." % (data["labels"][0], data["labels"][-1], "; ".join(parts))
-
-
 def first_try_text(data):
     if not data["rows"]:
         return "First-try pass rate per agent: none in this range."

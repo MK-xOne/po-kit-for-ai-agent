@@ -58,10 +58,17 @@ po_check_status() {
 }
 
 po_trim() {
-	local s=$1
-	s=${s#"${s%%[![:blank:]]*}"}
-	s=${s%"${s##*[![:blank:]]}"}
-	printf '%s' "$s"
+	local _pt_r
+	po_trim_into "$1" _pt_r
+	printf '%s' "$_pt_r"
+}
+
+# po_trim_into <text> <var>: po_trim without a subshell, into <var>.
+po_trim_into() {
+	local _pt_s=$1
+	_pt_s=${_pt_s#"${_pt_s%%[![:blank:]]*}"}
+	_pt_s=${_pt_s%"${_pt_s##*[![:blank:]]}"}
+	printf -v "$2" '%s' "$_pt_s"
 }
 
 # po_batch_read <rev> <outdir> <path>...: write the content of each path at
@@ -99,12 +106,13 @@ PO_BACKLOG_MEMO_OWNERS=''
 
 # po_backlog_load [<rev>]: fill PO_ITEMS from main, or from <rev>.
 po_backlog_load() {
-	local main backlog specs_dir sha
+	local main backlog specs_dir sha tag
 	main=${1:-$(po_get layout.main)}
 	# The memo is keyed by the commit, so a ref that moves mid-run misses.
 	sha=$(git rev-parse -q --verify "$main^{commit}" 2>/dev/null) || sha=''
 	backlog=$(po_get layout.backlog)
 	specs_dir=$(po_get layout.specs_dir)
+	tag=$(po_get versioning.tag)
 
 	# Memo hit: restore without touching git.
 	if [[ -n $sha && $sha == "${PO_BACKLOG_MEMO_REV:-}" ]]; then
@@ -146,12 +154,12 @@ po_backlog_load() {
 	po_batch_read "$main" "$_tmpdir" "${_files[@]}"
 
 	local _i=0
-	po_backlog_tables "$backlog" "$_tmpdir/0"
+	po_backlog_tables "$backlog" "$_tmpdir/0" "$tag"
 	_i=1
 	local _file
 	for _file in "${_files[@]:1}"; do
 		[[ $_file == *.md ]] || { _i=$((_i+1)); continue; }
-		po_backlog_headings "$_file" "$_tmpdir/$_i"
+		po_backlog_headings "$_file" "$_tmpdir/$_i" "$tag"
 		_i=$((_i+1))
 	done
 
@@ -175,7 +183,7 @@ po_backlog_load() {
 # written backslash-pipe (a plain pipe in the cell). Same rule as split_row in
 # setup.py and cells() in lint.sh.
 po_split_row() {
-	local row=$1 cur='' pre c rest span
+	local row=$1 cur='' pre c rest span cell
 	row=${row#|}
 	[[ $row == *'\|' ]] || row=${row%|}
 	PO_CELLS=()
@@ -191,7 +199,8 @@ po_split_row() {
 		row=${row:1}
 		case $c in
 		'|')
-			PO_CELLS+=("$(po_trim "$cur")")
+			po_trim_into "$cur" cell
+			PO_CELLS+=("$cell")
 			cur=''
 			;;
 		\\)
@@ -214,17 +223,22 @@ po_split_row() {
 			;;
 		esac
 	done
-	PO_CELLS+=("$(po_trim "$cur")")
+	po_trim_into "$cur" cell
+	PO_CELLS+=("$cell")
 }
 
+# po_backlog_tables <name> <file> [<tag template>]: add the table rows of
+# <file> to PO_ITEMS (and PO_OWNERS); po_backlog_headings the same for item
+# headings. Both parse without a subshell per line; the template is read from
+# the manifest when not given.
 po_backlog_tables() {
 	local name=$1 src=$2 line lineno=0 in_table=0 status_col=-1 width=0
-	local tag version id_col i owner_name='' owner_col=-1
-	tag=$(po_get versioning.tag)
+	local tag=${3-} version id_col i owner_name='' owner_col=-1
+	[[ -n $tag ]] || tag=$(po_get versioning.tag)
 	[[ -z ${PO_MANIFEST[layout.owner_column]+x} ]] || owner_name=${PO_MANIFEST[layout.owner_column]}
 	while IFS= read -r line || [[ -n $line ]]; do
 		lineno=$((lineno + 1))
-		line=$(po_trim "$line")
+		po_trim_into "$line" line
 		if [[ $line != '|'* ]]; then
 			in_table=0
 			continue
@@ -260,7 +274,7 @@ po_backlog_tables() {
 		po_check_status "$status" "$name:$lineno" table
 		id_col=-1
 		for i in "${!PO_CELLS[@]}"; do
-			if version=$(po_unfill "$tag" "${PO_CELLS[i]}"); then
+			if po_unfill_into "$tag" "${PO_CELLS[i]}" version; then
 				id_col=$i
 				break
 			fi
@@ -278,16 +292,20 @@ po_backlog_tables() {
 }
 
 po_backlog_headings() {
-	local name=$1 src=$2 line lineno=0 tag prefix id version
-	local -a segs
-	tag=$(po_get versioning.tag)
+	local name=$1 src=$2 line lineno n tag=${3-} prefix id version
+	local -a segs lines
+	[[ -n $tag ]] || tag=$(po_get versioning.tag)
 	prefix=${tag%%\{version\}*}
-	while IFS= read -r line || [[ -n $line ]]; do
-		lineno=$((lineno + 1))
+	# One read of the whole file: a spec file runs to thousands of lines and a
+	# read per line is most of the cost.
+	mapfile -t lines <"$src"
+	n=${#lines[@]}
+	for ((lineno = 1; lineno <= n; lineno++)); do
+		line=${lines[lineno - 1]}
 		[[ $line == "## $prefix"[0-9]* ]] || continue
 		id=${line#'## '}
 		id=${id%%[[:blank:]]*}
-		version=$(po_unfill "$tag" "$id") ||
+		po_unfill_into "$tag" "$id" version ||
 			po_die "$name:$lineno: heading id '$id' is not in tag form ($tag)"
 		# Split on " — " (space, em dash, space).
 		local rest=${line#"## $id"}
@@ -316,7 +334,7 @@ po_backlog_headings() {
 		done
 		[[ -n $status ]] || po_die "$name:$lineno: heading has no ALL-CAPS status segment"
 		PO_ITEMS+=("$version"$'\t'"$status"$'\t'"$title"$'\t'"$name:$lineno")
-	done <"$src"
+	done
 }
 
 # po_backlog_conflicts: one line per item whose sources disagree, or whose

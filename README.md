@@ -19,7 +19,9 @@ Three laws, non-negotiable:
   `--commit`; a full dry-run pass leaves `git status --porcelain` empty.
 - **Manifest-driven.** Everything project-specific lives in the adopting
   repo's `po.toml`; the same scripts serve every project.
-- **Never pushes, never writes prose.** The only words the kit ever edits
+- **Pushes only when the manifest says so, never writes prose.** The kit pushes
+  only through a `[land] push` command the project sets (`po land`); without
+  one it never pushes. The only words the kit ever edits
   are an item's STATUS tokens, wherever the backlog keeps them: a table
   cell, a status word in backlog prose, or a spec heading's status word.
   Close records, rulings, founding text and decisions stay human.
@@ -160,6 +162,7 @@ the same from any worktree.
   diffstat vs merge-base(main): <summary>
   tests vs merge-base(main): +<A> -<R>   # with [stamp] test_files and test_def
   flag: code changed, no test removed or rewritten (PO: check for pins on replaced behaviour)
+  tier: fast, 412 of 3399 checks    # with [stamp] tier or --tier (see Tiers below)
   prepare ran: <line>               # one per [stamp] prepare line
   bin sha256 <hash> (<path>)        # with --bin
   ```
@@ -195,6 +198,36 @@ the same from any worktree.
   disagreeing count, a non-ok summary, or a worktree that changed while
   the gate ran exits 4 and writes no file. `dirty` and that last check
   ignore the stamp files themselves; don't commit them.
+
+  **Tiers.** `po stamp --tier fast|full` (default `[stamp] tier`, else
+  `full`) chooses how much of the suite runs. A *unit* is one test file: each
+  file directly under a directory entry of `[stamp] test_files`, and each file
+  entry itself (a glob entry gives none). A unit says what it covers in its
+  first 30 lines: `# covers: lib/po/status.sh units/` (leader `#`, `//`
+  or `--`; repo-relative paths, separated by spaces, an entry ending in `/`
+  covering everything under it; no globs; several lines add up). The fast tier
+  takes the paths that differ between the merge-base with main and the working
+  tree (untracked files too, stamp files not): a path that is a unit selects
+  that unit, which runs whole; a path under `[stamp.fast] ignore` selects
+  nothing; any other selects every unit whose covers line names it. Then come
+  every unit with no covers line (it may cover anything) and the units of
+  `[stamp.fast] always` (the smoke set). The test leg (the leg named `test`,
+  or the single `[gate] command` leg) runs as `[stamp.fast] command` with
+  `{selected}` replaced by the selected units, shell-quoted, in `test_files`
+  order; every other leg runs as written. A changed path no unit covers, or a
+  selection that comes out empty, falls back to the full tier, and the block
+  says why. The block's tier line, after the `tests vs merge-base` and `flag:`
+  lines: `tier: fast, <n> of <m> checks` (`<m>` the count of this project's
+  newest passing full stamp in the live events log; `tier: fast, <n> checks, no
+  full count on record` without one), `tier: full`, or `tier: full (fast fell
+  back: etc/x is covered by no test)`. Without `[stamp] tier` and without
+  `--tier`, the block has no tier line and is as before. A fast stamp's event
+  carries `"tier":"fast"`. A fast stamp is evidence for the report, never for
+  the boundary: `po close` and `po land` want a full stamp at the tip (below),
+  and on a project that sets `[stamp] tier` or `[stamp.fast] command`, `po
+  release <N> --write` wants a full stamp of main's tip in the main checkout. A
+  covers line that misses a test is caught by the full run at land or release,
+  never by a wrong close.
 
   A failed run keeps its evidence outside the worktree. Its event (see
   `po events`) gives the failing leg a `tail`: the last 40 lines of that
@@ -254,8 +287,10 @@ the same from any worktree.
 - `po close <version>` — the closing boundary. Pre-flight, all before any
   write: every backlog source says the item is DOING and none disagrees
   (else exit 3); its branch is exactly one item-form commit on main (6);
-  `po fresh` passes (5); the newest `gate-<n>.txt` in its worktree names
-  the branch tip, `dirty 0`, `gate PASS` (6); its tag is free (6). Then, with
+  `po fresh` passes (5); the newest full `gate-<n>.txt` in its worktree (a
+  fast stamp, see `po stamp`, is skipped) names the branch tip, `dirty 0`,
+  `gate PASS` (6), and with only fast stamps there the refusal names the
+  command, `po stamp --tier full` (6); its tag is free (6). Then, with
   `--commit`: fast-forward main; a lightweight tag (written with
   `update-ref`, so `tag.gpgSign` never turns it into a signed one) or,
   with `[versioning] tag_style = "annotated"` (default `"light"`; any other
@@ -460,7 +495,11 @@ the same from any worktree.
   after the command (`(v0.9)`). A `|` in a cell is written `\|`; a command with backticks gets a
   longer code fence. `--write` inserts it right under the `## Release N` heading, or replaces the
   block there (idempotent); recorded steps are never edited. Under `[release] review = true` it
-  refuses (6) without the review row, like `po release <N>`.
+  refuses (6) without the review row, like `po release <N>`. On a project on the tiered gate
+  (`[stamp] tier` or `[stamp.fast] command` set) `--write` refuses (6) unless the main
+  checkout's newest full `gate-<n>.txt` names main's tip, `dirty 0`, `gate PASS`:
+  `release-N needs a full stamp at <tip>: run po stamp --tier full in <main checkout>`. The
+  release commit that follows touches only `CHANGELOG.md`.
 - `po setup list [--item <version>] [--all] [--json]` — read-only: the
   recorded steps still open (`--all` adds the confirmed ones, with who and
   when), one line each (`v0.9 #1  open  build host  operator  <command>`,
@@ -485,8 +524,8 @@ the same from any worktree.
   `prepare` leg failed with its tail (the output of every line so far) and
   the full output in the stamp log. Absent or `[]`, `po stamp` is
   unchanged. A value that is not an array of quoted strings, or any key
-  under `[stamp]` other than `prepare`, `slow_after`, `test_files` and
-  `test_def`, is a manifest error (2); `po doctor` lists the key as `adopt
+  under `[stamp]` other than `prepare`, `slow_after`, `test_files`,
+  `test_def` and `tier`, is a manifest error (2); `po doctor` lists the key as `adopt
   [stamp] prepare` for a manifest without it.
 - `[stamp] test_files` and `[stamp] test_def` — optional, and set together:
   `test_files` is a one-line array of git pathspecs, path prefixes or globs
@@ -498,6 +537,17 @@ the same from any worktree.
   `po stamp` above). With neither, the block is unchanged. One without the
   other, an empty `test_files`, an empty `test_def` or one that is not a
   valid extended regular expression is a manifest error (2).
+- `[stamp] tier` — optional, `"fast"` or `"full"` (default `full`): the tier
+  `po stamp` runs without `--tier` (see Tiers under `po stamp`). Another value,
+  or `"fast"` without `[stamp.fast] command`, is a manifest error (2).
+- `[stamp.fast]` — optional, the fast tier: `command`, the test leg's command
+  in that tier, holding `{selected}` where the selected test files go (`command
+  = "tests/run.sh --only {selected}"`; a command without `{selected}` is a
+  manifest error, 2); `always`, an array of test files that run in every fast
+  stamp (the smoke set); `ignore`, an array of paths (a file, or a `dir/`
+  prefix) whose changes select nothing (`["CHANGELOG.md", "docs/"]`). `po
+  stamp --tier fast` without `command` is exit 2. `po doctor` lists `[stamp]
+  tier` and `[stamp.fast] command` as adoptable.
 - `[events] live_days` — an optional integer, days (default 10): events older
   than this leave `po-events.jsonl` for `po-events-archive.jsonl` (see `po
   events`). Anything but an integer is a manifest error (2); `po doctor` lists
@@ -578,7 +628,27 @@ the same from any worktree.
   merged into `limit_until` and `usage` when the files exist; a missing file
   is ignored, an unreadable one warns on stderr and is left out (both need
   `python3`; paths are relative to the main worktree). An empty roster is an
-  error (2).
+  error (2). `[team] inactive_file` names your agent switch file (a path
+  relative to the main worktree, like `limits_file`): one agent name per line,
+  `#` comment lines, names matched without regard to case; a missing file, or
+  no key, means nobody is switched off. An agent it names gets
+  `"inactive": true` (the key is absent otherwise) and `free: false`, even when
+  idle and owning nothing; its `state` and `owns` are left as they are (its
+  items are not held or reassigned). The table prints `OFF` in its FREE
+  column.
+- `po team off <agent> [--commit]` / `po team on <agent> [--commit]` — switch
+  an agent off (its name appended as the last line of the `[team]
+  inactive_file`, never twice) or on (every line naming it removed). The agent
+  must be in the roster (else exit 2, nothing written); without
+  `inactive_file` it exits 2 with `no [team] inactive_file`. Without
+  `--commit` it prints `would switch <agent> off` (or `on`) and writes
+  nothing. With it, it prints `<agent> is now inactive` / `active`, or
+  `already inactive` / `already active` (exit 0, nothing written). Every other
+  byte of the file is kept (comments, order, the final newline or its
+  absence), so off then on of the last line gives the file back byte for byte;
+  a line from the middle switched on and off again comes back at the end. The
+  file is rewritten in place (same inode, no rename); off creates a missing
+  file. Needs `python3`.
   `po serve` exposes the same array at `/team.json`. `examples/team.po.toml`
   is a sample roster.
 - `po dispatch --plan | --commit` — gives the ready items to the free eligible
@@ -588,10 +658,12 @@ the same from any worktree.
   with no list to any roster agent. Candidates are tried in the order of
   `[dispatch] order` (a one-line array of names, cheapest first; agents not
   named come after, in roster order). An agent gets at most one item per run,
-  and an agent that is not free (WORKING, or owning an item) never gets one.
+  and an agent that is not free (WORKING, owning an item, or switched off by
+  `po team off`) never gets one.
   `--plan` prints one `assign <item> to <agent>` or `skip <item> <reason>` line
   per ready item (`no free eligible agent`, `no roster agent is eligible`) and
-  changes nothing. `--commit` runs `po open <item> --for <agent> --commit` for
+  changes nothing; a `no free eligible agent` skip whose eligible agents include
+  a switched-off one names it: `no free eligible agent (<agent> is inactive)`. `--commit` runs `po open <item> --for <agent> --commit` for
   each assignment with `BUZZ_AGENT=dispatcher`, so the open events carry the
   agent `dispatcher` (a fixed name); a failed open is reported (`FAILED`) and the
   run goes on, then exits 6. After each open it writes the item's prompt (a
@@ -717,11 +789,14 @@ the same from any worktree.
   them); the logic is `lib/po/dashboard_core.py`, which needs neither.
   `--team-url` or `PO_DASHBOARD_TEAM_URL` (no default; `--team-url` wins) adds a
   Team view, a header toggle Events | Team: one line per agent from a JSON
-  array of `{agent, model?, state, now, owns[], working_on?, free, limit_until?, usage?}`
+  array of `{agent, model?, state, now, owns[], working_on?, free, inactive?, limit_until?, usage?}`
   (name, then the optional `model` string in muted text, nothing when absent;
   one Status column, then the `now` item and the `owns` items). `working_on`,
   when present, splits the owns list into `working on:` and `parked:`; absent,
   the whole list is shown as `owns`. Status is
+  `OFF` when `inactive` is true (the agent switched off: a muted badge, the word as well as the colour, and the
+  whole line muted; it wins over the rest, and a live limit is said after it, `OFF · LIMIT until 7:00 PM EST`; the
+  web page shows no idle warning for it); else
   `LIMIT until <time>` (in the viewer's local time and named zone, `7:00 PM EST`, then the date when not
   today, `7:00 PM EST Nov 30`: the one time format of the desktop window and the web page; red; it wins over the rest) while `limit_until`, an ISO time, is still
   ahead (null, absent, past or unparseable is no limit); else `state` as given
@@ -749,6 +824,15 @@ the same from any worktree.
   refresh and at start, and `--check` uses it too. Agents not in the saved order
   go last, in the feed's order; a missing or broken file is no order; the feed
   itself is never written.
+  An agent switch (v0.173): with an answer URL every Team line (desktop and web) ends in an on/off switch for its
+  agent (the word `on` / `off` beside it; on the web page a 44 px button, on the desktop a switch at least 24 px
+  tall, the switch itself the only target so a click elsewhere on the line never flips it). Flipping it POSTs, to
+  the same answer sink with the same device token, `{answer_id, kind: "agent-active", agent, active, answered_at,
+  client: "po-dashboard"}`; your receiver switches the agent in your agent switch file (the `[team]
+  inactive_file`) as `po team off|on` does, with the same answers as the project switch (201 written, 200
+  already, 404 with an `X-Reason` for an agent it does not know). The line's OFF badge follows the switch while
+  the feed catches up (3 minutes at most); a refusal is said on the line (`not switched: ...`). Without an answer
+  URL there is no switch and `OFF` still shows.
   `--decisions-url` or `PO_DASHBOARD_DECISIONS_URL` (no default;
   `--decisions-url` wins) adds a Decisions view to the same header toggle
   (Events | Team | Decisions, each shown only when its feed is set): items

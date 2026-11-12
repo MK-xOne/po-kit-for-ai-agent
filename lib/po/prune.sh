@@ -146,6 +146,7 @@ po_cmd_prune() {
 	for x in "${kept[@]}"; do
 		printf '  %s  — %s\n' "${x%%$'\t'*}" "${x#*$'\t'}"
 	done
+	po_prune_land_records "$branch_tpl" "$tag_tpl"
 
 	# The backlog disagreeing with itself makes "open item" uncertain: the
 	# plan above already protects every branch any source calls open, but
@@ -181,4 +182,33 @@ po_cmd_prune() {
 		printf 'deleted branch %s (was %s)\n' "$br" "$(po_short "$sha")"
 	done
 	return 0
+}
+
+# po_prune_land_records <branch template> <tag template>: list every po land
+# record (<common git dir>/po-land/<version>/, v0.181) whose item is not
+# DOING or has no branch: a SPEC MET recorded for an item closed by hand.
+# Listed only, never removed: `rm -r` of the named directory is the PO's.
+po_prune_land_records() {
+	local dir d v why
+	local -a stale=()
+	dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/po-land
+	[[ -d $dir ]] || return 0
+	for d in "$dir"/*/; do
+		[[ -f $d/spec-met ]] || continue
+		d=${d%/}
+		v=${d##*/}
+		why=''
+		if ! po_item_is "$v" DOING; then
+			why="item is ${PO_ITEM_SAYS:-recorded by no backlog source}, not DOING"
+		elif ! git show-ref --verify --quiet "refs/heads/$(po_fill "$1" "$v")"; then
+			why="no branch $(po_fill "$1" "$v")"
+		fi
+		[[ -z $why ]] || stale+=("$(po_fill "$2" "$v")"$'\t'"$why"$'\t'"$d")
+	done
+	((${#stale[@]} > 0)) || return 0
+	printf '\nSTALE LAND RECORDS (%s) — SPEC MET recorded, nothing to land; listed only\n' "${#stale[@]}"
+	for d in "${stale[@]}"; do
+		IFS=$'\t' read -r v why dir <<<"$d"
+		printf '  %s  %s  (%s)\n' "$v" "$why" "$dir"
+	done
 }

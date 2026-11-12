@@ -210,9 +210,12 @@ po_edit_review_row() {
 # recorded steps of the items the entry names (po setup list --all), printed, or with
 # write inserted under the "## Release N" heading of CHANGELOG.md (idempotent). Where
 # [release] review = true the review row must exist first, as for po release <N>.
+# A project on the tiered gate (v0.182) writes only with a full passing stamp of
+# main's tip in the main checkout (po_release_full_stamp).
 po_release_setup() {
 	local top state
 	top=$(git rev-parse --show-toplevel 2>/dev/null) || po_die "not a git repository"
+	(($2 == 0)) || ! po_stamp_tiered || po_release_full_stamp "$1"
 	if [[ ${PO_MANIFEST[release.review]:-false} == true ]]; then
 		po_backlog_load
 		po_release_review_row "$1" ||
@@ -220,6 +223,24 @@ po_release_setup() {
 	fi
 	state=$(po_setup_file) || po_die "no git dir"
 	po_setup_py block "$top/CHANGELOG.md" "$1" "$2" "$state" || exit $?
+}
+
+# po_release_full_stamp <N>: refuse unless the main checkout's newest full
+# stamp names main's tip, clean, with a passing gate: the full suite runs before
+# every release, whatever the items' fast stamps said. The release commit that
+# follows touches only CHANGELOG.md.
+po_release_full_stamp() {
+	local main mtip stamp block first second
+	main=$(po_get layout.main)
+	mtip=$(git rev-parse -q --verify "refs/heads/$main^{commit}") || po_die "no branch '$main' (manifest [layout] main)"
+	stamp=$(po_stamp_newest "$PO_MAIN_WT" full)
+	if [[ -n $stamp ]]; then
+		block=$(<"$stamp")
+		first=${block%%$'\n'*} second=${block#*$'\n'}
+		second=${second%%$'\n'*}
+		[[ $first == "HEAD $mtip ($main)  dirty 0" && $second == 'gate PASS: '* ]] && return 0
+	fi
+	po_refuse "release-$1 needs a full stamp at $(po_short "$mtip"): run po stamp --tier full in $PO_MAIN_WT"
 }
 
 po_cmd_release() {

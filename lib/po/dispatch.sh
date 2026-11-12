@@ -11,7 +11,9 @@
 # (case-insensitive), one with no list to any roster agent. Agents are tried in
 # the order of [dispatch] order (names; an agent not listed comes after those
 # that are, in roster order). An agent gets at most one item per run, and an
-# agent that is not free (WORKING, or owning an item) never gets one.
+# agent that is not free (WORKING, owning an item, or switched off: inactive
+# in the team feed) never gets one; a skipped item whose eligible agents
+# include an inactive one says so: "no free eligible agent (<agent> is inactive)".
 #
 # --commit opens through `po open --for <agent> --commit` with BUZZ_AGENT set
 # to `dispatcher`, so the open event carries that agent name. A failed open is
@@ -34,6 +36,7 @@ order = [n.lower() for n in json.loads(sys.argv[3])]
 names = [a["agent"] for a in team]
 rank = {n.lower(): (order.index(n.lower()) if n.lower() in order else len(order)) for n in names}
 free = sorted((a["agent"] for a in team if a.get("free")), key=lambda n: rank[n.lower()])
+inactive = {a["agent"].lower() for a in team if a.get("inactive") is True}
 taken = set()
 for it in ready:
     want = [w.lower() for w in it.get("agents", [])]
@@ -43,7 +46,8 @@ for it in ready:
         continue
     pick = next((n for n in free if n in elig and n not in taken), None)
     if pick is None:
-        print("SKIP\t%s\tno free eligible agent" % it["item"])
+        off = ", ".join("%s is inactive" % n for n in elig if n.lower() in inactive)
+        print("SKIP\t%s\tno free eligible agent%s" % (it["item"], " (%s)" % off if off else ""))
         continue
     taken.add(pick)
     print("ASSIGN\t%s\t%s" % (it["item"], pick))

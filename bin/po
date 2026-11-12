@@ -8,11 +8,15 @@
 #   stamp           run the gate here and write the evidence block gate-<n>.txt
 #   fresh <version> is the item branch based at main's tip? (read-only)
 #   open, close     the founding and closing boundaries; plan only without --commit
+#   land <version> [--dry-run]  rebase, stamp, close (changelog in the admin
+#                   commit), push: a finished item the whole way, once its SPEC
+#                   MET is recorded (land record); --dry-run plans and runs nothing
 #   kickoff <version> the mechanical half of an item's founding brief (read-only)
 #   report [--note <text>]... the item report: files, the fresh stamp, PROPOSED notes
 #   events [--all] [--json] [--archived] | --trend [--days <n>] [--json] | --archive-now
 #                           the gate event log, newest first (read-only except --archive-now)
 #   team [--json]   the Team-view feed: roster, state, owned items, free (read-only)
+#   team off|on <agent> [--commit]   the agent switch file ([team] inactive_file)
 #   dispatch --plan|--commit  give the ready items to the free eligible agents
 #   lint-founding   do the backlog, the specs and the ready file hold together? (read-only)
 #   serve [--bind <addr>] [--port <n>] read-only HTTP viewer of the gate events
@@ -21,7 +25,8 @@
 #   doctor          does every adopter's manifest still work? (read-only)
 #
 # The manifest defaults to po.toml at the root of the repository's main
-# worktree. po never pushes.
+# worktree. po itself never pushes: po land runs the [land] push command the
+# project names, nothing else.
 set -euo pipefail
 
 PO_LIB="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/po" && pwd)"
@@ -47,6 +52,8 @@ PO_LIB="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/po" && pwd)
 . "$PO_LIB/open.sh"
 # shellcheck source=close.sh
 . "$PO_LIB/close.sh"
+# shellcheck source=land.sh
+. "$PO_LIB/land.sh"
 # shellcheck source=kickoff.sh
 . "$PO_LIB/kickoff.sh"
 # shellcheck source=report.sh
@@ -83,10 +90,12 @@ commands:
                     when a DOING item has been idle longer
   prune [--commit]  worktrees and branches merged into main; without
                     --commit, prints the plan and changes nothing
-  stamp [--bin <path>]
+  stamp [--bin <path>] [--tier fast|full]
                     run the manifest's gate in the current worktree; on a
                     full pass write the evidence block to gate-<n>.txt at
-                    its root and print it
+                    its root and print it; --tier fast runs only the tests
+                    whose "# covers:" lines name a changed file, plus the
+                    [stamp.fast] always set (default [stamp] tier, else full)
   fresh <version>   every main commit since the item branch's base, admin
                     and law-changing ones called out; REBASE REQUIRED when
                     the branch is behind main (read-only, never fetches)
@@ -104,6 +113,36 @@ commands:
                     --commit, prints the plan; a [close] checklist from
                     po.toml is printed (--run-checklist: run), then a
                     [hooks] on_close command runs
+  land <version> [--dry-run]
+                    a finished item the whole way, judging nothing: refused
+                    (6) unless its SPEC MET is recorded (below), every backlog
+                    source says DOING, its worktree is clean, its branch is one
+                    item commit (or none) and the newest gate-<n>.txt names
+                    that tip clean and passing; then rebase onto main when
+                    behind (a conflict is aborted, the worktree left as the
+                    dev had it, exit 5), po stamp (a failure is exit 4, the
+                    worktree left at the rebased tip, the old tip printed),
+                    po close --commit with a body built from the stamp, the
+                    record and the REPORT (its Memory: line, else "nothing
+                    new learned"; --changelog-file when the record holds a
+                    block), then the [land] push command (sh -c in the main
+                    worktree; a failure is exit 7, the boundary stands; no
+                    key: no push). stdout is one line "land: <OUTCOME> ...";
+                    --dry-run prints each check as ok / would refuse and the
+                    steps as a plan, runs no gate, writes nothing, exit 0
+  land record <version> --spec-met --by <name> [--ref <id>]
+       [--report-file <f>] [--changelog-file <f>]
+                    record the item's SPEC MET (by whom, when, the message
+                    id) with its REPORT and changelog block under
+                    <git common dir>/po-land/<version>/, never in the
+                    worktree; a DOING item only (6); a new record replaces
+                    the old one
+  close <version> ... [--changelog-file <f>]
+                    (v0.181) the file's text as one more edit of the close's
+                    admin commit, inserted into [close] changelog under the
+                    [close] changelog_heading line (default "## Unreleased");
+                    refused (6) without the key or when the changelog already
+                    has the block's first line
   kickoff <version> the item's spec section verbatim, the standing-rules
                     pointer, and every admin/ruling commit on main from the
                     previous boundary to its founding (read-only); a
@@ -148,7 +187,13 @@ commands:
                     <time> from the agent's newest event), now, owns (open
                     items the backlog owner column gives it), free, and
                     limit_until / usage merged from the [team] limits_file
-                    and usage_file when present (read-only)
+                    and usage_file when present (read-only); an agent named
+                    in the [team] inactive_file is "inactive": true, never
+                    free, OFF in the table's FREE column
+  team off|on <agent> [--commit]
+                    switch an agent off (append it to the [team]
+                    inactive_file) or on (remove its line), in place, every
+                    other byte kept; without --commit prints the plan only
   release <N> --setup | --write
                     the Setup after install block of CHANGELOG.md's release N
                     entry (else Unreleased) from the recorded steps of the
@@ -191,12 +236,14 @@ exit: 0 ok, 1 usage, 2 manifest/backlog/repository error, or a source
         the [layout] owner_column cell,
       4 stamp: a gate leg or the test count failed; nothing written,
         report: no stamp, or a stale one; nothing printed,
-      5 fresh (and close): REBASE REQUIRED,
+      5 fresh (and close): REBASE REQUIRED; land: the rebase conflicted
+        (aborted, the worktree as the dev left it),
       6 open/close: refused by the item law (numbering, branch shape,
         stamp evidence, status, a taken ref or path, main not writable,
         no "Setup after install" section under [close] require_setup),
       7 close: the [hooks] on_close command failed, or the setup steps
-        could not be recorded (the boundary stands),
+        could not be recorded (the boundary stands); land: the [land] push
+        command failed (the close stands),
       8 status --idle: a DOING item idle longer than the limit (the report
         is printed in full; exit 3 outranks 8)
 EOF
@@ -260,6 +307,7 @@ main() {
 	fresh) po_cmd_fresh "$@" ;;
 	open) po_cmd_open "$@" ;;
 	close) po_cmd_close "$@" ;;
+	land) po_cmd_land "$@" ;;
 	kickoff) po_cmd_kickoff "$@" ;;
 	report) po_cmd_report "$@" ;;
 	ready) po_cmd_ready "$@" ;;

@@ -282,6 +282,7 @@
   // null. None while it works or owns nothing, and none at its usage limit (its LIMIT line is the cause). The FREE
   // flag says its items wait on someone else; otherwise it owns them and is on none.
   function team_warning(agent, now) {
+    if (teamOff(agent)) return null;  // v0.173: switched off is the reason, said by its OFF badge
     if (typeof agent.state === "string" && /^working\b/i.test(agent.state.trim())) return null;
     var owns = Array.isArray(agent.owns) ? agent.owns : [];
     if (owns.length === 0) return null;
@@ -395,6 +396,25 @@
       answer_id: answerId,
       kind: PROJECT_ACTIVE,
       project: str(project),
+      active: active === true,
+      answered_at: now.toISOString().replace(/\.\d{3}Z$/, "Z"),
+      client: CLIENT
+    };
+  }
+
+  // ---- the agent switch (v0.173): an agent named in the switch file is `inactive: true` in the team feed --------
+
+  var AGENT_ACTIVE = "agent-active";
+
+  // teamOff(agent): the agent is switched off (the feed's `inactive` is exactly true).
+  function teamOff(agent) { return !!agent && agent.inactive === true; }
+
+  // agentActiveBody(agent, active, answerId, now): the body that switches an agent on or off.
+  function agentActiveBody(agent, active, answerId, now) {
+    return {
+      answer_id: answerId,
+      kind: AGENT_ACTIVE,
+      agent: str(agent),
       active: active === true,
       answered_at: now.toISOString().replace(/\.\d{3}Z$/, "Z"),
       client: CLIENT
@@ -753,6 +773,7 @@
     MAX_TEXT: MAX_TEXT, decisionShape: decisionShape, cardRuleProblems: cardRuleProblems, isLook: isLook, lookReady: lookReady, holdLooks: holdLooks,
     installedFor: installedFor, newAnswerId: newAnswerId, answerReady: answerReady, answerParams: answerParams,
     answerBody: answerBody, answerRequest: answerRequest, answerResult: answerResult,
+    teamOff: teamOff, agentActiveBody: agentActiveBody,
     projectActiveBody: projectActiveBody, switchShown: switchShown, switchSettled: switchSettled, switchResult: switchResult,
     SWITCH_HOLD_MS: SWITCH_HOLD_MS,
     unreleasedDone: unreleasedDone, releaseView: releaseView, releaseBody: releaseBody, releaseReady: releaseReady,

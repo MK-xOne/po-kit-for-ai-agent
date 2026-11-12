@@ -113,13 +113,15 @@ po_event_agent() {
 # po_event_log <kind> <item|-> <result> <legs-json> <detail> [<log|->]:
 # append one event; with a sixth argument it has a "log" key, null for -.
 # A non-empty PO_EVENT_SECONDS adds the run's "seconds" key after legs, then
-# a non-empty PO_EVENT_TESTS "tests" and PO_EVENT_LOAD1 "load1".
+# a non-empty PO_EVENT_TESTS "tests", PO_EVENT_TIER "tier" (fast; a full
+# stamp's event has none) and PO_EVENT_LOAD1 "load1".
 # Never fails; a write that fails warns.
-PO_EVENT_SECONDS='' PO_EVENT_TESTS='' PO_EVENT_LOAD1=''
+PO_EVENT_SECONDS='' PO_EVENT_TESTS='' PO_EVENT_LOAD1='' PO_EVENT_TIER=''
 po_event_log() {
 	local kind=$1 item=$2 result=$3 legs=$4 detail=$5 file project line itemj=null logj='' secj=''
 	[[ -z $PO_EVENT_SECONDS ]] || secj=',"seconds":'$PO_EVENT_SECONDS
 	[[ -z $PO_EVENT_TESTS ]] || secj+=',"tests":'$PO_EVENT_TESTS
+	[[ -z $PO_EVENT_TIER ]] || secj+=',"tier":"'$PO_EVENT_TIER'"'
 	[[ -z $PO_EVENT_LOAD1 ]] || secj+=',"load1":'$PO_EVENT_LOAD1
 	[[ $item == - ]] || itemj=$(po_json_str "$item")
 	if (($# >= 6)); then
@@ -195,14 +197,15 @@ po_event_secs() {
 }
 
 # po_event_took <line>: the run's time for the events table: its seconds, and
-# the word slow after it when that is over [stamp] slow_after; - when the
-# event has none.
+# the word slow after it when that is over [stamp] slow_after, then fast for a
+# fast stamp (v0.182); - when the event has none.
 po_event_took() {
-	local re='"legs":\[.*\],"seconds":([0-9]+),"(tests|load1|detail)"' s
+	local re='"legs":\[.*\],"seconds":([0-9]+),"(tests|tier|load1|detail)"' s
 	[[ $1 =~ $re ]] || { printf -- '-'; return 0; }
 	s=$((10#${BASH_REMATCH[1]}))
 	po_event_secs "$s"
 	((s <= 10#${PO_MANIFEST[stamp.slow_after]:-300})) || printf ' slow'
+	[[ $1 != *',"tier":"fast",'* ]] || printf ' fast'
 }
 
 # po_event_legs <line>: "name:result name:result" from the legs array; a leg
@@ -327,6 +330,7 @@ po_events_trend_raw() {
 		seen[$0]++ { next }
 		!/^\{"time":"[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z","kind":"stamp",/ { next }
 		index($0, ",\"result\":\"pass\",\"agent\":") == 0 { next }
+		index($0, ",\"tier\":\"fast\",") { next }
 		{
 			t = "-"; l = "-"; s = "-"
 			if (match($0, /[0-9],"tests":[0-9]+[,}]/)) t = val()

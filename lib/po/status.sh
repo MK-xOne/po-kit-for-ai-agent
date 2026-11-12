@@ -37,9 +37,15 @@ po_fmt_idle() {
 
 # po_item_lines <version> [idle]: the branch and worktree lines for one
 # item. With a second argument, the branch line ends in the idle time and
-# PO_IDLE_SECS is set to it ("" when the item has no worktree).
+# PO_IDLE_SECS is set to it ("" when the item has no worktree). A branch
+# behind main by one commit or more carries "  needs rebase" after its
+# behind count (v0.181: the mark a dev's eye catches before po stamp; po land
+# rebases anyway, the mark saves the second stamp) and sets
+# PO_NEEDS_REBASE=true. The idle time stays last: the host's status parsers
+# read the line's tail.
 po_item_lines() {
-	local version=$1 main branch ab i found=-1 idle='' suffix=''
+	local version=$1 main branch ab i found=-1 idle='' suffix='' mark=''
+	PO_NEEDS_REBASE=false
 	main=$(po_get layout.main)
 	branch=$(po_fill "$(po_get layout.branch)" "$version")
 	for i in "${!PO_WT_PATH[@]}"; do
@@ -56,8 +62,9 @@ po_item_lines() {
 	PO_IDLE_SECS=$idle
 	if git show-ref --verify --quiet "refs/heads/$branch"; then
 		ab=$(po_ahead_behind "$branch" "$main")
-		printf '          branch %s  %s  ahead %s  behind %s%s\n' \
-			"$branch" "$(po_short "$branch")" "${ab% *}" "${ab#* }" "$suffix"
+		[[ ${ab#* } == 0 ]] || mark='  needs rebase' PO_NEEDS_REBASE=true
+		printf '          branch %s  %s  ahead %s  behind %s%s%s\n' \
+			"$branch" "$(po_short "$branch")" "${ab% *}" "${ab#* }" "$mark" "$suffix"
 	else
 		printf '          branch %s  (none)%s\n' "$branch" "$suffix"
 	fi
@@ -107,9 +114,10 @@ po_split_tabs() {
 	PO_F+=("$rest")
 }
 
-# po_status_json: the DOING items as JSON, `[{"item":"0.9","idle_hours":3}]`;
-# idle_hours is the whole hours of the same idle time the report shows, null
-# when the item has no worktree.
+# po_status_json: the DOING items as JSON, `[{"item":"0.9","idle_hours":3,
+# "needs_rebase":false}]`; idle_hours is the whole hours of the same idle
+# time the report shows, null when the item has no worktree; needs_rebase
+# is true when the branch is behind main (v0.181).
 po_status_json() {
 	local rec v h sep='' out='['
 	while IFS= read -r rec; do
@@ -120,7 +128,7 @@ po_status_json() {
 		po_item_lines "$v" idle >/dev/null
 		h=null
 		[[ -z $PO_IDLE_SECS ]] || h=$((PO_IDLE_SECS / 3600))
-		out+="$sep{\"item\":$(po_json_str "$v"),\"idle_hours\":$h}"
+		out+="$sep{\"item\":$(po_json_str "$v"),\"idle_hours\":$h,\"needs_rebase\":$PO_NEEDS_REBASE}"
 		sep=,
 	done < <(po_open_items)
 	printf '%s]\n' "$out"

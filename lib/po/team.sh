@@ -14,6 +14,16 @@
 #     agent owns one and its newest event is under 15 minutes old;
 #   - `free`: not WORKING, and owning nothing, or idle 15 minutes or more with
 #     every owned item held (PAUSED or BLOCKED, i.e. waiting on someone else).
+#   - `inactive`: true for an agent named in the [team] inactive_file (the
+#     agent switch file: one name per line, `#` comments, names matched without
+#     case; a missing file names nobody); such an agent is never `free` and the
+#     table says OFF in the FREE column. Its state and items are left as they are.
+#
+#   po team off|on <agent> [--commit]
+#
+# switches an agent off (its name appended to the inactive_file) or on (its
+# line removed), in place; team_switch.py keeps every other byte. Without
+# --commit it prints what it would do and writes nothing.
 # Rate limits and usage are the host's facts, not probed here: the optional
 # files named by [team] limits_file and usage_file are merged when present
 # (see team_files.py for their shape); a missing file is ignored.
@@ -31,8 +41,59 @@ po_team_idle() {
 	fi
 }
 
+# po_team_inactive: the lower-cased names the [team] inactive_file lists, one per line.
+po_team_inactive() {
+	local f=${PO_MANIFEST[team.inactive_file]:-} line
+	[[ -n $f && -f $f ]] || return 0
+	while IFS= read -r line || [[ -n $line ]]; do
+		po_trim_into "$line" line
+		[[ -z $line || $line == '#'* ]] || printf '%s\n' "${line,,}"
+	done <"$f"
+}
+
+# po_team_switch off|on <args>: po team off|on <agent> [--commit].
+po_team_switch() {
+	local mode=$1 agent='' commit=0 i name=''
+	shift
+	while (($# > 0)); do
+		case $1 in
+		--commit) commit=1 ;;
+		-*) po_usage_die "team: unknown argument '$1'" ;;
+		*)
+			[[ -z $agent ]] || po_usage_die "team: unknown argument '$1'"
+			agent=$1
+			;;
+		esac
+		shift
+	done
+	[[ -n $agent ]] || po_usage_die "team $mode: give an agent name"
+	for i in "${!PO_TEAM_NAME[@]}"; do
+		[[ ${PO_TEAM_NAME[i],,} == "${agent,,}" ]] && name=${PO_TEAM_NAME[i]}
+	done
+	[[ -n $name ]] || po_die "team $mode: '$agent' is not an agent of the [[team.agent]] roster in $PO_MANIFEST_FILE"
+	local f=${PO_MANIFEST[team.inactive_file]:-}
+	[[ -n $f ]] || po_die "team $mode: no [team] inactive_file in $PO_MANIFEST_FILE"
+	local word=inactive
+	[[ $mode == off ]] || word=active
+	if ((!commit)); then
+		printf 'po team: PLAN — would switch %s %s in %s; nothing changes without --commit\n' "$name" "$mode" "$f"
+		return 0
+	fi
+	command -v python3 >/dev/null 2>&1 || po_die "team $mode: writing $f needs python3"
+	local res
+	res=$(python3 -I "$PO_LIB/team_switch.py" "$f" "$mode" "$name") || po_die "team $mode: could not write $f"
+	printf '%s is %s %s\n' "$name" "$res" "$word"
+}
+
 po_cmd_team() {
 	local json=0
+	case ${1:-} in
+	off | on)
+		((${#PO_TEAM_NAME[@]} > 0)) || po_die "no [[team.agent]] in $PO_MANIFEST_FILE: the roster is empty"
+		po_team_switch "$@"
+		return
+		;;
+	esac
 	while (($# > 0)); do
 		case $1 in
 		--json) json=1 ;;
@@ -84,7 +145,10 @@ po_cmd_team() {
 		done < <(python3 -I "$PO_LIB/team_files.py" "$fl" "$fu")
 	fi
 
-	local now_s i name key age state nowitem free entry list items=() rows=()
+	local -A off=()
+	while IFS= read -r a; do off[$a]=1; done < <(po_team_inactive)
+
+	local now_s i name key age state nowitem free freecol entry list items=() rows=()
 	now_s=$(date +%s)
 	for i in "${!PO_TEAM_NAME[@]}"; do
 		name=${PO_TEAM_NAME[i]} key=${PO_TEAM_NAME[i],,}
@@ -100,6 +164,8 @@ po_cmd_team() {
 		elif [[ -z ${owns[$key]:-} ]] || { [[ -z ${doing[$key]:-} ]] && ((age < 0 || age >= PO_TEAM_ACTIVE_SECS)); }; then
 			free=true
 		fi
+		freecol=$free
+		[[ -z ${off[$key]:-} ]] || free=false freecol=OFF
 		list=''
 		for v in ${owns[$key]:-}; do list+="${list:+,}$(po_json_str "$v")"; done
 		entry='{"agent":'$(po_json_str "$name")
@@ -107,10 +173,11 @@ po_cmd_team() {
 		entry+=',"state":'$(po_json_str "$state")
 		if [[ -n $nowitem ]]; then entry+=',"now":'$(po_json_str "$nowitem"); else entry+=',"now":null'; fi
 		entry+=',"owns":['$list'],"free":'$free
+		[[ -z ${off[$key]:-} ]] || entry+=',"inactive":true'
 		[[ -z ${lim[$key]:-} ]] || entry+=',"limit_until":'${lim[$key]}
 		[[ -z ${use[$key]:-} ]] || entry+=',"usage":'${use[$key]}
 		items+=("$entry}")
-		rows+=("$name"$'\t'"$state"$'\t'"${nowitem:--}"$'\t'"${owns[$key]:--}"$'\t'"$free"$'\t'"${lim[$key]:--}"$'\t'"${use[$key]:--}")
+		rows+=("$name"$'\t'"$state"$'\t'"${nowitem:--}"$'\t'"${owns[$key]:--}"$'\t'"$freecol"$'\t'"${lim[$key]:--}"$'\t'"${use[$key]:--}")
 	done
 
 	if ((json)); then

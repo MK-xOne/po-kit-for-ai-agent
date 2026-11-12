@@ -9,6 +9,7 @@
 #     values are shell commands, kept in file order
 #   - one more sub-table, `[serve.web]`, with the fixed string keys of the
 #     web view's feed URLs (see PO_SCHEMA)
+#   - and `[stamp.fast]`, the fast tier of po stamp (see stamp.sh)
 #   - `key = "basic string"` or `key = 123`, optionally followed by a
 #     `# comment`; the only escapes are \" and \\
 #   - `[[team.agent]]`, repeatable: one roster entry each, with the string keys
@@ -49,10 +50,17 @@ declare -gA PO_SCHEMA=(
 	[close.checklist]=0
 	[close.require_setup]=0
 	[close.memory]=0
+	[close.changelog]=0
+	[close.changelog_heading]=0
+	[land.push]=0
 	[stamp.prepare]=0
 	[stamp.slow_after]=0
 	[stamp.test_files]=0
 	[stamp.test_def]=0
+	[stamp.tier]=0
+	[stamp.fast.command]=0
+	[stamp.fast.always]=0
+	[stamp.fast.ignore]=0
 	[events.live_days]=0
 	[release.source]=0
 	[release.pattern]=0
@@ -60,6 +68,7 @@ declare -gA PO_SCHEMA=(
 	[project.name]=0
 	[team.limits_file]=0
 	[team.usage_file]=0
+	[team.inactive_file]=0
 	[ready.file]=0
 	[dispatch.order]=0
 	[dispatch.notify]=0
@@ -77,6 +86,8 @@ declare -gA PO_ARRAYS=(
 	[close.checklist]=1
 	[stamp.prepare]=1
 	[stamp.test_files]=1
+	[stamp.fast.always]=1
+	[stamp.fast.ignore]=1
 	[dispatch.order]=1
 )
 
@@ -97,6 +108,7 @@ declare -gA PO_DEFAULTS=(
 	[events.live_days]=10
 	[release.source]=none
 	[release.pattern]=release-*
+	[close.changelog_heading]='## Unreleased'
 )
 
 # The parsed manifest: section.key -> value.
@@ -137,7 +149,7 @@ po_manifest_load() {
 			PO_TEAM_NAME+=("") PO_TEAM_MODEL+=("") PO_TEAM_ROLE+=("")
 			continue
 		fi
-		if [[ $line =~ ^\[([a-z0-9_]+|gate\.legs|serve\.web)\]$ ]]; then
+		if [[ $line =~ ^\[([a-z0-9_]+|gate\.legs|serve\.web|stamp\.fast)\]$ ]]; then
 			in_agent=0
 			section=${BASH_REMATCH[1]}
 			[[ -n ${seen_sections[$section]:-} ]] &&
@@ -204,6 +216,12 @@ po_manifest_load() {
 		po_die "$file: [hooks] on_close needs a non-empty \"command\""
 	[[ -z ${PO_MANIFEST[layout.owner_column]+x} || -n ${PO_MANIFEST[layout.owner_column]} ]] ||
 		po_die "$file: [layout] owner_column needs a non-empty \"column name\""
+	[[ -z ${PO_MANIFEST[close.changelog]+x} || -n ${PO_MANIFEST[close.changelog]} ]] ||
+		po_die "$file: [close] changelog needs a non-empty \"path\""
+	[[ -z ${PO_MANIFEST[close.changelog_heading]+x} || ${PO_MANIFEST[close.changelog_heading]} == '## '?* ]] ||
+		po_die "$file: [close] changelog_heading must be a \"## heading\" line: ${PO_MANIFEST[close.changelog_heading]}"
+	[[ -z ${PO_MANIFEST[land.push]+x} || -n ${PO_MANIFEST[land.push]} ]] ||
+		po_die "$file: [land] push needs a non-empty \"command\" (or no [land] section: then po land does not push)"
 	[[ -z ${PO_MANIFEST[serve.web.stall_minutes]+x} || ${PO_MANIFEST[serve.web.stall_minutes]} =~ ^[0-9]+$ ]] ||
 		po_die "$file: [serve.web] stall_minutes must be an integer (minutes): ${PO_MANIFEST[serve.web.stall_minutes]}"
 	[[ -z ${PO_MANIFEST[stamp.slow_after]+x} || ${PO_MANIFEST[stamp.slow_after]} =~ ^[0-9]+$ ]] ||
@@ -219,6 +237,12 @@ po_manifest_load() {
 		((rc != 2)) ||
 			po_die "$file: [stamp] test_def is not a valid extended regular expression: ${PO_MANIFEST[stamp.test_def]}"
 	fi
+	[[ -z ${PO_MANIFEST[stamp.tier]+x} || ${PO_MANIFEST[stamp.tier]} == fast || ${PO_MANIFEST[stamp.tier]} == full ]] ||
+		po_die "$file: [stamp] tier must be \"fast\" or \"full\": ${PO_MANIFEST[stamp.tier]}"
+	[[ -z ${PO_MANIFEST[stamp.fast.command]+x} || ${PO_MANIFEST[stamp.fast.command]} == *'{selected}'* ]] ||
+		po_die "$file: [stamp.fast] command must contain {selected} (where the selected test files go): ${PO_MANIFEST[stamp.fast.command]}"
+	[[ ${PO_MANIFEST[stamp.tier]:-full} == full || -n ${PO_MANIFEST[stamp.fast.command]+x} ]] ||
+		po_die "$file: [stamp] tier = \"fast\": [stamp.fast] command is needed for the fast tier"
 	[[ -z ${PO_MANIFEST[events.live_days]+x} || ${PO_MANIFEST[events.live_days]} =~ ^[0-9]+$ ]] ||
 		po_die "$file: [events] live_days must be an integer (days): ${PO_MANIFEST[events.live_days]}"
 	[[ -z ${PO_MANIFEST[versioning.tag_style]+x} || ${PO_MANIFEST[versioning.tag_style]} == light || ${PO_MANIFEST[versioning.tag_style]} == annotated ]] ||
@@ -379,12 +403,18 @@ po_fill() {
 # po_unfill <template> <text>: the version <text> was filled from, if
 # <text> has the template's shape; non-zero otherwise.
 po_unfill() {
-	local template=$1 text=$2 prefix suffix version
-	prefix=${template%%\{version\}*}
-	suffix=${template#*\{version\}}
-	[[ $text == "$prefix"* && $text == *"$suffix" ]] || return 1
-	version=${text#"$prefix"}
-	version=${version%"$suffix"}
-	[[ $version =~ ^[0-9]+(\.[0-9]+)+$ ]] || return 1
-	printf '%s' "$version"
+	local _pu_v
+	po_unfill_into "$1" "$2" _pu_v || return 1
+	printf '%s' "$_pu_v"
+}
+
+# po_unfill_into <template> <text> <var>: po_unfill without a subshell; sets
+# <var> to the version and returns 0, or returns non-zero leaving <var> as it was.
+po_unfill_into() {
+	local _pu_p=${1%%\{version\}*} _pu_s=${1#*\{version\}} _pu_t=$2
+	[[ $_pu_t == "$_pu_p"* && $_pu_t == *"$_pu_s" ]] || return 1
+	_pu_t=${_pu_t#"$_pu_p"}
+	_pu_t=${_pu_t%"$_pu_s"}
+	[[ $_pu_t =~ ^[0-9]+(\.[0-9]+)+$ ]] || return 1
+	printf -v "$3" '%s' "$_pu_t"
 }

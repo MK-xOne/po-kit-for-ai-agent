@@ -554,4 +554,19 @@ check("web: v0.140 the Release button is a 44 px target", /\.release \{[^}]*min-
   const desktop = JSON.parse(require("child_process").execFileSync("python3", ["-B", "-c", py, path.join(__dirname, "..", "lib", "po"), JSON.stringify(all)]).toString());
   check("web: v0.159 cardRuleProblems gives the desktop's list, same words and order, for every case", eq(all.map((d) => C.cardRuleProblems(d)), desktop), JSON.stringify([all.map((d) => C.cardRuleProblems(d)), desktop]));
 }
+
+// v0.173: the agent switch in the Team view
+const offA = { agent: "bo", state: "idle 3h", now: null, owns: [], free: false, inactive: true };
+check("web: v0.173 teamOff is true only for inactive: true", C.teamOff(offA) === true && C.teamOff(Object.assign({}, offA, { inactive: false })) === false &&
+  C.teamOff({ agent: "x", state: "idle" }) === false && C.teamOff(Object.assign({}, offA, { inactive: "yes" })) === false);
+const abBody = C.agentActiveBody("bo", false, "0b7e3c1a-5d2f-4a8e-9c61-3f0d2b8a7e41", new Date(Date.UTC(2026, 10, 4, 2, 0, 0)));
+check("web: v0.173 agentActiveBody is the desktop viewer's body",
+  eq(abBody, { answer_id: "0b7e3c1a-5d2f-4a8e-9c61-3f0d2b8a7e41", kind: "agent-active", agent: "bo", active: false, answered_at: "2026-11-04T02:00:00Z", client: "po-dashboard" }), JSON.stringify(abBody));
+const pyAb = JSON.parse(execFileSync("python3", ["-I", "-c",
+  "import sys, json; sys.path.insert(0, sys.argv[1]); import dashboard_core as c; print(json.dumps(sorted(c.agent_active_body('bo', False, 'x'))))",
+  path.join(__dirname, "..", "lib", "po")]).toString());
+check("web: v0.173 the web agent body has the same fields as the desktop viewer's agent_active_body", eq(pyAb, Object.keys(abBody).sort()), JSON.stringify(pyAb));
+check("web: v0.173 an inactive agent raises no idle warning (OFF is the reason)", C.team_warning(Object.assign({}, offA, { owns: ["1.4"] }), NOW) === null);
+const webCss = fs.readFileSync(path.join(dir, "style.css"), "utf8");
+check("web: v0.173 the OFF badge and the muted OFF card have rules", /\.card\.off\b/.test(webCss) && /\.badge\.off\b|\.off-badge\b/.test(webCss));
 console.log("BLOCK-END web-core");

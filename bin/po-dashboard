@@ -7,9 +7,12 @@ The URL is the events JSON (a JSON array or one object per line, e.g. the
 /events.json of `po serve`); --url or PO_DASHBOARD_URL, no default. GTK 4 and
 PyGObject (pacman -S gtk4 python-gobject); the logic is lib/po/dashboard_core.py.
 --team-url or PO_DASHBOARD_TEAM_URL (no default) adds a Team view, a header toggle Events | Team, reading a
-JSON array of {agent, model?, state, now, owns[], free, limit_until?, usage?}; without it there is no toggle. Drag a Team line
+JSON array of {agent, model?, state, now, owns[], free, inactive?, limit_until?, usage?}; without it there is no toggle. Drag a Team line
 (or Alt+Up/Down on a focused one) to reorder; the order is saved in $XDG_CONFIG_HOME/po-dashboard/team-order.json
-(default ~/.config; PO_DASHBOARD_TEAM_ORDER names another file).
+(default ~/.config; PO_DASHBOARD_TEAM_ORDER names another file). An entry with `inactive: true` (v0.173, the agent
+switched off) shows a muted line with an `OFF` badge in place of its FREE or idle status; with --answer-url each line
+ends in an on/off switch that POSTs {answer_id, kind: "agent-active", agent, active, answered_at, client} on the
+answer path (same URL, token and refusals as the project switch); without it there is no switch and OFF still shows.
 --decisions-url or PO_DASHBOARD_DECISIONS_URL (no default) adds a Decisions view to the toggle, read-only:
 a JSON array of {project, item, title, waiting_for, asked_at, thread_url?, asked_by?, kind?, id?, ...}: Choices first, then
 Actions, then unformatted and legacy entries, oldest asked first in each group; an Actions toggle (saved in $XDG_CONFIG_HOME/po-dashboard/decisions.json)
@@ -315,6 +318,7 @@ def main():
 
             self.reports_on = a.view == "reports"  # the Reports pane replaces the Events list; kept across refreshes
             self.report_range = core.REPORT_DEFAULT
+            self.reports_redraw = core.ReportsRedraw(lambda: self.redraw_reports(), self.reports_visible)  # v0.178
             title.set_text(self.title_for("events"))
             self.reports_button = Gtk.ToggleButton(label="Reports", active=self.reports_on)
             self.reports_button.add_css_class("po-small")
@@ -388,6 +392,8 @@ def main():
             self.projects_sig = None  # what the cards show now; a refresh that changes nothing touches nothing
             self.switch_pending = {}  # project -> (active, sent at): a switch the (cached) feed does not show yet (v0.139)
             self.switch_note = {}  # project -> why the last switch did not go through ("" when it did)
+            self.agent_pending = {}  # agent -> (active, sent at): an agent switch the feed does not show yet (v0.173)
+            self.agent_note = {}  # agent -> why the last agent switch did not go through ("" when it did)
             self.release_note = {}  # project -> the last Release request's result (v0.140)
             self.pstate = core.project_view_state(a.project)  # open project (None = overview) and per-project filter
             self.pscreen_sig = None
@@ -438,6 +444,7 @@ def main():
             GLib.timeout_add(500, self.fade_tick)
             if not getattr(a, "no_memory_log", False):
                 GLib.timeout_add_seconds(60, self.log_memory)
+            GLib.timeout_add_seconds(core.REPORTS_TICK_SECONDS, self.reports_redraw.tick)
 
         # -- style --
         def dark(self):
@@ -637,25 +644,6 @@ def main():
             self.redraw_projects()
             return True  # the redraw sets the shown state
 
-        @staticmethod
-        def over_switch(line, sw, x, y):
-            """Whether (x, y) of the switch's line falls on the switch itself."""
-            hit = line.pick(x, y, Gtk.PickFlags.DEFAULT)
-            while hit is not None and hit is not line:
-                if hit is sw:
-                    return True
-                hit = hit.get_parent()
-            return False
-
-        def on_switch_line_press(self, g, _n, x, y, line, sw):
-            if not self.over_switch(line, sw, x, y):  # the switch handles its own clicks
-                g.set_state(Gtk.EventSequenceState.CLAIMED)
-
-        def on_switch_line(self, _g, _n, x, y, line, sw):
-            """A click on the switch's line beside the switch flips it."""
-            if not self.over_switch(line, sw, x, y) and sw.get_sensitive():
-                sw.set_active(not sw.get_active())
-
         def _send_switch(self, name, body):
             note = core.post_switch(self.answer_url, body, self.answer_token)
             GLib.idle_add(self.on_switch_done, name, note)
@@ -820,11 +808,13 @@ def main():
                 top.append(self.release_widget(c["release"]))
                 card.append(top)
                 if shown is not None:
-                    # the whole line (switch, its word, the reason) is the click target, at least 44 px tall (P1.10)
+                    # only the switch flips (v0.179): the line is 44 px tall and so is the switch's touch area, but a click
+                    # on the word, the reason or the empty part opens the project like a click on the card
                     line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
                     line.add_css_class("po-switch-line")
                     line.set_size_request(core.SWITCH_TARGET_PX, core.SWITCH_TARGET_PX)
                     sw = Gtk.Switch(active=shown, valign=Gtk.Align.CENTER)
+                    sw.set_size_request(-1, core.SWITCH_TARGET_PX)
                     sw.update_property([Gtk.AccessibleProperty.LABEL], ["%s active" % c["name"]])
                     why = ""
                     if not self.answer_url:
@@ -839,12 +829,6 @@ def main():
                     if why:  # said beside the switch, not only in its tooltip (P1.5)
                         line.append(self.label(why, "po-muted", wrap=True, hexpand=True,
                                                wrap_mode=Pango.WrapMode.WORD_CHAR, max_width_chars=24))
-                    if sw.get_sensitive():
-                        click = Gtk.GestureClick()
-                        # claimed (beside the switch only): flips the switch and does not also open the project
-                        click.connect("pressed", self.on_switch_line_press, line, sw)
-                        click.connect("released", self.on_switch_line, line, sw)
-                        line.add_controller(click)
                     card.append(line)
                     if note:  # its own line: a long refusal wraps inside the card instead of widening it
                         card.append(self.label(note, "po-muted" if note == "switching\u2026" else "po-warn", wrap=True,
@@ -1010,6 +994,8 @@ def main():
             self.team_error.set_visible(name == "team" and self.team_failed)
             self.decisions_error.set_visible(name == "decisions" and self.decisions_failed)
             self.projects_error.set_visible(name == "projects" and self.projects_failed)
+            if name == "events":
+                self.reports_redraw.shown()
             self.show_status()
 
         def fetch_worker(self, since):
@@ -1035,14 +1021,7 @@ def main():
             self.events_failed = False
             self.events_as_of = datetime.datetime.now(datetime.timezone.utc)  # what Reports says it is "as of"
             self.error.set_visible(False)
-            if events is None:
-                changed = False
-            elif partial:
-                events = core.merge_since(self.events, events)
-                changed = len(events) != len(self.events)
-                text = None if changed else self.last_text  # after a merge the next whole fetch always redraws
-            else:
-                changed = text != self.last_text
+            changed, events, text = core.fetch_change(self.events, self.last_text, text, events, partial)
             if changed:
                 now = time.monotonic()
                 for k in core.new_keys(self.seen, events):
@@ -1050,7 +1029,7 @@ def main():
                 self.seen, self.born = core.prune_records(self.seen, self.born, events, now)
                 self.last_text, self.events = text, events
                 self.redraw()
-            self.redraw_reports()  # the range holds more or fewer events as the clock moves
+            self.reports_redraw.fetched(changed)  # v0.178: never on a 304 or an unchanged feed; the clock moves on the minute tick
             self.show_status()
             if a.screenshot and not self.shot_done and a.view != "projects":  # the projects feed triggers its own shot
                 self.shot_done = True
@@ -1128,7 +1107,11 @@ def main():
             scroll.set_child(pane)
             return scroll
 
+        def reports_visible(self):
+            return self.view == "events" and self.reports_on
+
         def redraw_reports(self):
+            self.reports_redraw.dirty = False  # every redraw is current, whoever asked for it
             child = self.chart_box.get_first_child()
             while child is not None:
                 nxt = child.get_next_sibling()
@@ -1210,6 +1193,7 @@ def main():
             self.reports_on = button.get_active()
             self.events_stack.set_visible_child_name("reports" if self.reports_on else "list")
             self.title_label.set_text(self.title_for(self.view))
+            self.reports_redraw.shown()
             self.show_status()
 
         def on_toggle(self, button):
@@ -1363,17 +1347,24 @@ def main():
                 child = nxt
             groups = self.team_groups
             sort = self.sorts["team"]
-            rows = core.team_rows(core.sorted_team(core.apply_team_order(self.team, self.team_order), sort))
+            entries = core.sorted_team(core.apply_team_order(self.team, self.team_order), sort)
+            views = [self.agent_view(e) for e in entries]
+            # the OFF badge follows the switch, so a switch still on its way shows at once (v0.173)
+            entries = [e if shown is None or shown == (e.get("inactive") is not True) else dict(e, inactive=not shown)
+                       for e, (shown, _n) in zip(entries, views)]
+            rows = core.team_rows(entries)
             any_model = any(r["model"] for r in rows)
             self.heads["team"]["model"][0].set_visible(any_model)
             self.team_shown = [r["agent"] for r in rows]
             self.team_cards = {}
             shared = core.team_shared_usage(rows)  # one subscription: said once in the header, not on every line (v0.142)
-            for r in rows:
+            for r, (shown, note) in zip(rows, views):
                 card = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
                 card.add_css_class("po-card")
                 card.add_css_class("po-row")
                 card.add_css_class("po-team")
+                if r["kind"] == "off":
+                    card.add_css_class("po-off")  # the whole line muted, and OFF said in words (v0.173)
                 self.make_movable(card, r["agent"])
                 name = self.label(r["agent"], "po-text", width_chars=10, max_width_chars=16, ellipsize=3)
                 model = self.label(r["model"], "po-muted", max_width_chars=28, ellipsize=3)
@@ -1381,7 +1372,7 @@ def main():
                 state = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
                 if r["kind"] == "working":
                     state.append(self.label("\u25cf", "po-live"))
-                style = {"working": "po-live", "free": "po-free", "limit": "po-fail"}.get(r["kind"], "po-muted")
+                style = {"working": "po-live", "free": "po-free", "limit": "po-fail", "off": "po-off-badge"}.get(r["kind"], "po-muted")
                 state.append(self.label(r["status"], style, ellipsize=3, max_width_chars=28))
                 if r["usage"] and r["usage"] != shared:
                     state.append(self.label(r["usage"], "po-muted", ellipsize=3, max_width_chars=20))
@@ -1392,10 +1383,66 @@ def main():
                     g.add_widget(w)
                 for w in (name, model, state, now, owns) if any_model else (name, state, now, owns):
                     card.append(w)
+                if shown is not None:
+                    card.append(self.agent_switch(r["agent"], shown, note))
                 if sort is not None:
                     card.set_tooltip_text("%s: clear the column sort to reorder" % r["agent"])
                 self.team_list.append(card)
                 self.team_cards[r["agent"]] = card
+
+        def agent_view(self, entry):
+            """(shown position or None without an answer URL, note) for one Team line, dropping a settled pending switch."""
+            if not self.answer_url:
+                return None, ""  # read-only: no switch, the feed's OFF still shows
+            name, now = str(entry.get("agent") or ""), time.time()
+            feed = entry.get("inactive") is not True
+            pending = self.agent_pending.get(name)
+            if pending is not None and core.switch_settled(feed, pending, now):
+                self.agent_pending.pop(name, None)
+                if self.agent_note.get(name) == "":
+                    self.agent_note.pop(name, None)
+                pending = None
+            return core.switch_shown(feed, pending, now), self.agent_note.get(name, "")
+
+        def agent_switch(self, agent, shown, note):
+            """A Team line's on/off switch with its word (and the last refusal), the end of the line (v0.173)."""
+            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6, valign=Gtk.Align.CENTER)
+            box.set_size_request(-1, core.AGENT_SWITCH_TARGET_PX)
+            if note:
+                box.append(self.label(note, "po-muted" if note == "switching\u2026" else "po-warn", ellipsize=3, max_width_chars=28))
+            sw = Gtk.Switch(active=shown, valign=Gtk.Align.CENTER)
+            sw.set_size_request(-1, core.AGENT_SWITCH_TARGET_PX)
+            sw.update_property([Gtk.AccessibleProperty.LABEL], ["%s active" % agent])
+            sw.set_tooltip_text("%s: %s; flip to switch it %s" % (agent, "active" if shown else "switched off", "off" if shown else "on"))
+            sw.set_sensitive(note != "switching\u2026")  # one POST at a time per agent
+            sw.connect("state-set", self.on_agent_switch, agent)
+            box.append(sw)
+            box.append(self.label("on" if shown else "off", "po-muted", width_chars=3))
+            return box
+
+        def on_agent_switch(self, _sw, state, agent):
+            """A Team line's switch was flipped: POST the new state in a worker thread; the line shows it meanwhile."""
+            self.agent_pending[agent] = (state, time.time())
+            self.agent_note[agent] = "switching\u2026"
+            body = core.agent_active_body(agent, state, core.answer_id())
+            threading.Thread(target=self._send_agent_switch, args=(agent, body), daemon=True).start()
+            GLib.idle_add(self._redraw_team_once)  # not inside the switch's own signal: the redraw replaces it
+            return True
+
+        def _send_agent_switch(self, agent, body):
+            note = core.post_switch(self.answer_url, body, self.answer_token)
+            GLib.idle_add(self.on_agent_switch_done, agent, note)
+
+        def on_agent_switch_done(self, agent, note):
+            self.agent_note[agent] = note
+            if note:  # not switched: the feed's state is shown again
+                self.agent_pending.pop(agent, None)
+            self.redraw_team()
+            return False
+
+        def _redraw_team_once(self):
+            self.redraw_team()
+            return False
 
         def redraw_decisions(self):
             self.decisions_expanded = core.prune_expanded(self.decisions_expanded, self.decisions)

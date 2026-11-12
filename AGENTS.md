@@ -28,9 +28,9 @@ every backlog status; **devs** each work one item in its own worktree.
 - **Setup steps:** `po setup list` (read-only) shows the setup steps recorded at
   each close that nobody has confirmed yet. Whoever does a step confirms it:
   `po setup confirm <version> <n> --by <name>`.
-- **The PO's only:** `po open`, `po close`, `po prune`, `po dispatch` with `--commit`, and every
-  backlog status. Without `--commit` they print a plan and change nothing; a dev
-  may run them that way to check.
+- **The PO's only:** `po open`, `po close`, `po prune`, `po dispatch` with `--commit`, `po land`
+  and `po land record`, and every backlog status. Without `--commit` they print a plan and
+  change nothing (`po land --dry-run` likewise); a dev may run them that way to check.
 - **Exit codes:** 1 usage, 2 manifest or repo, 3 backlog disagreement, 4 a gate
   leg or count failed (nothing written), 5 REBASE REQUIRED, 6 refused by the
   item law, 7 the close hook failed (the boundary stands), 8 an item is idle
@@ -47,11 +47,28 @@ every backlog status; **devs** each work one item in its own worktree.
    single word `None`. Where the manifest sets `[close] require_setup = true`, the
    PO's `po close` refuses an item without it.
 2a. An item that changes or replaces a behaviour updates or deletes the tests that pinned the old behaviour, in the same commit. A new test is added beside them only for what is new. Report lists the tests changed or deleted (names) or says `none pinned the old behaviour`.
-3. `po stamp` in the worktree; on exit 4, fix and run it again.
+3. `po status` first: a `needs rebase` on your branch line means main moved,
+   so `git rebase <main>` before you stamp (a stamp of a branch behind main is re-done
+   after the rebase anyway). Then `po stamp` in the worktree; on exit 4, fix and run it again.
+3a. **Tiered gate** (where the manifest sets `[stamp] tier = "fast"`): your `po stamp` runs
+   only the test files whose `# covers:` line names a file you changed, plus the smoke set;
+   the block says `tier: fast, <n> of <m> checks`, or `tier: full (fast fell back: ...)`
+   when a changed file is covered by no test. A new test file gets its own `# covers:`
+   line (the paths it exercises) in its first 30 lines. `po land` stamps the full suite;
+   a `STAMP FAILED` from it after your fast stamp passed means a test outside your
+   `# covers:` lines broke: fix it and widen the line in the same commit. `po close` by
+   hand needs `po stamp --tier full`.
 4. Report: `po report [--note <text>]...` prints the report block (files changed,
    the newest stamp verbatim, numbered notes) from a fresh stamp; exit 4 if it
    is stale.
-5. Stop without committing until the PO says to commit; then commit and
+5. In a project whose manifest has a `[land]` section (`po land` closes items): commit
+   before you report, as the item commit (`v{version}: {title}`, one commit), `po stamp`
+   again at dirty 0, and only then REPORT; there is no commit prompt. Once the spec
+   reviewer's `SPEC MET` is recorded, `po land` rebases, stamps, closes and pushes your
+   item with nobody at the keyboard, and a conflict or a failed gate comes back to you as
+   one `FIX?`. A `Changelog:` fenced block in your REPORT is the changelog entry it lands,
+   unless your commit edits the changelog itself (never both).
+   Elsewhere: stop without committing until the PO says to commit; then commit and
    `po stamp` again at dirty 0.
 
 ## PO
@@ -59,12 +76,27 @@ every backlog status; **devs** each work one item in its own worktree.
 `po open` → the dev's brief (`po kickoff` is its mechanical half) → verify with
 `po stamp` → rulings → commit → `po close` → `po prune`. Before `po close`,
 `po fresh` must pass; when main moved, rebase the item branch and re-stamp.
-po never pushes: pushing is the PO's own step after a close. Verify also checks
+po itself never pushes: pushing is the PO's own step after a close, unless the
+manifest names a push command for `po land` (below). Verify also checks
 that no outdated test was left behind: for a changed behaviour, search the tests
 for the old name, flag, output or exit code, and send back any that still pins it
 (or passes only because it no longer checks anything).
 
-**Slow gate trigger.** Every stamp event records the seconds it took, and `po events` and the dashboard mark a run over `[stamp] slow_after` (default 300) as `slow`. When a gate goes over about 5 minutes, the PO specs a fast per-item gate and runs the full suite nightly and before each release; those tiers are not built until then.
+**`po land` (v0.181).** `po land record <v> --spec-met --by <who> [--ref <id>] [--report-file <f>]
+[--changelog-file <f>]` records the item's SPEC MET outside the worktree (in the git dir);
+`po land <v>` then does the mechanical close in one command: refuses unless the item is DOING,
+its worktree clean, its branch one item commit (or none) and the newest stamp names that tip;
+rebases onto main when behind (a conflict is aborted, the worktree left as the dev had it, exit
+5); `po stamp` (a failure is exit 4, the worktree left at the rebased tip with the old tip
+printed); `po close --commit` with a body built from the stamp, the record and the REPORT (its
+`Memory:` line, else `nothing new learned`), the changelog block as one more file of the same
+admin commit (`po close --changelog-file`, under `[close] changelog`); then the `[land] push`
+command (a failure is exit 7, the close stands; no key, no push). stdout is one line, `land:
+OK|REFUSED|CONFLICT|STAMP FAILED|CLOSE FAILED|PUSH FAILED ...`; `--dry-run` prints every check
+and step and runs nothing. It judges nothing: SPEC MET stays the reviewer's, the diff read the
+PO's (after the land), and an item that waits on a ruling is held, never landed.
+
+**Slow gate trigger.** Every stamp event records the seconds it took, and `po events` and the dashboard mark a run over `[stamp] slow_after` (default 300) as `slow`. When a gate goes over about 5 minutes, the PO adopts the tiered gate (v0.182: `[stamp] tier` and `[stamp.fast]`, a `# covers:` line per test file): item stamps run fast, `po land` and `po close` want a full stamp at the tip, and `po release <N> --write` wants a full stamp of main's tip in the main checkout (`po stamp --tier full` there first; the release commit then touches only `CHANGELOG.md`). `po events` marks a fast run `fast`; `po events --trend` counts full stamps only.
 
 ## Asking the owner
 

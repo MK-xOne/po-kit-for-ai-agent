@@ -18,6 +18,7 @@
   var results = {};          // card id -> {text, sent, sending} of the last Send
   var settingsOpen = false;
   var switches = {};         // project -> {active, at, note, sending}: the last switch flipped here (v0.139)
+  var agentSwitches = {};    // agent -> {active, at, note, sending}: the last agent switch flipped here (v0.173)
   var releases = {};         // project -> the last Release request's result here (v0.140)
 
   function el(tag, cls, text) {
@@ -548,15 +549,75 @@
     return card;
   }
 
+  // An agent's switch (v0.173): the project switch's button, one per Team card, only with a sink. The OFF badge
+  // follows it, so a switch still on its way shows at once.
+  function agentSwitchRow(name, feedActive) {
+    var nowMs = Date.now();
+    var sw = agentSwitches[name];
+    if (sw && !sw.sending && (sw.note ? nowMs - sw.at >= C.SWITCH_HOLD_MS : C.switchSettled(feedActive, sw, nowMs))) {
+      delete agentSwitches[name];
+      sw = null;
+    }
+    var shown = C.switchShown(feedActive, sw && !sw.note ? sw : null, nowMs);
+    var row = el("div", "row switch-row");
+    row.setAttribute("data-shown", shown ? "true" : "false");
+    var b = el("button", "switch");
+    b.type = "button";
+    b.setAttribute("role", "switch");
+    b.setAttribute("aria-checked", shown ? "true" : "false");
+    b.setAttribute("aria-label", name + " active");
+    b.appendChild(el("span", "knob"));
+    b.appendChild(el("span", "", shown ? "on" : "off"));
+    b.disabled = !tokenSet() || !!(sw && sw.sending);
+    b.addEventListener("click", function () { flipAgent(name, !shown); });
+    row.appendChild(b);
+    var why = !tokenSet() ? "set the device token to switch" : sw && sw.sending ? "switching\u2026" : sw && sw.note ? sw.note : "";
+    if (why) row.appendChild(el("span", sw && sw.note && !sw.sending ? "stat-bad" : "meta", why));
+    return row;
+  }
+
+  function flipAgent(name, active) {
+    var sw = agentSwitches[name] = { active: active, at: Date.now(), note: "", sending: true };
+    render();
+    var body = C.agentActiveBody(name, active, C.newAnswerId(crypto.getRandomValues(new Uint8Array(16))), new Date());
+    var req = sinkRequest(body);
+    var ctl = new AbortController();
+    var timer = setTimeout(function () { ctl.abort(); }, 25000);
+    req.init.signal = ctl.signal;
+    fetch(req.url, req.init).then(function (resp) {
+      return C.switchResult(resp.status, resp.headers.get("X-Reason"));
+    }, function (e) {
+      return C.switchResult(0, e && e.name === "AbortError" ? "timeout" : "unreachable or refused");
+    }).then(function (note) {
+      clearTimeout(timer);
+      sw.sending = false;
+      sw.note = note;
+      sw.at = Date.now();
+      render();
+    });
+  }
+
   function teamCard(a, shared) {
     var now = new Date();
-    var warning = C.team_warning(a, now);
-    var card = el("article", "card" + (warning ? " warn" : ""));
+    var name = String(a.agent || "?");
+    var switchRow = answerUrl ? agentSwitchRow(name, !C.teamOff(a)) : null;
+    var off = switchRow ? switchRow.getAttribute("data-shown") === "false" : C.teamOff(a);
+    var warning = off ? null : C.team_warning(a, now);
+    var card = el("article", "card" + (warning ? " warn" : "") + (off ? " off" : ""));
     var row = el("div", "row");
-    row.appendChild(el("strong", "", String(a.agent || "?")));
-    // a live limit replaces the feed's own state text: one line, the dashboard's one time format (v0.142)
-    var stateLine = [C.limitText(a, now) || a.state, a.now ? "on " + C.itemRef(a.now) : ""].filter(Boolean).join(" · ");
-    row.appendChild(el("div", C.isWorking(a) ? "meta state-working" : "meta", stateLine));
+    row.appendChild(el("strong", "", name));
+    // a live limit replaces the feed's own state text: one line, the dashboard's one time format (v0.142);
+    // switched off (v0.173), an OFF badge takes the state's place, a live limit still said after it
+    var stateLine = [off ? C.limitText(a, now) : C.limitText(a, now) || a.state, a.now ? "on " + C.itemRef(a.now) : ""].filter(Boolean).join(" · ");
+    if (off) {
+      var st = el("div", "meta");
+      st.appendChild(el("span", "badge off", "OFF"));
+      if (stateLine) st.appendChild(document.createTextNode(" " + stateLine));
+      row.appendChild(st);
+      stateLine = "OFF" + (stateLine ? " · " + stateLine : "");
+    } else {
+      row.appendChild(el("div", C.isWorking(a) ? "meta state-working" : "meta", stateLine));
+    }
     var split = C.split_owns(a.owns || [], a.working_on || null);
     if (split.working_on && split.working_on.length) {
       var label = "working on: " + split.working_on.map(C.itemRef).join(", ");
@@ -579,6 +640,7 @@
       warnRow.appendChild(document.createTextNode("⚠️ " + warning));
       card.appendChild(warnRow);
     }
+    if (switchRow) card.appendChild(switchRow);
     return card;
   }
 

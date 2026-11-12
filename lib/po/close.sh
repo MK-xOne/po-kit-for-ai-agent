@@ -30,19 +30,26 @@
 # install" section (setup.sh; exit 6 without it, unless the item was founded
 # before the key was on); --commit records its steps as open (exit 7, the
 # boundary standing, when they cannot be written).
+# --changelog-file <f> (v0.181): the file's text becomes one more planned edit
+# of the same admin commit, inserted into [close] changelog right under the
+# line [close] changelog_heading (default "## Unreleased"; the heading and the
+# block go before the file's first "## " heading when it is missing), one blank
+# line each side. Refused (6) without the key, when the file does not exist at
+# the tip, or when the changelog already has the block's first line verbatim.
+# Without the flag the close behaves exactly as before.
 
 po_close_usage() {
-	po_usage_die "usage: po close <version> [--next <version> [--next-title <title>] [--for <name>]] [--also-done <version>]... [--body-file <file>] [--run-checklist] [--commit]"
+	po_usage_die "usage: po close <version> [--next <version> [--next-title <title>] [--for <name>]] [--also-done <version>]... [--body-file <file>] [--changelog-file <file>] [--run-checklist] [--commit]"
 }
 
 po_cmd_close() {
-	local commit=0 runlist=0 version='' next='' next_title='' for_name='' body_file='' x
+	local commit=0 runlist=0 version='' next='' next_title='' for_name='' body_file='' changelog_file='' x
 	local -a also=()
 	while (($# > 0)); do
 		case $1 in
 		--commit) commit=1 ;;
 		--run-checklist) runlist=1 ;;
-		--next | --next-title | --also-done | --for | --body-file)
+		--next | --next-title | --also-done | --for | --body-file | --changelog-file)
 			(($# >= 2)) || po_usage_die "close: $1 needs a value"
 			case $1 in
 			--next) next=$(po_version_arg close "$2") ;;
@@ -50,6 +57,7 @@ po_cmd_close() {
 			--also-done) also+=("$(po_version_arg close "$2")") ;;
 			--for) for_name=$2 ;;
 			--body-file) body_file=$2 ;;
+			--changelog-file) changelog_file=$2 ;;
 			esac
 			shift
 			;;
@@ -69,6 +77,10 @@ po_cmd_close() {
 	((runlist == 0)) || [[ -n ${PO_MANIFEST[close.checklist]:-} ]] || po_usage_die "close: --run-checklist needs a [close] checklist in the manifest"
 	[[ -z $body_file || -f $body_file ]] || po_usage_die "close: --body-file $body_file is not a file"
 	[[ -z $body_file ]] || body_file=$(readlink -f -- "$body_file")
+	[[ -z $changelog_file || -f $changelog_file ]] || po_usage_die "close: --changelog-file $changelog_file is not a file"
+	[[ -z $changelog_file ]] || changelog_file=$(readlink -f -- "$changelog_file")
+	[[ -z $changelog_file || -n ${PO_MANIFEST[close.changelog]+x} ]] ||
+		po_refuse "--changelog-file needs [close] changelog (the changelog's path) in the manifest"
 
 	local main ttpl btpl tag branch mtip tip
 	main=$(po_get layout.main)
@@ -116,20 +128,18 @@ po_cmd_close() {
 		po_die "po fresh $version failed (exit $fresh_code)"
 	fi
 
-	# The evidence: the newest stamp in the item's worktree names the tip.
-	local i wt='' f stamp='' sn=0 block
+	# The evidence: the newest full stamp in the item's worktree names the
+	# tip; a fast stamp (v0.182) is never evidence for the boundary.
+	local i wt='' f stamp='' newest block
 	for i in "${!PO_WT_PATH[@]}"; do
 		[[ ${PO_WT_BRANCH[i]} == "$branch" && " ${PO_WT_FLAGS[i]} " != *' prunable '* ]] && wt=${PO_WT_PATH[i]}
 	done
 	[[ -n $wt ]] || po_refuse "$branch has no worktree, so no po stamp evidence"
-	for f in "$wt"/gate-*.txt; do
-		[[ ${f##*/} =~ $PO_STAMP_NAME_RE ]] || continue
-		if ((10#${BASH_REMATCH[1]} > sn)); then
-			sn=$((10#${BASH_REMATCH[1]}))
-			stamp=$f
-		fi
-	done
-	[[ -n $stamp ]] || po_refuse "no po stamp evidence (gate-<n>.txt) in $(po_rel "$wt")"
+	newest=$(po_stamp_newest "$wt")
+	[[ -n $newest ]] || po_refuse "no po stamp evidence (gate-<n>.txt) in $(po_rel "$wt")"
+	stamp=$(po_stamp_newest "$wt" full)
+	[[ -n $stamp ]] ||
+		po_refuse "${newest##*/} is a fast stamp; run po stamp --tier full in $(po_rel "$wt") (po land does this)"
 	block=$(<"$stamp")
 	local first=${block%%$'\n'*} second=${block#*$'\n'}
 	second=${second%%$'\n'*}
@@ -203,6 +213,7 @@ po_cmd_close() {
 	fi
 	[[ -z $next ]] || verify+=("$next:DOING")
 	po_edit_verify "${verify[@]}"
+	[[ -z $changelog_file ]] || po_close_changelog "$changelog_file"
 
 	# The admin commit.
 	local subj
@@ -257,6 +268,9 @@ po_cmd_close() {
 		printf '  %s. tag %s at %s (lightweight; never signed or annotated)\n' $((s++)) "$tag" "$tagat"
 	fi
 	((nochange)) || printf '  %s. backlog edits below, committed on %s as the admin commit\n' $((s++)) "$main"
+	[[ -z $changelog_file ]] ||
+		printf '     the changelog block (%s) goes into %s under "%s", in the same admin commit\n' \
+			"$(po_rel "$changelog_file")" "${PO_MANIFEST[close.changelog]}" "$(po_get close.changelog_heading)"
 	[[ -z $next ]] ||
 		printf '  %s. branch %s + worktree %s at the admin commit\n' $((s++)) \
 			"$(po_fill "$btpl" "$next")" "$(po_rel "$(po_new_worktree_path "$next")")"
@@ -343,6 +357,62 @@ po_cmd_close() {
 	((setupcode == 0)) || exit 7
 }
 
+# po_close_changelog <file>: plan the changelog block in <file> as one more
+# edit of the admin commit (edit.sh): into [close] changelog, right under the
+# first line equal to [close] changelog_heading, one blank line on each side;
+# when the heading is missing, the heading and the block go before the file's
+# first "## " heading (at the end when there is none). Leading and trailing
+# blank lines of the block are dropped. Refused when the file does not exist
+# at the plan's rev, the block is empty, or the changelog already holds the
+# block's first line verbatim (the entry would land twice).
+po_close_changelog() {
+	local path heading first i j h=-1 at n
+	local -a block=()
+	path=${PO_MANIFEST[close.changelog]}
+	heading=$(po_get close.changelog_heading)
+	git cat-file -e "$PO_EDIT_REV:$path" 2>/dev/null ||
+		po_refuse "--changelog-file: $path does not exist at $(po_short "$PO_EDIT_REV")"
+	mapfile -t block <"$1"
+	while ((${#block[@]} > 0)) && [[ -z ${block[-1]//[[:blank:]]/} ]]; do unset 'block[-1]'; done
+	while ((${#block[@]} > 0)) && [[ -z ${block[0]//[[:blank:]]/} ]]; do block=("${block[@]:1}"); done
+	((${#block[@]} > 0)) || po_refuse "--changelog-file $(po_rel "$1") is empty"
+	first=${block[0]}
+	po_edit_read "$path"
+	n=${#PO_LINES[@]}
+	for i in "${!PO_LINES[@]}"; do
+		[[ ${PO_LINES[i]} != "$first" ]] || po_refuse "changelog already has $first ($path:$((i + 1)))"
+		((h >= 0)) || [[ ${PO_LINES[i]} != "$heading" ]] || h=$i
+	done
+	if ((h >= 0)); then
+		j=$((h + 1))
+		while ((j < n)) && [[ -z ${PO_LINES[j]//[[:blank:]]/} ]]; do j=$((j + 1)); done
+		if ((j < n)); then
+			PO_LINES=("${PO_LINES[@]:0:h+1}" "" "${block[@]}" "" "${PO_LINES[@]:j}")
+		else
+			PO_LINES=("${PO_LINES[@]:0:h+1}" "" "${block[@]}")
+			# shellcheck disable=SC2034 # read by po_edit_write
+			PO_LINES_NL=1
+		fi
+	else
+		at=$n
+		for i in "${!PO_LINES[@]}"; do
+			if [[ ${PO_LINES[i]} == '## '* ]]; then
+				at=$i
+				break
+			fi
+		done
+		if ((at < n)); then
+			PO_LINES=("${PO_LINES[@]:0:at}" "$heading" "" "${block[@]}" "" "${PO_LINES[@]:at}")
+		else
+			((n == 0)) || [[ -z ${PO_LINES[-1]//[[:blank:]]/} ]] || PO_LINES+=("")
+			PO_LINES+=("$heading" "" "${block[@]}")
+			# shellcheck disable=SC2034 # read by po_edit_write
+			PO_LINES_NL=1
+		fi
+	fi
+	po_edit_write "$path"
+}
+
 # po_close_budget_flag <version> <tag>: a flag line when the item's newest
 # passing stamp event took longer than [stamp] slow_after (default 300), the
 # PO's cue to ask for a trimmed or tiered gate. No event, or one without the
@@ -351,7 +421,7 @@ po_close_budget_flag() {
 	local file line re='"legs":\[.*\],"seconds":([0-9]+),"(tests|load1|detail)"' s budget
 	file=$(po_events_file) && [[ -s $file ]] || return 0
 	line=$(grep -F "\"kind\":\"stamp\",\"item\":$(po_json_str "$1")," -- "$file" |
-		grep -F '"result":"pass","agent":' | tail -n 1) || return 0
+		grep -F '"result":"pass","agent":' | grep -vF ',"tier":"fast",' | tail -n 1) || return 0
 	[[ $line =~ $re ]] || return 0
 	s=$((10#${BASH_REMATCH[1]}))
 	budget=$((10#${PO_MANIFEST[stamp.slow_after]:-300}))

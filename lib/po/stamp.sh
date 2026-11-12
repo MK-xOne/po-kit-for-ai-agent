@@ -485,10 +485,182 @@ po_stamp_test_counts() {
 		printf 'flag: code changed, no test removed or rewritten (PO: check for pins on replaced behaviour)\n'
 }
 
+# The tiered gate (v0.182). A unit is one test file: each file directly under a
+# directory entry of [stamp] test_files, and each file entry itself. A unit says
+# what it covers in its first PO_COVERS_LINES lines, on lines like
+#   # covers: lib/po/status.sh units/
+# (leader #, // or --; repo-relative paths, an entry ending in / covers all under
+# it; no globs). A unit with no such line covers anything: it runs in every fast
+# stamp. `po stamp --tier fast` (or [stamp] tier = "fast") runs the test leg as
+# [stamp.fast] command with {selected} replaced by the units it selects (see
+# po_stamp_select); every other leg runs as written. A fast stamp is evidence for
+# the report, never for the boundary: po close, po land and po release --write
+# want a full one (po_stamp_newest ... full).
+PO_COVERS_LINES=30
+
+# po_stamp_tiered: whether the manifest opts into the tiers ([stamp] tier or
+# [stamp.fast] command set).
+po_stamp_tiered() {
+	[[ -n ${PO_MANIFEST[stamp.tier]+x} || -n ${PO_MANIFEST[stamp.fast.command]+x} ]]
+}
+
+# po_stamp_is_fast <stamp file>: whether the block is a fast stamp's.
+po_stamp_is_fast() {
+	grep -q '^tier: fast' -- "$1" 2>/dev/null
+}
+
+# po_stamp_newest <dir> [full]: the newest gate-<n>.txt in <dir> (the highest
+# <n>); with full, the newest that is not a fast stamp. Empty when none.
+po_stamp_newest() {
+	local f n
+	while read -r n f; do
+		[[ ${2:-} != full ]] || ! po_stamp_is_fast "$f" || continue
+		printf '%s' "$f"
+		return 0
+	done < <(
+		for f in "$1"/gate-*.txt; do
+			[[ ${f##*/} =~ $PO_STAMP_NAME_RE ]] && printf '%s %s\n' "$((10#${BASH_REMATCH[1]}))" "$f"
+		done | sort -rn
+	)
+}
+
+# po_stamp_units <wt>: the units, one repo-relative path per line, in
+# [stamp] test_files order (a directory's files in glob order).
+po_stamp_units() {
+	local wt=$1 p f
+	while IFS= read -r p; do
+		[[ -n ${p//[[:blank:]]/} ]] || continue
+		p=${p#./}
+		if [[ $p == */ || -d $wt/$p ]]; then
+			for f in "$wt/${p%/}"/*; do
+				[[ -f $f ]] && printf '%s\n' "${f#"$wt/"}"
+			done
+		elif [[ -f $wt/$p ]]; then
+			printf '%s\n' "$p"
+		fi
+	done <<<"${PO_MANIFEST[stamp.test_files]:-}"
+}
+
+# po_stamp_covers <file>: the entries of its covers lines, space-separated;
+# empty when it has none.
+po_stamp_covers() {
+	head -n "$PO_COVERS_LINES" -- "$1" 2>/dev/null |
+		sed -nE 's#^[[:space:]]*(\#|//|--)[[:space:]]*covers:[[:space:]]*(.*[^[:space:]])[[:space:]]*$#\2#p' |
+		tr -s '[:space:]' ' '
+}
+
+# po_stamp_listed <path> <entries, one per line>: whether <path> is an entry
+# or under an entry that ends in /.
+po_stamp_listed() {
+	local e
+	while IFS= read -r e; do
+		[[ -n $e ]] || continue
+		if [[ $e == */ ]]; then
+			[[ $1 == "$e"* ]] && return 0
+		else
+			[[ $1 == "$e" ]] && return 0
+		fi
+	done <<<"$2"
+	return 1
+}
+
+# po_stamp_select <wt> <merge-base>: the fast tier's units into
+# PO_TIER_SELECTED, or the reason it falls back to full into PO_TIER_WHY. The
+# changed set is every path that differs between <merge-base> and the working
+# tree, untracked files too, minus stamp files. Per changed path: a unit is
+# selected itself; a path under [stamp.fast] ignore selects nothing; any other
+# selects every unit whose covers line names it, and none is a fall back.
+# Then every unit without a covers line and the [stamp.fast] always set; an
+# empty selection is a fall back too.
+PO_TIER_SELECTED=() PO_TIER_WHY=''
+po_stamp_select() {
+	local wt=$1 mb=$2 c u e hit
+	local -a units=() changed=() order=()
+	local -A cov=() isunit=() sel=()
+	PO_TIER_SELECTED=() PO_TIER_WHY=''
+	mapfile -t units < <(po_stamp_units "$wt")
+	for u in "${units[@]}"; do
+		isunit[$u]=1
+		cov[$u]=$(po_stamp_covers "$wt/$u")
+		[[ -n ${cov[$u]} ]] || sel[$u]=1
+	done
+	mapfile -d '' -t changed < <(
+		{
+			git -C "$wt" diff -z --name-only --no-renames "$mb" -- &&
+				git -C "$wt" ls-files -z --others --exclude-standard
+		} || po_die "could not list the paths changed since $mb"
+	)
+	for c in "${changed[@]}"; do
+		[[ $c =~ $PO_STAMP_NAME_RE ]] && continue
+		if [[ -n ${isunit[$c]:-} ]]; then
+			sel[$c]=1
+			continue
+		fi
+		po_stamp_listed "$c" "${PO_MANIFEST[stamp.fast.ignore]:-}" && continue
+		hit=0
+		for u in "${units[@]}"; do
+			[[ -n ${cov[$u]} ]] || continue
+			po_stamp_listed "$c" "${cov[$u]// /$'\n'}" || continue
+			sel[$u]=1 hit=1
+		done
+		if ((hit == 0)); then
+			PO_TIER_WHY="$c is covered by no test"
+			return 0
+		fi
+	done
+	while IFS= read -r e; do
+		[[ -z $e ]] || sel[$e]=1
+	done <<<"${PO_MANIFEST[stamp.fast.always]:-}"
+	for u in "${units[@]}"; do
+		[[ -z ${sel[$u]:-} ]] || order+=("$u")
+	done
+	while IFS= read -r e; do
+		[[ -z $e || -n ${isunit[$e]:-} ]] || order+=("$e")
+	done <<<"${PO_MANIFEST[stamp.fast.always]:-}"
+	if ((${#order[@]} == 0)); then
+		PO_TIER_WHY='no test selected'
+		return 0
+	fi
+	PO_TIER_SELECTED=("${order[@]}")
+}
+
+# po_stamp_fast_command: [stamp.fast] command with each {selected} replaced by
+# PO_TIER_SELECTED, shell-quoted and space-separated.
+po_stamp_fast_command() {
+	local rest=${PO_MANIFEST[stamp.fast.command]} out='' q='' u qu
+	for u in "${PO_TIER_SELECTED[@]}"; do
+		printf -v qu '%q' "$u"
+		q+=${q:+ }$qu
+	done
+	while [[ $rest == *'{selected}'* ]]; do
+		out+=${rest%%'{selected}'*}$q
+		rest=${rest#*'{selected}'}
+	done
+	printf '%s' "$out$rest"
+}
+
+# po_stamp_full_count: the tests of this project's newest passing full stamp in
+# the live events log; empty when there is none or the log cannot be read.
+po_stamp_full_count() {
+	local file
+	file=$(po_events_file) && [[ -r $file ]] || return 0
+	grep -F '"kind":"stamp",' -- "$file" 2>/dev/null |
+		grep -F "\"project\":$(po_json_str "$(basename -- "${PO_MAIN_WT:-$PWD}")")," |
+		grep -F ',"result":"pass","agent":' | grep -vF ',"tier":"fast"' | tail -n 1 |
+		sed -nE 's/.*[0-9],"tests":([0-9]+)[,}].*/\1/p'
+}
+
 po_cmd_stamp() {
-	local bin='' wt=$PO_INVOKE_WT
+	local bin='' wt=$PO_INVOKE_WT tier=${PO_MANIFEST[stamp.tier]:-full} tier_named=0
+	[[ -z ${PO_MANIFEST[stamp.tier]+x} ]] || tier_named=1
 	while (($# > 0)); do
 		case $1 in
+		--tier)
+			(($# >= 2)) || po_usage_die "--tier needs fast or full"
+			[[ $2 == fast || $2 == full ]] || po_usage_die "stamp: --tier must be fast or full: $2"
+			tier=$2 tier_named=1
+			shift 2
+			;;
 		--bin)
 			(($# >= 2)) || po_usage_die "--bin needs a path"
 			bin=$2
@@ -526,6 +698,13 @@ po_cmd_stamp() {
 	fi
 	if [[ ${PO_MANIFEST[gate.test_format]:-libtest} == pytest ]]; then
 		sumfn=po_stamp_sum_pytest summary='pytest summary'
+	fi
+	local fast_leg=-1
+	if [[ $tier == fast ]]; then
+		[[ -n ${PO_MANIFEST[stamp.fast.command]+x} ]] || po_die "$PO_MANIFEST_FILE: [stamp.fast] command is needed for the fast tier"
+		fast_leg=$test_leg
+		((fast_leg >= 0)) || [[ ${names[*]} != gate ]] || fast_leg=0
+		((fast_leg >= 0)) || po_die "$PO_MANIFEST_FILE: the fast tier replaces the leg named test, and [gate.legs] has none"
 	fi
 
 	if [[ -n $bin ]]; then
@@ -585,9 +764,21 @@ po_cmd_stamp() {
 		PO_STAMP_RES[0]=pass
 	fi
 	# Taken after prepare: the block and the unchanged-tree check name the
-	# tree the gate tests.
+	# tree the gate tests, and the fast tier selects from it.
 	dirty=$(po_stamp_porcelain "$wt" | grep -c '' || true)
 	state=$(po_stamp_state "$wt")
+	local tier_line=''
+	if ((fast_leg >= 0)); then
+		po_stamp_select "$wt" "$mb"
+		if [[ -n $PO_TIER_WHY ]]; then
+			tier=full tier_line="tier: full (fast fell back: $PO_TIER_WHY)"
+			printf 'po stamp: the fast tier falls back to full: %s\n' "$PO_TIER_WHY" >&2
+		else
+			cmds[fast_leg]=$(po_stamp_fast_command)
+			# shellcheck disable=SC2034 # read by po_event_log
+			PO_EVENT_TIER=fast
+		fi
+	fi
 	for i in "${!names[@]}"; do
 		printf 'po stamp: leg %s: %s\n' "${names[i]}" "${cmds[i]}" >&2
 		leg_start=$(date +%s)
@@ -654,6 +845,20 @@ po_cmd_stamp() {
 	((PO_EVENT_SECONDS <= budget)) ||
 		over="gate time: $(po_event_secs "$PO_EVENT_SECONDS"), over budget $(po_event_secs "$budget") (slow_after)"
 
+	if ((tier_named)) && [[ -z $tier_line ]]; then
+		if [[ $tier == full ]]; then
+			tier_line='tier: full'
+		else
+			local whole
+			whole=$(po_stamp_full_count)
+			if [[ -n $whole ]]; then
+				tier_line="tier: fast, $tests of $whole checks"
+			else
+				tier_line="tier: fast, $tests checks, no full count on record"
+			fi
+		fi
+	fi
+
 	local legs block
 	legs=$(
 		IFS=/
@@ -664,6 +869,7 @@ po_cmd_stamp() {
 		printf 'gate PASS: %s   tests %s passed\n' "$legs" "$tests"
 		printf 'diffstat vs merge-base(%s): %s\n' "$main" "$diffstat"
 		[[ -z $tcount ]] || printf '%s\n' "$tcount"
+		[[ -z $tier_line ]] || printf '%s\n' "$tier_line"
 		[[ -z $over ]] || printf '%s\n' "$over"
 		for line in "${prep[@]}"; do printf 'prepare ran: %s\n' "$line"; done
 		[[ -z $bin_line ]] || printf '%s\n' "$bin_line"

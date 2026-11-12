@@ -16,6 +16,140 @@ one row per step or per group of steps.
 
 ## Unreleased
 
+## Release 29 (2026-11-12): a tiered gate and `po land`; the host lands finished items; a test review and faster tests
+
+### Setup after install
+
+| # | Machine | Command | Who | Check |
+|---|---|---|---|---|
+| 1 | the host | `the host install script` (v0.162, v0.167, v0.175, v0.176, v0.177, v0.180, v0.205) | the host operator | `systemctl --user is-active land-queue.timer` prints `active` |
+| 2 | each machine that shows the dashboard | restart `po-dashboard` (v0.178, v0.179) | the machine's operator | a project card's switch flips only on the switch |
+
+**Agents:** on po-kit your `po stamp` is fast (v0.182): a new test file gets a `# covers:` line, and a `STAMP FAILED` from `po land` after a fast pass means widen it. Devs in a `[land]` project commit as the item commit, stamp at dirty 0 and REPORT; no commit prompt follows (v0.181). **Adopt:** `[stamp] tier = "fast"` with `[stamp.fast] command`, and `[land] push`, `[close] changelog` (v0.182, v0.181; `po doctor` lists them). Also in this release without notes of their own: v0.172 (auto-dispatch reads Nous agents from the roster), v0.200 and v0.201 (two private tests wait on files, not sleeps).
+
+### The projects-feed private tests stub team-status (v0.185, 2026-11-12)
+
+- 40-v0.50, 45-v0.83, 98-v0.94 and 99-v0.130 pass `TEAM_STATUS_BIN` a stub that prints `[]` instead of the real `team-status` (3.5-4 s a call under the suite): about 127 s of team-status time per run gone, same 3599 checks.
+- **Agents**: none. **Adopt**: none.
+
+### The over-budget gate test no longer sleeps (v0.187, 2026-11-12)
+
+- tests/run.sh: the v0.170 over-budget block runs `po stamp` under the fake `date` instead of a real `sleep 2`; about 2 s less wall time per run, same 3599 checks.
+- **Agents**: none. **Adopt**: none.
+
+### Tiered gate: a fast po stamp per item, the full suite at land and release (v0.182, 2026-11-12)
+
+- `po stamp --tier fast|full` (default `[stamp] tier`): the fast tier runs the test files whose `# covers:` line names a changed path, plus `[stamp.fast] always`; an uncovered path or an empty selection falls back to full. The block names the tier; `po events` marks fast runs, `--trend` skips them.
+- `po close` and `po land` want a full stamp at the tip (land stamps `--tier full` itself); `po release <N> --write` wants one at main's tip.
+- **Agents:** on po-kit your `po stamp` is fast after this release; a new test file gets a `# covers:` line (and `# needs:` for a fixture it reuses); a `STAMP FAILED` from `po land` after a fast pass means widen your covers line.
+- **Adopt:** `[stamp] tier = "fast"` and `[stamp.fast] command = "... {selected}"` (`po doctor` lists them).
+
+### The heartbeat tells the PO when a finished item waits for the close (v0.180, 2026-11-12)
+
+- `the PO-pending` raises `CLOSE WAITING <item>` when a DOING item's newest message is a dev REPORT or COMMIT, or dante's SPEC MET, and the PO has not answered for `close_wait` minutes (default 20); other waiting items are listed on the same wake. It posts nothing.
+- **Agents**: none. **Adopt**: the host operator runs `the host install script`.
+
+### Test review of po-kit: timing, overlaps and 20 follow-up rows (v0.183, 2026-11-12)
+
+- Read-only review: the suite is 3420 checks and 322 s; the slow private files are slow because the projects-feed tests call the real `team-status` at `SNAPSHOT_TTL=0` (3.6 s a call against 0.46 s). Findings and rows are in `docs/notes/test-review-v0.183.md` and the backlog (v0.185-v0.204).
+- **Agents**: none. **Adopt**: none.
+
+### The heartbeat raises a stalled-item finding from the dashboard's idle number (v0.162, 2026-11-12)
+
+- `the PO-pending` raises one `STALLED ITEM` finding for every DOING item the dashboard already shows as "idle Nh, stalled", from the same number, instead of a separate rule.
+- **Agents**: none. **Adopt**: the host operator runs `the host install script`.
+
+### A project card's switch flips only on the switch (v0.179, 2026-11-11)
+
+- In the GTK Projects view a click on the word, the reason or the empty part of the switch line opens the project like a click on the card; only the switch itself flips (click or keyboard). The switch keeps a 44 px touch area. The web card is unchanged: its card opens nothing and its switch is already a single button.
+- **Agents**: none. **Adopt**: restart `po-dashboard` on each machine.
+
+### `po land`: rebase, stamp, close, changelog and push in one command (v0.181, 2026-11-12)
+
+- `po land <version> [--dry-run]` takes a finished item the whole way with nobody at the keyboard: refused (6) unless its SPEC MET is recorded, every backlog source says DOING, its worktree is clean, its branch is one item commit (or none) and the newest `gate-<n>.txt` names that tip clean and passing; then rebase onto main when behind (a conflict is aborted and the worktree verified back at the dev's tip, exit 5, `land: CONFLICT <paths>`), `po stamp` (a failure is exit 4, `land: STAMP FAILED leg <l>, log <p>`, the worktree left at the rebased tip with the old tip printed), `po close --commit` with a body built from fixed parts (the stamp line, `SPEC MET: <by> <at> <ref>`, the REPORT's `PROPOSED:` notes and `Memory:` line, else `Memory: nothing new learned`), then the `[land] push` command (`sh -c` in the main worktree with `PO_VERSION`, `PO_TAG`, `PO_REPO`, `PO_ADMIN_COMMIT`; a failure is exit 7, the close stands; no key: no push). stdout is exactly one line, `land: OK|REFUSED|CONFLICT|STAMP FAILED|CLOSE FAILED|PUSH FAILED ...`, for a queue to read; `--dry-run` prints each check as `ok` / `would refuse: <reason>` and the steps as a plan, runs no gate, writes nothing, exit 0.
+- `po land record <version> --spec-met --by <name> [--ref <id>] [--report-file <f>] [--changelog-file <f>]` writes the trigger record under `<git common dir>/po-land/<version>/` (never in the worktree); a DOING item only; a new record replaces the old; refused when the block would land an entry the item commit already carries. `po prune` lists a record whose item is no longer DOING (`STALE LAND RECORDS`), removes nothing.
+- `po close --changelog-file <f>`: the file's text becomes one more planned edit of the close's admin commit, inserted into `[close] changelog` right under the `[close] changelog_heading` line (default `## Unreleased`; heading and block go before the first `## ` heading when it is missing), one blank line each side; refused (6) without the key or when the changelog already has the block's first line. Main moves once per close. Without the flag `po close` is unchanged.
+- `po status`: a DOING branch behind main carries `  needs rebase` after its behind count (the idle time stays last, what the host's parsers read); `--json` carries `"needs_rebase": true|false` (the v0.130 pin updated: `status --json: idle 30 min ...`).
+- **Agents**: devs in a `[land]` project commit as the item commit, `po stamp` at dirty 0 and then REPORT; no commit prompt follows. Run `po status` before stamping: `needs rebase` means `git rebase <main>` first. A `Changelog:` fenced block in the REPORT is the entry `po land` lands (never when the commit edits the changelog too). **Adopt**: `[land] push = "the push command {repo}"` (the push command `po land` runs; `{repo}` is the main worktree), `[close] changelog = "CHANGELOG.md"`, `[close] changelog_heading = "## Unreleased"` (po-kit's `po.toml` by the PO's admin commit; other projects after po-kit has used it for a week). The host queue (`the land-queue script`) is the row's step 3, a separate build.
+
+### The feed's idle time counts the owner's real activity (v0.176, 2026-11-11)
+
+- `projects-feed` reports a DOING item's `idle_hours` as the smallest of the worktree's idle time, the owner's last action and the newest message in the item's thread, and adds `idle_source` (`worktree`, `agent` or `thread`). `po status` is unchanged.
+- **Agents**: none. **Adopt**: the host operator runs `the host install script`.
+
+### The sweep records a handoff nobody picked up (v0.177, 2026-11-11)
+
+- `report-sweep` records a handoff to a dev that went unanswered while the dev's session was idle (kind `HANDOFF`, state only, nothing posted); `projects-feed` passes it into `stalled`, so the dashboard shows it.
+- **Agents**: none. **Adopt**: the host operator runs `the host install script`.
+
+### Concurrent stamps queue on the display lock (v0.175, 2026-11-11)
+
+- `run-scoped` queues every run that uses the same display behind one host lock, so concurrent `po stamp` runs no longer collide on Xvfb :99 and fail the same GUI tests.
+- **Agents**: none. **Adopt**: the host operator runs `the host install script`.
+
+### The host dispatcher hands orphaned items to a free dev and honours an exclusion file (v0.167, 2026-11-11)
+
+- `the dispatch exclusion file` (one agent name per line, `#` comments; absent = nobody excluded) names agents that get no new item and are never a reassign target; they leave the roster and every ready line (logged `skipped <agent>: excluded`, `ready: <item> names excluded agent <agent>, dropped`). After the resume step, a DOING item is ORPHANED when its owner is excluded, at its limit, or silent in the item's thread for 24 h while the item sat idle 24 h or more (`po status --json` idle hours; `local`'s items never). Oldest idle first, it goes to the first free agent in the cost order with role `dev` (level 1) or `senior-dev` (level 2 and up) that took nothing this run: one empty admin commit `admin: <item> DOING for <agent> (reassigned from <old>)` on the project's main checkout as the PO, then `<item> → <agent> · PROMPT (reassigned from <old>)` in the item's thread with the old worktree. One reassign per agent per run; a state marker holds a second reassign of the item for 24 h; without `--commit` the plan prints `would reassign:` and writes nothing.
+- **Agents**: a `· PROMPT (reassigned from <old>)` means the item is yours now: check `po status` in the named worktree, keep what is sound, redo the rest, REPORT with the quoted stamp. **Adopt**: none (the host operator creates `the dispatch exclusion file`; the owner edits it).
+
+### The dashboard Reports view redraws only on change (v0.178, 2026-11-11)
+
+- The Reports view no longer rebuilds all its charts on every 5-second fetch: a 304 or an unchanged feed redraws nothing, a changed feed redraws once (or marks Reports dirty while another view is on screen and redraws on switching to it), and a 60-second tick moves the range clock only while Reports is visible. Output of the redraw is unchanged. This removes the steady CPU load and the widget churn behind the dashboard's memory growth.
+- **Agents**: none. **Adopt**: restart `po-dashboard` on each machine that shows it.
+
+## Release 28 (2026-11-11): an agent can be switched off; the dispatcher resumes parked items; local best-of-N
+
+### Setup after install
+
+| # | Machine | Command | Who | Check |
+|---|---|---|---|---|
+| 1 | the host | `the host install script` (v0.123, v0.163, v0.166, v0.173, v0.174) | the host operator | `ls the agent switch file` exists |
+| 2 | the host | `systemctl --user restart answer-receiver.service` (v0.174) | the host operator | `systemctl --user is-active answer-receiver.service` prints `active` |
+| 3 | each machine that shows the dashboard | restart `po-dashboard` (v0.154, v0.173) | the machine's operator | the Team view shows an OFF switch per agent |
+
+**Agents:** a `· PROMPT (resume)` means finish that item before anything new (v0.166); an agent shown OFF gets no item until switched on (v0.173, v0.174). **Adopt:** set `[team] inactive_file` to the agent switch file (v0.173); write `n=3` to `the best-of-N config file` for local best-of-N (v0.123).
+
+### The PO heartbeat raises a finding for an item stuck at a PO step (v0.163, 2026-11-11)
+
+- `the PO-pending` raises one `OPEN` finding line for an item whose last handoff is waiting on the PO's own step (verify, commit prompt or close) so it shows up instead of sitting silent.
+- **Agents**: none. **Adopt**: none.
+
+### The host honours the agent switch (v0.174, 2026-11-11)
+
+- `the agent switch file` is the agent switch file: the answer receiver takes kind `agent-active` (off appends, on removes), `team-status` hands it to `po team`, `auto-dispatch` logs `skipped <agent>: inactive` and drops the agent, `the PO-pending` raises one `OFF <agent>` line instead of QUIET, and `dante-pending` does not count it free.
+- **Agents**: none. **Adopt**: none.
+
+### Local best-of-N with the gate as verifier (v0.123, 2026-11-11)
+
+- `private/the host/bin/local-bestofn` (new) makes N sibling worktrees `item-<v>-cand1..N` of an item, runs one local session in each at temperature 1.0 (one at a time), gates each with `gate-brief` and keeps the first that passes: its diff is applied to the item worktree with `git apply --index` (never a merge). When none passes, the candidate with the fewest failure lines is applied and the v0.118 retry loop takes it. Every candidate worktree and branch is pruned after; `po status` never lists one as ORPHANED. `local-pending` starts it, detached behind a lock, for an item's first attempt only when `the best-of-N config file` has `n=2..5`; with no file or `n=1` its output is byte-identical to before. Design: `docs/notes/local-best-of-n.md`.
+- **Agents**: none. **Adopt**: write `n=3` to `the best-of-N config file` to switch it on (the host operator runs `the host install script` first).
+
+### The host dispatcher resumes parked items before it opens new ones (v0.166, 2026-11-11)
+
+- Before any new item, each free agent that owns a DOING item idle 2 h or more (`po status --json` idle hours, the dashboard's stalled rule) is re-sent its longest-idle one: one `<item> → <agent> · PROMPT (resume)` in the item's thread (top level, logged, when no thread is found), and that agent takes no new item that run. An item whose thread ends with the owner's own REPORT, BLOCKED or TESTS handoff waits on someone else and is skipped (logged). A state marker holds a second resume of the same item for 2 h; without `--commit` the plan prints `would resume:` and sends nothing.
+- **Agents**: a `· PROMPT (resume)` means finish that item before anything new: report in its thread (REPORT with the quoted stamp, or BLOCKED with what you wait on). **Adopt**: none.
+
+### An agent switch: switch an agent off so nothing is dispatched to it (v0.173, 2026-11-11)
+
+- `[team] inactive_file` names an agent switch file (one agent per line, `#` comments, names without case; missing means nobody is off). `po team` / `--json` / `/team.json` give a listed agent `"inactive": true` and `free: false` (its state and items untouched) and print `OFF` in the FREE column; `po dispatch` never gives it an item and its `--plan` skip says `(<agent> is inactive)`. `po team off|on <agent> [--commit]` switches it, in place, every other byte kept (off then on of the last line is byte-exact). The dashboard Team view (desktop and web) shows a muted line with an `OFF` badge and, with an answer URL, an on/off switch per line that posts the answer kind `agent-active` on the answer path; your receiver applies it.
+- **Agents**: none. **Adopt**: set `[team] inactive_file` to your agent switch file to switch the feature on; teach your answer receiver the `agent-active` kind to use the dashboard switch.
+
+### Desktop small buttons are at least 24 px tall (v0.154, 2026-11-11)
+
+- The `.po-small` buttons of the desktop dashboard (the range, Show all, Reports, Archive and Actions buttons, the project screen's filters) measured 21 px tall; `css()` now gives them `min-height: 18px`, which GTK applies to the content box, so with the unchanged 2 px padding and 1 px border each button is 24 px tall, the target size of WCAG 2.2 criterion 2.5.8; every one is already wider than 24 px. Colours, fonts and the `:checked`, `:disabled` and `:focus-visible` states are unchanged.
+- **Agents**: none. **Adopt**: restart `po-dashboard` on each machine that shows it.
+
+### The backlog loads without a subshell per heading or cell (v0.161, 2026-11-10)
+
+- `po_backlog_load` (every `po` command that reads the backlog) no longer forks per table line, cell or heading: `po_unfill_into` and `po_trim_into` set a variable instead of printing into a command substitution, the tag template is read once per load, and a spec file is read in one `mapfile`. A backlog with 440 spec headings loads in about half the time; the parse result and every loader error are unchanged. `po_unfill` and `po_trim` keep their output for their other callers.
+
+- **Agents**: none. **Adopt**: none.
+
+### The suite retires its duplicate and replaced tests (v0.171, 2026-11-10)
+
+- The self-test suite drops tests that repeated another test or pinned text a later item replaced: the per-agent gate-run text (and its dead function), repeated receiver auth and replay cases, per-item install and rollback re-tests (one generic test now checks that every file under `bin/` and `units/` is tracked), a repeated journal and CORS check, and source-text greps that a behaviour check already covers. No behaviour changed.
+- **Agents**: none. **Adopt**: none.
+
 ## Release 27 (2026-11-10): the gate shows its growth; one rule for table rows; action cards follow six rules
 
 ### Setup after install
@@ -398,7 +532,6 @@ With a leg named `test`, the count taken from its output is now checked against 
 
 Every feed (events, team, decisions, projects) still refreshes every 5 seconds, but a feed whose last fetch is still in flight skips that tick, so a slow server never has two fetches of one feed running. Fetches send `If-None-Match` with the `ETag` of the body last accepted, and a `304 Not Modified` leaves the data as it is (nothing downloaded or parsed). A server that answers `X-Po-Since: full` on the events feed is asked for `?since=<newest event time held>`; its `X-Po-Since: partial` answer holds only the events since, which the window adds; every 60th fetch is whole. A server without these headers is fetched whole each time, as before. New in `dashboard_core`: `Feed`, `feed_url_since`, `merge_since`. `examples/events-demo-server.py` serves `/events.json` with ETag/304 and `?since=`. **Agents:** nothing. **Adopt:** a feed server may send `ETag` (and answer 304) and offer `?since=` with `X-Po-Since`; install the release on the machine that shows the dashboard.
 
-
 ### Backlog load in one process (v0.86, 2026-11-01)
 
 `po_backlog_load` forked one `git show` per spec file, and `po kickoff` read every spec file again for each heading rule and reloaded the backlog at every commit of its founding walk. The backlog and all spec files are now read by one `git cat-file --batch` process, the parsed backlog is memoised per commit within one run, and kickoff reads the spec files once for both rules. In a project with 135 spec files `po status` makes 28 git calls instead of 162 and `po kickoff` 37 instead of 354; the output is byte-identical. **Agents:** nothing. **Adopt:** nothing. **Note:** reading the backlog now needs `python3` on PATH (it did not before; po already used it for `po ready`, `po setup` and the feeds).
@@ -477,7 +610,6 @@ Fixes release 18 (and v0.69): Send built the answer from the display row, and an
 
 **Agents:** nothing new. **Adopt:** nothing to turn on; install the release on the machine that shows the dashboard.
 
-
 ### An open decision card stays open while the owner types (v0.71, 2026-10-30)
 
 Fixes release 17: typing in a card's answer box closed the card after a few characters. Every 5 s refresh rebuilt every card, the box being typed in lost its focus to the first card's item line, and the next space pressed that line. A refresh that brings the same decisions now rebuilds nothing (only the "asked … ago" text moves on); a changed feed rebuilds and gives the box back its focus and cursor; a draft keeps its spaces as typed (trimmed only when sent). A card closes only on a click of its item line. **Agents:** nothing new. **Adopt:** nothing to turn on; install the release on the machine that shows the dashboard.
@@ -485,7 +617,6 @@ Fixes release 17: typing in a card's answer box closed the card after a few char
 ## Release 17 (2026-10-30): multi-line answer box, one install block per project
 
 **Agents:** rebuild the cumulative bundle before posting a look card, name the build on the card with `requires` (`ask-mk --requires`), never write an install command on a card; action cards hold only commands that run as written. **Adopt:** on the machine that shows the dashboard, set `--install-dir` or `PO_DASHBOARD_INSTALL_DIR` to the absolute directory holding the built packages; unset, the install block says `set install_dir`. Nothing else to turn on.
-
 
 ### Bundle record, `requires` from the record, cards validated (v0.70, 2026-10-30)
 

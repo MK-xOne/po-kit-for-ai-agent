@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 # po-kit self-tests: small throwaway repositories under a temp dir.
+# covers: bin/ lib/ examples/ po.toml README.md AGENTS.md
 # shellcheck disable=SC2015 # ok/bad always return 0, so "A && ok || bad" is a true if/else here
 # shellcheck disable=SC2034 # RUN_DONE is read by the EXIT trap
-# Usage: tests/run.sh    (exit 0 when every case passes)
+# Usage: tests/run.sh [--only <test file>...]    (exit 0 when every case passes)
+#
+# --only is the fast tier's (po stamp --tier fast, [stamp.fast] in po.toml): it
+# names the test files the stamp selected, repo-relative. This file's own blocks
+# (the public part) run in any case; of private/tests.d/ only the files named
+# run, with the files their "# needs:" lines name (fixtures they reuse), in the
+# usual order.
 #
 # A runner with no `set -e` hides a block that dies. So: a multi-check block
 # (a python heredoc or a shell function that prints several verdicts) runs
@@ -15,6 +22,13 @@
 # The run ends with "RUN-END <passed> <failed> <blocks>", then the summary; a
 # run that ends any other way prints RUN-ABORTED and exits non-zero.
 set -uo pipefail
+ONLY_SET=0 ONLY=()
+if (($# > 0)); then
+	[[ $1 == --only ]] || { printf 'usage: tests/run.sh [--only <test file>...]\n' >&2; exit 1; }
+	ONLY_SET=1
+	shift
+	ONLY=("$@")
+fi
 # Hermetic: no inherited GIT_* variable (an exported GIT_DIR — a git hook
 # sets one — would point every `git -C <fixture>` below at that repository,
 # making fixture branches and commits there), and no user or system git
@@ -2184,11 +2198,11 @@ expect "--idle rejects text" 1 '--idle needs a whole number' -- -C "$ID" status 
 expect "status still takes no other arguments" 1 "unknown argument '--bogus'" -- -C "$ID" status --bogus
 # v0.130: status --json, idle_hours per DOING item (whole hours, null with no worktree, held items left out)
 idle_set $((M * 30)) none none
-expect "status --json: idle 30 min is 0 hours, no worktree is null, a held item is left out" 0 '^\[\{"item":"1\.0\.3","idle_hours":0\},\{"item":"1\.0\.5","idle_hours":null\}\]$' -- -C "$ID" status --json
+expect "status --json: idle 30 min is 0 hours, no worktree is null, a held item is left out" 0 '^\[\{"item":"1\.0\.3","idle_hours":0,"needs_rebase":false\},\{"item":"1\.0\.5","idle_hours":null,"needs_rebase":false\}\]$' -- -C "$ID" status --json
 idle_set $((5 * H)) none none
-expect "status --json: idle 5 h is 5" 0 '"item":"1\.0\.3","idle_hours":5\}' -- -C "$ID" status --json
+expect "status --json: idle 5 h is 5" 0 '"item":"1\.0\.3","idle_hours":5,"needs_rebase":false\}' -- -C "$ID" status --json
 idle_set $((72 * H + 20 * M)) none none
-expect "status --json: idle 72 h is 72" 0 '"item":"1\.0\.3","idle_hours":72\}' -- -C "$ID" status --json
+expect "status --json: idle 72 h is 72" 0 '"item":"1\.0\.3","idle_hours":72,"needs_rebase":false\}' -- -C "$ID" status --json
 isnap() { git -C "$ID" for-each-ref; git -C "$ID" worktree list --porcelain; git -C "$ID" status --porcelain --ignored; git -C "$IW" status --porcelain --ignored; }
 before=$(isnap; stat -c '%n %Y' "$IW"/*)
 "$PO" -C "$ID" status --idle 1 >/dev/null 2>&1
@@ -2627,9 +2641,9 @@ else
 fi
 EOF
 chmod +x "$TMP/clock-bin/date"
-rm -f "$W"/gate-*.txt
-SLOW_AFTER=1 stamp_manifest check=true "test=sleep 2; sh ./fake-test.sh"
-blk=$("$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>/dev/null)
+rm -f "$W"/gate-*.txt "$TMP/clock-now"
+SLOW_AFTER=1 stamp_manifest check=true "test=sh ./fake-test.sh"
+blk=$(PATH="$TMP/clock-bin:$PATH" "$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>/dev/null)
 sec=$(jfield "$(tail -1 "$SLOG")" seconds)
 want="gate time: $(secs_fmt "$sec"), over budget 1s (slow_after)"
 [[ $sec -ge 2 && $(sed -n 4p <<<"$blk") == "$want" && $(sed -n 4p "$W/gate-1.txt") == "$want" ]] &&
@@ -3731,10 +3745,9 @@ check("dashboard reports: gate runs ignore non-stamps, old, future and unreadabl
 check("dashboard reports: 7 d gate runs bucket by day, labelled by date", r.gate_runs([_st("2026-10-23T12:00:00Z")], 7 * 86400, _n)["series"]["a"][-3] == (1, 0) and r.gate_runs([], 7 * 86400, _n)["labels"][-1] == "10-25")
 check("dashboard reports: 30 d reaches back where 7 d does not", r.gate_runs([_st("2026-10-10T12:00:00Z")], 7 * 86400, _n)["total"] == 0 and r.gate_runs([_st("2026-10-10T12:00:00Z")], 30 * 86400, _n)["total"] == 1)
 check("dashboard reports: empty feed gives empty data and text", r.gate_runs([], 86400, _n)["agents"] == [] and r.first_try([], 86400, _n)["rows"] == [] and r.closed([], 86400, _n)["total"] == 0
-      and "none in this range" in r.gate_runs_text(r.gate_runs([], 86400, _n)) and "none in this range" in r.first_try_text(r.first_try([], 86400, _n)) and "none in this range" in r.closed_text(r.closed([], 86400, _n)))
+      and "none in this range" in r.first_try_text(r.first_try([], 86400, _n)) and "none in this range" in r.closed_text(r.closed([], 86400, _n)))
 _o = r.gate_runs([_st("2026-10-25T12:10:00Z", agent="solo")], 86400, _n)
-check("dashboard reports: one agent gives one row", _o["agents"] == ["solo"] and len(_o["series"]["solo"]) == 24 and r.layout_fail_rate(r.fail_rate(_o), 600)[0] > 0)
-check("dashboard reports: busiest agent first, ties by name", r.gate_runs([_st("2026-10-25T12:10:00Z", agent="z"), _st("2026-10-25T12:11:00Z", agent="z"), _st("2026-10-25T12:12:00Z", agent="b"), _st("2026-10-25T12:13:00Z", agent="a")], 86400, _n)["agents"] == ["z", "a", "b"])
+check("dashboard reports: one agent still draws the fail-rate chart", r.layout_fail_rate(r.fail_rate(_o), 600)[0] > 0)
 _f = r.first_try([_st("2026-10-25T10:00:00Z", result="fail"), _st("2026-10-25T11:00:00Z"),
                   _st("2026-10-25T10:00:00Z", item="2"), _st("2026-10-25T10:00:00Z", item="3", project="q"),
                   _st("2026-10-25T10:00:00Z", agent="b", result="fail"), _st("2026-10-25T10:00:00Z", kind="close")], 86400, _n)
@@ -3747,7 +3760,7 @@ check("dashboard reports: closes per day by project, passing closes only, two da
 check("dashboard reports: 7 d closes reach the older day", r.closed([_st("2026-10-20T03:00:00Z", kind="close", project="y")], 7 * 86400, _n)["total"] == 1 and len(r.closed([], 30 * 86400, _n)["labels"]) == 30)
 check("dashboard reports: a time zone moves the day boundary", r.closed([_st("2026-10-25T02:00:00Z", kind="close")], 86400, _n, datetime.timezone(datetime.timedelta(hours=-4)))["series"]["p"] == [1, 0])
 check("dashboard reports: events with no agent or project are 'unknown'", r.gate_runs([{"time": "2026-10-25T12:10:00Z", "kind": "stamp", "result": "pass"}], 86400, _n)["agents"] == ["unknown"])
-check("dashboard reports: the text alternative carries the numbers", "a 2 runs, 1 passed, 1 failed" in r.gate_runs_text(_g) and "a 67\u00a0% of 3 items, too few to rank" in r.first_try_text(_f) and "3 in all; x 2; y 1" in r.closed_text(_c))
+check("dashboard reports: the text alternative carries the numbers", "a 67\u00a0% of 3 items, too few to rank" in r.first_try_text(_f) and "3 in all; x 2; y 1" in r.closed_text(_c))
 check("dashboard reports: charts() gives the five charts in order with text", [x["topic"] for x in r.charts([], 86400, _n)] == list(c.REPORT_CHARTS) and all(x["text"] for x in r.charts([], 86400, _n)))
 def _lg(t, legs, **k):
     e = _st(t, **k)
@@ -4620,6 +4633,15 @@ for variant in sorted(c.PALETTES):
         check("dashboard css %s: v0.142 %s is the accent fill with its own text colour, not an inset shadow alone" % (variant, sel),
               props[sel]["background-color"] == c.PALETTES[variant]["accent"] and props[sel]["color"] == c.PALETTES[variant]["on_accent"]
               and props[sel]["box-shadow"] == "none")
+    # v0.154: a small button's border box is 24 px tall (ui-guidelines 1.10, WCAG 2.2 2.5.8), read from the generated CSS:
+    # GTK applies min-height to the content box, so the target is min-height + padding + border, never min-height alone
+    _sm = props[".po-small"]
+    _px = lambda v: [int(x) for x in re.findall(r"(\d+)px", v)]
+    _tall = _px(_sm["min-height"])[0] + 2 * _px(_sm["padding"])[0] + 2 * _px(_sm["border"])[0]
+    check("dashboard css %s: v0.154 .po-small min-height, padding and border add up to a 24 px button (%d)" % (variant, _tall), _tall == 24)
+    check("dashboard css %s: v0.154 .po-small keeps its checked, disabled and focus states" % variant,
+          props[".po-small:checked"]["background-color"] == c.PALETTES[variant]["accent"] and props[".po-small:checked"]["color"] == c.PALETTES[variant]["on_accent"]
+          and props[".po-small:disabled"]["color"] == c.PALETTES[variant]["muted"] and props[".po-small:focus-visible"]["outline"] == "2px solid " + props[".po-small"]["color"])
     # v0.142 (7): one raised panel per list, the rows inside it flat (no shadow, no radius) with a hairline between them
     check("dashboard css %s: v0.142 a list panel is raised, with the base colour" % variant,
           props[".po-panel"]["background-color"] == _base and "inset" not in props[".po-panel"]["box-shadow"] and props[".po-panel"]["box-shadow"] != "none")
@@ -5174,9 +5196,102 @@ check("reports 30 d: the aggregation reads live plus archive; live alone leaves 
 check("reports 7 d: the archive never changes the 7 d aggregation", rep77.reports(c.report_events(_L, _A, 7 * 86400), 7 * 86400, _n)["charts"][0]["data"] == rep77.reports(_L, 7 * 86400, _n)["charts"][0]["data"])
 
 
+# ---- v0.173: the agent switch in the Team view ----
+_off = {"agent": "bo", "state": "idle 3h", "now": None, "owns": [], "free": False, "inactive": True}
+_offr = c.team_row(_off)
+check("v0.173 dashboard team: an inactive entry is kind off with status OFF", _offr["kind"] == "off" and _offr["status"] == "OFF", repr(_offr))
+_offw = c.team_row(dict(_off, state="WORKING", now="1.4", owns=["1.4"]))
+_offf = c.team_row(dict(_off, free=True))
+check("v0.173 dashboard team: OFF wins over working and free", _offw["kind"] == "off" and _offw["status"] == "OFF" and _offf["kind"] == "off" and _offf["status"] == "OFF",
+      repr((_offw, _offf)))
+_NOW173 = datetime.datetime(2030, 5, 1, 14, 0, tzinfo=datetime.timezone.utc)
+_offl = c.team_row(dict(_off, limit_until="2030-05-01T18:30:00Z"), _NOW173, datetime.timezone.utc)
+check("v0.173 dashboard team: an inactive agent at its limit is OFF and still shows the LIMIT time",
+      _offl["kind"] == "off" and _offl["status"].startswith("OFF") and "LIMIT until 6:30 PM UTC" in _offl["status"], repr(_offl))
+check("v0.173 dashboard team: inactive false or absent changes nothing",
+      c.team_row(dict(_off, inactive=False, free=True))["kind"] == "free" and c.team_row({"agent": "x", "state": "idle 22m"})["kind"] == "idle"
+      and c.team_row(dict(_off, inactive="yes", free=True))["kind"] == "free")
+check("v0.173 dashboard team: a check line says OFF", c.team_check_lines([_off]) == ["bo | OFF | now: - | owns: -"], repr(c.team_check_lines([_off])))
+_ab = c.agent_active_body("bo", False, "0b7e3c1a-5d2f-4a8e-9c61-3f0d2b8a7e41")
+check("v0.173 dashboard switch: the agent body is {answer_id, kind agent-active, agent, active, answered_at, client}",
+      set(_ab) == {"answer_id", "kind", "agent", "active", "answered_at", "client"} and _ab["kind"] == "agent-active" == c.AGENT_ACTIVE
+      and _ab["agent"] == "bo" and _ab["active"] is False and _ab["client"] == c.CLIENT and _ab["answer_id"] == "0b7e3c1a-5d2f-4a8e-9c61-3f0d2b8a7e41"
+      and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", _ab["answered_at"]) is not None, repr(_ab))
+check("v0.173 dashboard switch: active True is sent as true", c.agent_active_body("bo", 1, "x")["active"] is True)
+for _v in sorted(c.PALETTES):
+    _p = c.css_properties(c.css(_v))
+    check("v0.173 dashboard css %s: the OFF badge and the muted OFF row have rules" % _v,
+          ".po-off-badge" in _p and ".po-off .po-text" in _p and _p[".po-off .po-text"]["color"] == _p[".po-muted"]["color"])
+check("v0.173 dashboard css: the OFF badge and the muted row are in the contrast table",
+      {(".po-off-badge", ".po-card"), (".po-off .po-text", ".po-card")} <= {(f, b) for f, b, _r in c.CONTRAST_PAIRS})
+check("v0.173 dashboard switch: an agent switch target is at least 24 px", c.AGENT_SWITCH_TARGET_PX >= 24)
+# v0.178: the Reports view redraws only when its events changed, on the minute tick, or when it comes on
+# screen after a change; never on a 304 or an unchanged fetch, never hidden. A stub app counts the redraws.
+class _App178:
+    def __init__(self, view="events", reports_on=True):
+        self.view, self.reports_on, self.n = view, reports_on, 0
+        self.events, self.last_text = [], None
+        self.gate = c.ReportsRedraw(self.redraw_reports, lambda: self.view == "events" and self.reports_on)
+    def redraw_reports(self):  # as bin/po-dashboard: every redraw clears the dirty mark
+        self.gate.dirty = False
+        self.n += 1
+    def fetch(self, text, events, partial=False):  # as on_data
+        changed, self.events, self.last_text = c.fetch_change(self.events, self.last_text, text, events, partial)
+        self.gate.fetched(changed)
+    def switch(self, view=None, reports_on=None):  # as on_view / on_reports
+        self.view = self.view if view is None else view
+        self.reports_on = self.reports_on if reports_on is None else reports_on
+        self.gate.shown()
+_E178 = [{"time": "2026-11-11T2%d:00:00Z" % i, "kind": "stamp", "item": "x%d" % i} for i in range(3)]
+_T178 = json.dumps(_E178)
+_a = _App178(); _a.fetch(_T178, _E178); _a.n = 0
+_a.fetch(None, None)
+check("v0.178 reports: a 304 fetch redraws Reports 0 times", _a.n == 0, repr(_a.n))
+_a.fetch(_T178, json.loads(_T178))
+check("v0.178 reports: an unchanged whole fetch redraws Reports 0 times", _a.n == 0, repr(_a.n))
+_a.fetch(None, [_E178[0]], partial=True)
+check("v0.178 reports: a ?since= answer with nothing new redraws Reports 0 times", _a.n == 0, repr(_a.n))
+_a.fetch(_T178 + " ", _E178 + [{"time": "2026-11-11T23:30:00Z", "kind": "close", "item": "x9"}])
+check("v0.178 reports: a changed fetch with Reports visible redraws once", _a.n == 1, repr(_a.n))
+_b = _App178(reports_on=False); _b.fetch(_T178, _E178)
+check("v0.178 reports: a changed fetch with Events visible redraws 0 times and marks Reports dirty", _b.n == 0 and _b.gate.dirty, repr((_b.n, _b.gate.dirty)))
+_b.switch(reports_on=True)
+check("v0.178 reports: switching to Reports after a hidden change redraws once", _b.n == 1 and not _b.gate.dirty, repr(_b.n))
+_b.switch(reports_on=False); _b.switch(reports_on=True)
+check("v0.178 reports: switching to Reports with nothing changed redraws 0 times", _b.n == 1, repr(_b.n))
+_t = _App178(view="team"); _t.fetch(_T178, _E178); _t.switch(view="events")
+check("v0.178 reports: a change seen from another view redraws once on the switch back to Events with Reports on", _t.n == 1, repr(_t.n))
+_a.n = 0
+for _i in range(12):  # 60 s of 5 s fetches, half 304, half the same whole feed
+    _a.fetch(None, None) if _i % 2 else _a.fetch(_a.last_text, list(_a.events))
+check("v0.178 reports: 12 five-second no-change fetches redraw Reports 0 times", _a.n == 0, repr(_a.n))
+_a.n = 0
+check("v0.178 reports: the 60 s tick with Reports visible redraws once and keeps ticking", _a.gate.tick() is True and _a.n == 1, repr(_a.n))
+_h = _App178(view="events", reports_on=False)
+check("v0.178 reports: the 60 s tick with Reports hidden redraws 0 times", _h.gate.tick() is True and _h.n == 0, repr(_h.n))
+_h.switch(reports_on=True)
+check("v0.178 reports: Reports shown after a hidden tick redraws once (its window moved)", _h.n == 1, repr(_h.n))
+check("v0.178 reports: the tick is one minute", c.REPORTS_TICK_SECONDS == 60)
+_r = _App178(); _r.redraw_reports()  # a range or variant change calls redraw_reports directly, as before
+check("v0.178 reports: a range or variant change redraws once", _r.n == 1, repr(_r.n))
+_r2 = _App178(reports_on=False); _r2.fetch(_T178, _E178); _r2.redraw_reports(); _r2.switch(reports_on=True)
+check("v0.178 reports: a direct redraw clears the dirty mark, so the switch does not redraw again", _r2.n == 1, repr(_r2.n))
+_ch, _ev, _tx = c.fetch_change([{"time": "t1", "item": "a"}], "old", None, [{"time": "t2", "item": "b"}], True)
+check("v0.178 reports: fetch_change keeps the merge rule (a partial with news drops the text)", _ch and len(_ev) == 2 and _tx is None, repr((_ch, _ev, _tx)))
 print("BLOCK-END dashboard-core")
 
 PY
+# v0.178: the window wires the counted gate above: on_data hands it `changed` and never redraws Reports itself,
+# one 60 s tick, and both ways onto Reports (the view buttons and the Reports toggle) call shown().
+_od=$(awk '/def on_data\(/,/def on_key\(/' "$DB")
+[[ $_od == *'self.reports_redraw.fetched(changed)'* && $_od != *'self.redraw_reports()'* ]] &&
+	ok "v0.178 po-dashboard: on_data hands the change to the Reports gate and never redraws Reports itself" || bad "v0.178 on_data" "$_od"
+grep -q 'GLib.timeout_add_seconds(core.REPORTS_TICK_SECONDS, self.reports_redraw.tick)' "$DB" &&
+	[[ $(awk '/def on_view\(/,/def fetch_worker\(/' "$DB") == *'self.reports_redraw.shown()'* && $(awk '/def on_reports\(/,/def on_toggle\(/' "$DB") == *'self.reports_redraw.shown()'* ]] &&
+	grep -q 'return self.view == "events" and self.reports_on' "$DB" &&
+	ok "v0.178 po-dashboard: the minute tick is armed and the view switch and Reports toggle redraw a dirty Reports" || bad "v0.178 tick/shown"
+[[ $(awk '/def on_range\(/,/def on_report_archive\(/' "$DB") == *'self.redraw_reports()'* && $(awk '/def apply_css\(/,/def step_of\(/' "$DB") == *'self.redraw_reports()'* ]] &&
+	ok "v0.178 po-dashboard: a range or variant change still redraws Reports directly" || bad "v0.178 range/variant"
 
 # v0.159: the card rules (card_rule_problems), one case per rule, and the reference card passes unchanged
 block card-rules python3 -B -I - "$DBLIB" <<'PY'
@@ -5442,21 +5557,23 @@ check("README documents the in-flight skip, If-None-Match/304 and ?since=",
 print("BLOCK-END dashboard-feeds")
 PY
 
-grep -q '"unconfigured": core.REPORT_NO_ARCHIVE' "$DB" && ok "po-dashboard shows the not-configured note for the unconfigured plan" || bad "dashboard report note wiring"
 grep -q 'sort by %s' "$DB" && grep -q 'Gtk.Button' "$DB" && ok "po-dashboard headers are buttons labelled sort by <column>" || bad "dashboard header buttons"
 # bin/po-dashboard: argument handling needs no display.
 out=$(env -u PO_DASHBOARD_URL python3 -B "$DB" 2>&1)
 [[ $? == 1 && $out == *'no URL'* && $out == *PO_DASHBOARD_URL* ]] &&
 	ok "po-dashboard without a URL is a usage error naming --url and PO_DASHBOARD_URL" || bad "dashboard no url" "$out"
-out=$(python3 -B "$DB" --url ftp://h/x 2>&1)
-[[ $? == 1 && $out == *'not an http'* ]] && ok "po-dashboard refuses a non-http URL" || bad "dashboard bad url" "$out"
+# one loop: each feed option, and the answer variable, refuses a non-http URL at the CLI with exit 1 (the core resolvers carry the cases)
+for _flag in --url --team-url --decisions-url --answer-url; do
+	if [[ $_flag == --url ]]; then out=$(timeout 10 python3 -B "$DB" --url ftp://h/x --check 2>&1); else out=$(timeout 10 python3 -B "$DB" --url http://h/x "$_flag" ftp://h/x --check 2>&1); fi
+	[[ $? == 1 && $out == *'not an http'* ]] && ok "po-dashboard refuses a non-http $_flag" || bad "dashboard non-http $_flag" "$out"
+done
+out=$(PO_DASHBOARD_ANSWER_URL=ftp://h/x timeout 10 python3 -B "$DB" --url http://h/x --check 2>&1)
+[[ $? == 1 && $out == *'not an http'* ]] && ok "po-dashboard refuses a non-http PO_DASHBOARD_ANSWER_URL" || bad "dashboard answer url env" "$out"
 out=$(python3 -B "$DB" --theme neon --url http://h/x 2>&1)
 [[ $? == 2 && $out == *'--theme'* ]] && ok "po-dashboard rejects an unknown theme" || bad "dashboard theme" "$out"
 out=$(python3 -B "$DB" --size 10x10 --url http://h/x 2>&1)
 [[ $? == 2 && $out == *'--size'* ]] && ok "po-dashboard rejects a window size below 200" || bad "dashboard size" "$out"
 # --team-url: a bad value is a usage error; --check prints the team lines after the events.
-out=$(python3 -B "$DB" --url http://h/x --team-url ftp://h/x 2>&1)
-[[ $? == 1 && $out == *'not an http'* ]] && ok "po-dashboard refuses a non-http team URL" || bad "dashboard team url" "$out"
 printf '[{"agent":"ada","state":"WORKING","now":"1.4","owns":["1.4"],"free":false},{"agent":"cy","state":"idle 3h","now":null,"owns":[],"free":true}]\n' >"$TMP/team.json"
 # --check prints the rows without a display (and needs no GTK).
 # helper
@@ -5498,14 +5615,10 @@ printf '{"order": ["cy"]}\n' >"$TMP/team-order.json"
 out=$(PO_DASHBOARD_TEAM_ORDER="$TMP/team-order.json" PO_DASHBOARD_TEAM_URL="$TMP/team.json" python3 -B "$DB" --url "$CHK_URL" --check 2>&1)
 [[ $(tail -2 <<<"$out" | head -1) == "cy | FREE | now: - | owns: -" && $(tail -1 <<<"$out") == "ada | WORKING | now: 1.4 | owns: 1.4" ]] &&
 	ok "po-dashboard --check applies the saved team order" || bad "dashboard check team order" "$out"
-out=$(PO_DASHBOARD_TEAM_URL="$TMP/none.json" python3 -B "$DB" --url "$CHK_URL" --team-url "$TMP/team.json" --check 2>&1)
-[[ $out == *'team:'* ]] && ok "po-dashboard --team-url wins over PO_DASHBOARD_TEAM_URL" || bad "dashboard team precedence" "$out"
 out=$(env -u PO_DASHBOARD_TEAM_URL python3 -B "$DB" --url "$CHK_URL" --check 2>&1)
 [[ $out != *'team:'* ]] && ok "po-dashboard --check without a team feed prints no team section" || bad "dashboard no team" "$out"
 # --decisions-url: no default; --check prints the decisions, oldest asked first, after the events (and team).
 printf '[{"project":"harbor","item":"0.7","title":"Accept","waiting_for":"an acceptance","asked_at":"2026-10-24T11:30:00Z"},{"project":"orchard","item":"2.3","title":"Pick","waiting_for":"a ruling","asked_at":"2026-10-24T09:00:00Z","thread_url":"https://chat.example.org/t/1"}]\n' >"$TMP/decisions.json"
-out=$(python3 -B "$DB" --url http://h/x --decisions-url ftp://h/x 2>&1)
-[[ $? == 1 && $out == *'not an http'* ]] && ok "po-dashboard refuses a non-http decisions URL" || bad "dashboard decisions url" "$out"
 out=$(python3 -B "$DB" --url http://h/x --view bogus 2>&1)
 [[ $? -ne 0 && $out == *"invalid choice"* ]] && ok "po-dashboard --view accepts reports and rejects an unknown view" || bad "dashboard view bogus" "$out"
 out=$(env -u PO_DASHBOARD_DECISIONS_URL python3 -B "$DB" --url http://h/x --view decisions 2>&1)
@@ -5514,7 +5627,6 @@ out=$(env -u PO_DASHBOARD_DECISIONS_URL python3 -B "$DB" --url http://h/x --view
 out=$(env -u PO_DASHBOARD_PROJECTS_URL python3 -B "$DB" --url http://h/x --view projects 2>&1)
 [[ $? == 1 && $out == *'--projects-url'* && $out == *PO_DASHBOARD_PROJECTS_URL* ]] &&
 	ok "po-dashboard --view projects without a projects feed is a usage error" || bad "dashboard view projects" "$out"
-grep -q 'Gtk.AccessibleProperty.LABEL\], \[c\["text"\]' "$DB" && grep -q 'set_tooltip_text(c\["text"\])' "$DB" && ok "po-dashboard Projects cards carry the light in tooltip and accessible label" || bad "dashboard projects label"
 out=$(PO_DASHBOARD_DECISIONS_URL="$TMP/decisions.json" PO_DASHBOARD_TEAM_URL="$TMP/team.json" python3 -B "$DB" --url "$CHK_URL" --check 2>&1)
 [[ $(tail -3 <<<"$out" | head -1) == "decisions:" && $(tail -2 <<<"$out" | head -1) == "legacy | 2.3 | orchard | Pick | waiting for: a ruling | asked "*" | https://chat.example.org/t/1" &&
 	$(tail -1 <<<"$out") == "legacy | 0.7 | harbor | Accept | waiting for: an acceptance | asked "* && $out == *'team:'* ]] &&
@@ -5546,19 +5658,17 @@ out=$(env -u PO_DASHBOARD_INSTALL_DIR python3 -B "$DB" --url "$CHK_URL" --decisi
 	ok "po-dashboard --check leaves out a held look card, and its Install block" || bad "dashboard check held" "$out"
 out=$(python3 -B "$DB" --url http://h/x --install-dir pkgs --check 2>&1)
 [[ $? == 1 && $out == *'install_dir is not an absolute plain path'* ]] && ok "po-dashboard refuses a relative --install-dir" || bad "dashboard install relative" "$out"
-out=$(PO_DASHBOARD_DECISIONS_URL="$TMP/none.json" python3 -B "$DB" --url "$CHK_URL" --decisions-url "$TMP/decisions.json" --check 2>&1)
-[[ $out == *'decisions:'* ]] && ok "po-dashboard --decisions-url wins over PO_DASHBOARD_DECISIONS_URL" || bad "dashboard decisions precedence" "$out"
 out=$(env -u PO_DASHBOARD_DECISIONS_URL python3 -B "$DB" --url "$CHK_URL" --check 2>&1)
 [[ $out != *'decisions:'* ]] && ok "po-dashboard --check without a decisions feed prints no decisions section" || bad "dashboard no decisions" "$out"
 out=$(python3 -B "$DB" --url "$CHK_URL" --decisions-url "http://127.0.0.1:1/" --check 2>&1)
 [[ $? == 2 && $out == *'cannot reach'* ]] && ok "po-dashboard --check with an unreachable decisions feed exits 2" || bad "dashboard check decisions unreachable" "$out"
 # --answer-url: http(s) only; none is read-only (no error); flag wins over env.
-out=$(python3 -B "$DB" --url "$CHK_URL" --answer-url ftp://h/x --check 2>&1)
-[[ $? == 1 && $out == *'not an http'* ]] && ok "po-dashboard refuses a non-http answer URL" || bad "dashboard answer url" "$out"
-out=$(PO_DASHBOARD_ANSWER_URL=ftp://h/x python3 -B "$DB" --url "$CHK_URL" --check 2>&1)
-[[ $? == 1 && $out == *'not an http'* ]] && ok "po-dashboard refuses a non-http PO_DASHBOARD_ANSWER_URL" || bad "dashboard answer url env" "$out"
-out=$(PO_DASHBOARD_ANSWER_URL=ftp://h/x python3 -B "$DB" --url "$CHK_URL" --answer-url http://h/a --check 2>&1)
-[[ $? == 0 && -n "$out" ]] && ok "po-dashboard --answer-url wins over PO_DASHBOARD_ANSWER_URL" || bad "dashboard answer precedence" "$out"
+# one loop: the option beats its environment variable at the CLI (the core resolvers carry the rest)
+for _p in "--team-url|PO_DASHBOARD_TEAM_URL|$TMP/team.json|team:" "--decisions-url|PO_DASHBOARD_DECISIONS_URL|$TMP/decisions.json|decisions:" "--answer-url|PO_DASHBOARD_ANSWER_URL|http://h/a|"; do
+	IFS='|' read -r _flag _var _good _mark <<<"$_p"
+	out=$(env "$_var=ftp://h/x" python3 -B "$DB" --url "$CHK_URL" "$_flag" "$_good" --check 2>&1)
+	[[ $? == 0 && -n $out && $out == *"$_mark"* ]] && ok "po-dashboard $_flag wins over $_var" || bad "dashboard $_flag precedence" "$out"
+done
 out=$(python3 -B "$DB" --url "$CHK_URL" --answer-url http://h/a --check 2>&1)
 [[ $? == 0 && -n "$out" ]] && ok "po-dashboard --answer-url is accepted, --check runs (read-only)" || bad "dashboard answer check" "$out"
 out=$(python3 -B "$DB" --url "$CHK_URL" --answer-url " " --check 2>&1)
@@ -5642,8 +5752,8 @@ mod.main()
 PY
 		)
 		[[ $out == opened ]] && ok "po-dashboard Projects card activation opens the project screen" || bad "dashboard projects activate" "$out"
-		# v0.139: the GTK switch line is a 44 px click target, a click beside the switch flips it (and does not open
-		# the project), and without a sink the reason is said on the card next to the switch, not only in a tooltip.
+		# v0.139/v0.179: the switch is a 44 px touch area, only the switch flips (a click beside it opens the project),
+		# and without a sink the reason is said on the card next to the switch, not only in a tooltip.
 		python3 -c 'import json, sys; p = json.load(open(sys.argv[1]))
 for e, a in zip(p, (True, False, True)): e["active"] = a
 json.dump(p, open(sys.argv[2], "w"))' "$(dirname "$PO")/../examples/projects-feed.json" "$TMP/v139-projects.json"
@@ -5704,10 +5814,11 @@ def tick():
     if not sink:
         os._exit(0)
     harbor = line_of("harbor")
-    word = next(y for y in walk(harbor) if isinstance(y, Gtk.Label) and y.get_label() == "off")
-    _ok, pt = word.compute_point(harbor, Graphene.Point())
-    g = next(c for c in [harbor.observe_controllers().get_item(i) for i in range(harbor.observe_controllers().get_n_items())] if isinstance(c, Gtk.GestureClick))
-    g.emit("released", 1, pt.x + 2, pt.y + 2)
+    sw = next(y for y in walk(harbor) if isinstance(y, Gtk.Switch))
+    ctrls = [harbor.observe_controllers().get_item(i) for i in range(harbor.observe_controllers().get_n_items())]
+    out("line", "noclick" if not any(isinstance(c, Gtk.GestureClick) for c in ctrls) else "click")
+    out("swsize", "ok" if sw.get_size_request()[1] >= 44 and sw.get_width() < harbor.get_width() else (sw.get_size_request(), sw.get_width(), harbor.get_width()))
+    sw.activate()  # the keyboard path: state-set -> on_switch
     GLib.timeout_add(300, after)
     return False
 def after():
@@ -5721,10 +5832,19 @@ mod.main()
 PY
 			)
 			if [[ -n $_sink ]]; then
-				[[ $out == *"sizes ok"* ]] && ok "v0.139 po-dashboard: each GTK switch line is a click target of at least 44x44 px" || bad "v0.139 GTK switch target" "$out"
+				[[ $out == *"sizes ok"* ]] && ok "v0.139/v0.179 po-dashboard: each GTK switch line is at least 44x44 px" || bad "v0.139 GTK switch target" "$out"
 				[[ $out == *"reason none"* && $out == *"flip on overview"* ]] &&
-					ok "v0.139 po-dashboard: a click on the switch's word flips the GTK switch and leaves the overview open; no reason shown with a sink" ||
-					bad "v0.139 GTK switch line click" "$out"
+					ok "v0.179 po-dashboard: the switch flips by its own activation (keyboard path); no reason shown with a sink" ||
+					bad "v0.179 GTK switch activation flips" "$out"
+				[[ $out == *"line noclick"* ]] &&
+					ok "v0.179 po-dashboard: the switch line has no click gesture, so a click beside the switch does not flip it (it opens the project)" ||
+					bad "v0.179 GTK switch line has no click gesture" "$out"
+				! grep -q "on_switch_line" "$DB" &&
+					ok "v0.179 po-dashboard: the whole-line handlers on_switch_line and on_switch_line_press are gone" ||
+					bad "v0.179 GTK line handlers gone" "$out"
+				[[ $out == *"swsize ok"* ]] &&
+					ok "v0.179 po-dashboard: the switch itself has a 44 px touch area and is narrower than its line" ||
+					bad "v0.179 GTK switch own touch area" "$out"
 			else
 				[[ $out == *"sizes ok"* && $out == *"reason inline"* ]] &&
 					ok "v0.139 po-dashboard: without a sink the GTK card says read-only: no answer URL next to the switch" ||
@@ -6232,7 +6352,8 @@ class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 srv = http.server.HTTPServer(("127.0.0.1", 0), H)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
-sys.argv = [db, "--url", "http://127.0.0.1:%d/" % srv.server_address[1], "--team-url", team, "--projects-url", projects, "--view", "team", "--no-memory-log"]
+sys.argv = [db, "--url", "http://127.0.0.1:%d/" % srv.server_address[1], "--team-url", team, "--projects-url", projects,
+            "--decisions-url", os.path.join(os.path.dirname(projects), "decisions-feed.json"), "--archive-url", events, "--view", "team", "--no-memory-log"]
 loader = importlib.machinery.SourceFileLoader("po_dashboard", db)
 mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("po_dashboard", loader))
 loader.exec_module(mod)
@@ -6269,14 +6390,34 @@ def run(win):
         texts = [n.get_label() for n in walk(win.team_list) if isinstance(n, Gtk.Label)]
         say("usage-once", win.status.get_label() == "3 agents · subscription 5h 22% · 7d 64%" and not any("22%" in t for t in texts), (win.status.get_label(), texts))
         say("tab-selected", win.view_buttons["team"].get_active() and win.view_buttons["team"].has_css_class("po-view"))
+        def smalls():
+            return [n for n in walk(win.win) if n.has_css_class("po-small") and n.get_mapped()]
+        def small_check(state):  # the measured minimum is the border box (padding and border in, no margin on .po-small)
+            s = smalls()
+            tall = [n.measure(Gtk.Orientation.VERTICAL, -1)[0] for n in s]
+            say("small-" + state, len(s) >= 2 and 24 <= min(tall) and max(tall) <= 26, (state, len(s), sorted(set(tall))))
+            return [n.get_label() for n in s]
         win.view_buttons["events"].set_active(True)
+        win.reports_button.set_active(False)
+        say("small-archive", "Archive" in small_check("toolbar"))
+        end = GLib.get_monotonic_time() + 500000  # let the frame clock allocate the toolbar after the view switch
+        while GLib.get_monotonic_time() < end:
+            GLib.MainContext.default().iteration(False)
+        # the allocated border box of the built toolbar buttons (get_height() is the content box and leaves out padding and border)
+        boxes = [n.compute_bounds(n.get_parent())[1] for n in smalls()]
+        heights = sorted(set(round(b.get_height()) for b in boxes))
+        say("small-allocated", len(boxes) >= 2 and 24 <= heights[0] and heights[-1] <= 26 and min(b.get_width() for b in boxes) >= 24, heights)
         win.reports_button.set_active(True)
+        small_check("reports")
         st = win.status.get_label()
         say("reports-header", win.title_label.get_label() == "Reports" and st.startswith("7 d · as of ") and "events" not in st, (win.title_label.get_label(), st))
         win.reports_button.set_active(False)
         say("events-header", win.title_label.get_label() == "Gate events", win.title_label.get_label())
         win.view_buttons["projects"].set_active(True)
         win.open_project(win.projects[0]["project"])
+        small_check("project-screen")
+        win.view_buttons["decisions"].set_active(True)
+        say("small-actions", {"Actions", "Decisions"} <= set(small_check("decisions")))
         toggles = [n for n in walk(win.pscreen) if isinstance(n, Gtk.ToggleButton)]
         on = [t.get_label() for t in toggles if t.get_active()]
         say("screen-doing", len(on) == 1 and on[0].startswith("DOING "), on)
@@ -6290,7 +6431,7 @@ GLib.timeout_add(100, tick)
 mod.main()
 PY
 		)
-		for t in panels flat-rows usage-once tab-selected reports-header events-header screen-doing screen-buttons screen-panel; do
+		for t in panels flat-rows usage-once tab-selected reports-header events-header screen-doing screen-buttons screen-panel small-toolbar small-archive small-allocated small-reports small-project-screen small-decisions small-actions; do
 			case $t in
 			panels) m="Events, Team and Decisions each draw one raised panel (po-panel)" ;;
 			flat-rows) m="the Team and Events lines inside it are flat rows (po-row), not cards of their own" ;;
@@ -6301,6 +6442,13 @@ PY
 			screen-doing) m="a project screen opens on DOING" ;;
 			screen-buttons) m="the project screen's filter buttons are the small po buttons, not stock GTK" ;;
 			screen-panel) m="the project screen's items are flat rows in one panel" ;;
+			small-toolbar) m="every small button of the Events toolbar measures 24 to 26 px tall, border included (ui-guidelines 1.10)" ;;
+			small-allocated) m="the built toolbar's small buttons are allocated 24 to 26 px tall and at least 24 px wide, border included" ;;
+			small-reports) m="the Reports header's small buttons measure 24 to 26 px tall" ;;
+			small-project-screen) m="the project screen's small buttons measure 24 to 26 px tall" ;;
+			small-archive) m="the Archive button (shown with an archive feed) is one of the measured small buttons" ;;
+			small-decisions) m="the Decisions view's small buttons measure 24 to 26 px tall" ;;
+			small-actions) m="the Actions and Decisions filter buttons are among them" ;;
 			esac
 			grep -qx "PASS $t" <<<"$out" && ok "po-dashboard v0.142: $m" || bad "dashboard v0.142 $t" "$out"
 		done
@@ -7229,8 +7377,826 @@ else
 	bad "row split: the wrong-count message lacks the pipe sentence" "$RS_BAD"
 fi
 
+# ---- backlog load (v0.161): no subshell per heading or cell ------------------
+# The golden dumps and die messages below were written against the loader as it
+# was before v0.161 (memory 20261031-050608-0864): the parse must not change.
+BL=$TMP/bl
+bl_repo() { # <dir>: a backlog with tables (owner column, odd shapes) and heading specs
+	local d=$1
+	rm -rf "$d"
+	git init -q -b main "$d"
+	git -C "$d" config user.name t
+	git -C "$d" config user.email t@example.invalid
+	mkdir -p "$d/docs/backlog"
+	printf '[versioning]\ntag = "v{version}"\n\n[layout]\nbacklog = "docs/BACKLOG.md"\nspecs_dir = "docs/backlog"\nworktrees = ".wt"\nbranch = "item-v{version}"\nowner_column = "Owner"\n\n[project]\nname = "bl"\n' >"$d/po.toml"
+	# shellcheck disable=SC2016 # the backticks are fixture text
+	printf '%s\n' '# Backlog' '' 'Intro line.' \
+		'  | Item | Title | Owner | Status |  ' '|---|---|---|---|' \
+		'| v1.1 | One | ann | DONE |' '| v1.2 |  | bob | DOING |' '| note | not an item | x | TODO |' \
+		'| v1.1 | One again | carl | DONE |' '| `v1.3` | Coded | dee | TODO |' \
+		'| v1.4 | Pipe `a|b` and x\|y | eve | PAUSED |' '| v1.7 | Seven |  | DONE (no change) |' '' \
+		'| Status | Item |' '|---|---|' '| BLOCKED | v1.5 |' '' \
+		'| Item | Title |' '|---|---|' '| v9.9 | no status column |' 'Para' \
+		'| Item | Status | Title |' '|:-|:-:|-:|' '| v1.6 | TODO | after status |' >"$d/docs/BACKLOG.md"
+	printf '%s\n' '# Specs a' '## v2.1 — Heading one — DONE' 'text' '## v2.2 — Two — parts — DOING extra words' \
+		'### v2.5 — sub heading ignored — DOING' '## Not an item' '## v2.3 — T — NOTE — later' >"$d/docs/backlog/a.md"
+	printf '%s\n' '## v2.4 — T — wait — PAUSED — x' $'## v2.6 — Tab\there — TODO' '## v2.10 — Ten — DONE' >"$d/docs/backlog/b.md"
+	printf '%s\n' '## v8.8 — not markdown — DOING' >"$d/docs/backlog/c.txt"
+	git -C "$d" add -A
+	git -C "$d" commit -qm init
+}
+bl_dump() { # <dir>: PO_ITEMS then PO_OWNERS (sorted) after the load, tabs shown as ">"
+	(
+		set +u
+		cd "$1" || exit 1
+		# shellcheck source=/dev/null
+		source "$KITROOT/lib/po/manifest.sh"
+		# shellcheck source=/dev/null
+		source "$KITROOT/lib/po/backlog.sh"
+		po_manifest_load "$1/po.toml"
+		po_backlog_load
+		printf 'I %s\n' "${PO_ITEMS[@]}"
+		for k in "${!PO_OWNERS[@]}"; do printf 'O %s=%s\n' "$k" "${PO_OWNERS[$k]}"; done | LC_ALL=C sort
+	) 2>&1 | tr '\t' '>'
+}
+bl_repo "$BL"
+# shellcheck disable=SC2016 # the backticks are fixture text
+BL_WANT='I 1.1>DONE>One>docs/BACKLOG.md:6
+I 1.2>DOING>>docs/BACKLOG.md:7
+I 1.1>DONE>One again>docs/BACKLOG.md:9
+I 1.4>PAUSED>Pipe `a|b` and x|y>docs/BACKLOG.md:11
+I 1.7>DONE (no change)>Seven>docs/BACKLOG.md:12
+I 1.5>BLOCKED>>docs/BACKLOG.md:16
+I 1.6>TODO>>docs/BACKLOG.md:24
+I 2.1>DONE>Heading one>docs/backlog/a.md:2
+I 2.2>DOING>Two — parts>docs/backlog/a.md:4
+I 2.3>NOTE>T>docs/backlog/a.md:7
+I 2.4>PAUSED>T — wait>docs/backlog/b.md:1
+I 2.6>TODO>Tab	here>docs/backlog/b.md:2
+I 2.10>DONE>Ten>docs/backlog/b.md:3
+O 1.1=ann
+O 1.2=bob
+O 1.4=eve
+O 1.7='
+BL_WANT=${BL_WANT//	/>}
+BL_GOT=$(bl_dump "$BL")
+[[ $BL_GOT == "$BL_WANT" ]] &&
+	ok "v0.161 backlog load: PO_ITEMS and PO_OWNERS match the unchanged loader's golden (tables, owner column, odd rows, headings)" ||
+	bad "v0.161 backlog load golden" "$(diff <(printf '%s\n' "$BL_WANT") <(printf '%s\n' "$BL_GOT"))"
+
+# Each die of the loader, word for word: <file> <line to append> <message>.
+bl_die() {
+	local file=$1 add=$2 want=$3 got
+	bl_repo "$BL"
+	if [[ $file == - ]]; then
+		git -C "$BL" rm -rq "$add" && git -C "$BL" commit -qm gone
+	else
+		printf '%s\n' "$add" >>"$BL/$file" && git -C "$BL" commit -qam case
+	fi
+	got=$(bl_dump "$BL")
+	[[ $got == "po: $want" ]] &&
+		ok "v0.161 backlog load: dies with the unchanged message: $want" ||
+		bad "v0.161 backlog load die: $want" "got: $got"
+}
+bl_die docs/BACKLOG.md $'\n| Item | status |' "docs/BACKLOG.md:26: column header 'status' is not written exactly as Status"
+bl_die docs/BACKLOG.md $'\n| Status | Item | Status |' "docs/BACKLOG.md:26: two Status columns"
+bl_die docs/BACKLOG.md $'\n| Owner | Item | Status | Owner |' "docs/BACKLOG.md:26: two Owner columns"
+bl_die docs/BACKLOG.md '| v3.1 | TODO | T | x |' "docs/BACKLOG.md:25: row has 4 cells, header has 3; a pipe inside a code span or written as backslash-pipe is not a separator"
+bl_die docs/BACKLOG.md '| v3.1 | **DOING** | T |' "docs/BACKLOG.md:25: status '**DOING**' is not written exactly as DOING"
+bl_die docs/BACKLOG.md '| x3.1 | DOING | T |' "docs/BACKLOG.md:25: DOING row has no cell in tag form (v{version})"
+bl_die docs/backlog/b.md '## v3x — T — DONE' "docs/backlog/b.md:4: heading id 'v3x' is not in tag form (v{version})"
+bl_die docs/backlog/b.md '## v3.1 T DONE' "docs/backlog/b.md:4: heading has no ' — ' after its id"
+bl_die docs/backlog/b.md '## v3.1 — T' "docs/backlog/b.md:4: heading has no status segment"
+bl_die docs/backlog/b.md '## v3.1 — T — DONE — TODO' "docs/backlog/b.md:4: two status-like segments ('DONE', 'TODO')"
+bl_die docs/backlog/b.md '## v3.1 — T — done' "docs/backlog/b.md:4: heading has no ALL-CAPS status segment"
+bl_die docs/backlog/b.md '## v3.1 — T — Doing now' "docs/backlog/b.md:4: status 'Doing now' is not written exactly as DOING"
+bl_die - docs/BACKLOG.md "backlog 'docs/BACKLOG.md' not found on main"
+bl_die - docs/backlog "specs_dir 'docs/backlog' not found on main"
+
+# Forks: 300 more headings add no process. Counted as the PID gap across the
+# load inside a fresh PID namespace (unshare), where every fork takes the next
+# PID; without unshare, the smallest gap of 5 runs on the host.
+bl_repo "$BL"
+for _i in $(seq 1 300); do printf '## v5.%s — Item %s — TODO\n' "$_i" "$_i"; done >"$BL/docs/backlog/many.md"
+git -C "$BL" add -A && git -C "$BL" commit -qm many
+bl_forks() {
+	(
+		set +u
+		cd "$BL" || exit 1
+		# shellcheck source=/dev/null
+		source "$KITROOT/lib/po/manifest.sh"
+		# shellcheck source=/dev/null
+		source "$KITROOT/lib/po/backlog.sh"
+		po_manifest_load "$BL/po.toml"
+		local a b
+		a=$(printf '%s' "$BASHPID")
+		po_backlog_load
+		b=$(printf '%s' "$BASHPID")
+		((${#PO_ITEMS[@]} >= 313)) || { printf 'only %s items\n' "${#PO_ITEMS[@]}"; exit 1; }
+		printf '%s\n' "$((b - a - 1))"
+	)
+}
+if unshare -rpf --mount-proc true 2>/dev/null; then
+	BL_HOW='in a PID namespace'
+	# helper
+	BL_FORKS=$(KITROOT=$KITROOT BL=$BL unshare -rpf --mount-proc bash -c "$(declare -f bl_forks); bl_forks" 2>&1)
+else
+	BL_HOW='on the host, least of 5 runs'
+	BL_FORKS=$(for _i in 1 2 3 4 5; do bl_forks; done 2>&1 | sort -n | head -1)
+fi
+[[ $BL_FORKS =~ ^[0-9]+$ ]] && ((BL_FORKS <= 20)) &&
+	ok "v0.161 backlog load: 313 items load with $BL_FORKS forks, at most 20 ($BL_HOW)" ||
+	bad "v0.161 backlog load forks ($BL_HOW): want at most 20" "$BL_FORKS"
+
+# po_unfill_into gives what po_unfill gives; po_trim_into what po_trim gives.
+bl_unfill() {
+	(
+		set +u
+		# shellcheck source=/dev/null
+		source "$KITROOT/lib/po/manifest.sh"
+		# shellcheck source=/dev/null
+		source "$KITROOT/lib/po/backlog.sh"
+		local tpl text want a rc_a b rc_b
+		while IFS='|' read -r tpl text want; do
+			a=$(po_unfill "$tpl" "$text")
+			rc_a=$?
+			b=keep
+			po_unfill_into "$tpl" "$text" b
+			rc_b=$?
+			((rc_b != 0)) && b=-
+			((rc_a != 0)) && a=-
+			[[ $a == "$want" && $b == "$want" ]] &&
+				printf 'ok\tv0.161 po_unfill_into: %s on %s gives %s, as po_unfill\t\n' "$tpl" "${text:-(empty)}" "$want" ||
+				printf 'FAIL\tv0.161 po_unfill_into: %s on %s\twant %s, po_unfill %s, po_unfill_into %s\n' "$tpl" "$text" "$want" "$a" "$b"
+		done <<<'v{version}|v1.2.3|1.2.3
+v{version}|v1.2|1.2
+v{version}|v1|-
+v{version}|vX.Y|-
+v{version}|v1.x|-
+v{version}|x1.2|-
+v{version}||-
+{version}|1.10|1.10
+item-v{version}|item-v0.161|0.161
+item-v{version}|v0.161|-
+rel-{version}-final|rel-2.0-final|2.0
+rel-{version}-final|rel-2.0|-'
+		local s t
+		for s in '' '  a b  ' $'\t x \t' 'none' '   '; do
+			t=keep
+			po_trim_into "$s" t
+			[[ $t == "$(po_trim "$s")" ]] &&
+				printf 'ok\tv0.161 po_trim_into: %q trims as po_trim\t\n' "$s" ||
+				printf 'FAIL\tv0.161 po_trim_into: %q\tgot %q\n' "$s" "$t"
+		done
+		printf 'BLOCK-END bl_unfill\n'
+	)
+}
+block bl_unfill bl_unfill
+
+# ---- the agent switch (v0.173): [team] inactive_file, po team off|on --------
+# An agent named in the switch file is OFF: inactive in the feed, never free,
+# never given an item by dispatch. po team off|on writes the file in place.
+AS=$TMP/agent-switch
+mkdir -p "$AS/docs"
+git init -q -b main "$AS"
+git -C "$AS" config user.name t
+git -C "$AS" config user.email t@example.invalid
+cat >"$AS/docs/BACKLOG.md" <<'MD'
+# Backlog
+
+| Item | Status | Owner |
+|---|---|---|
+| v1.1 | DOING | ada |
+| v1.2 | TODO |  |
+| v1.3 | TODO |  |
+MD
+cat >"$AS/ready.jsonl" <<'JL'
+{"item":"v1.2","title":"Two","agents":["bo"]}
+JL
+as_manifest() { # [extra [team] lines...]
+	cat <<'TOML'
+[versioning]
+tag = "v{version}"
+admin_prefix = "admin:"
+insert_segment = 2
+
+[layout]
+backlog = "docs/BACKLOG.md"
+specs_dir = "docs"
+worktrees = ".wt"
+branch = "item-v{version}"
+owner_column = "Owner"
+
+[ready]
+file = "ready.jsonl"
+
+TOML
+	if (($# > 0)); then
+		printf '[team]\n'
+		printf '%s\n' "$@"
+		printf '\n'
+	fi
+	cat <<'TOML'
+[[team.agent]]
+name = "ada"
+
+[[team.agent]]
+name = "Bo"
+
+[[team.agent]]
+name = "cy"
+
+[[team.agent]]
+name = "di"
+TOML
+}
+as_manifest 'inactive_file = "inactive-agents"' >"$AS/po.toml"
+printf '# agents switched off\n\n  BO  \nada\n# cy\n' >"$AS/inactive-agents"
+git -C "$AS" add -A
+git -C "$AS" commit -qm init
+# ada works on v1.1 (fresh event); bo, cy and di are idle and own nothing.
+printf '{"time":"%s","kind":"stamp","item":"v1.1","project":"as","result":"pass","agent":"ada","legs":[],"detail":""}\n' \
+	"$(date -u -d "1 minute ago" +%Y-%m-%dT%H:%M:%SZ)" >"$AS/.git/po-events.jsonl"
+AJ=$("$PO" -C "$AS" team --json 2>&1)
+[[ $(tjson '[a["Bo"].get("inactive"), a["Bo"]["free"], a["Bo"]["state"], a["Bo"]["owns"]]' <<<"$AJ") == "True False idle never []" ]] &&
+	ok "v0.173 team: a listed idle agent that owns nothing is inactive and not free, its state unchanged" || bad "v0.173 team listed idle" "$AJ"
+[[ $(tjson '[a["ada"].get("inactive"), a["ada"]["free"], a["ada"]["state"], a["ada"]["now"]]' <<<"$AJ") == "True False WORKING 1.1" ]] &&
+	ok "v0.173 team: a listed WORKING agent is inactive, keeps its state and its item" || bad "v0.173 team listed working" "$AJ"
+[[ $(tjson '["inactive" in a["cy"], a["cy"]["free"], "inactive" in a["di"], a["di"]["free"]]' <<<"$AJ") == "False True False True" ]] &&
+	ok "v0.173 team: an unlisted agent (and a commented-out name) has no inactive key and stays free" || bad "v0.173 team unlisted" "$AJ"
+out=$("$PO" -C "$AS" team 2>&1)
+[[ $(awk '$1 == "Bo" {print $(NF-2)}' <<<"$out") == OFF && $(awk '$1 == "ada" {print $(NF-2)}' <<<"$out") == OFF && $(awk '$1 == "cy" {print $(NF-2)}' <<<"$out") == true && $(head -n 1 <<<"$out") == AGENT*STATE*NOW*OWNS*FREE*LIMIT*USAGE ]] &&
+	ok "v0.173 team: the table prints OFF in the FREE column, no new column" || bad "v0.173 team table OFF" "$out"
+mv "$AS/inactive-agents" "$TMP/as-saved"
+out=$("$PO" -C "$AS" team --json 2>&1)
+[[ $out != *inactive* && $out != *warning* && $(tjson '[a["Bo"]["free"]]' <<<"$out") == True ]] &&
+	ok "v0.173 team: a missing switch file means nobody is inactive" || bad "v0.173 team missing file" "$out"
+mv "$TMP/as-saved" "$AS/inactive-agents"
+# dispatch: v1.2 may go only to bo, who is OFF.
+out=$("$PO" -C "$AS" dispatch --plan 2>&1)
+[[ $out == *'skip      v1.2  no free eligible agent (Bo is inactive)'* ]] &&
+	ok "v0.173 dispatch --plan: the only eligible agent inactive is a skip that names it" || bad "v0.173 dispatch skip inactive" "$out"
+printf '{"item":"v1.2","title":"Two","agents":["bo","cy"]}\n' >"$AS/ready.jsonl"
+out=$("$PO" -C "$AS" dispatch --plan 2>&1)
+[[ $out == *'assign    v1.2  to cy'* && $out != *inactive* ]] &&
+	ok "v0.173 dispatch --plan: with a second free eligible agent the item goes to it" || bad "v0.173 dispatch second agent" "$out"
+git -C "$AS" checkout -q -- ready.jsonl
+# The CLI. Fixture: no final newline, comments and a blank line kept.
+SWF=$AS/inactive-agents
+printf '# agents switched off\n\nada' >"$SWF"
+cp "$SWF" "$TMP/as-orig"
+as_ino=$(stat -c %i "$SWF")
+out=$("$PO" -C "$AS" team off cy 2>&1); code=$?
+[[ $code == 0 && $out == *'would switch cy off'* ]] && cmp -s "$SWF" "$TMP/as-orig" &&
+	ok "v0.173 team off without --commit prints the plan and writes nothing" || bad "v0.173 team off dry run (exit $code)" "$out"
+out=$("$PO" -C "$AS" team on ada 2>&1); code=$?
+[[ $code == 0 && $out == *'would switch ada on'* ]] && cmp -s "$SWF" "$TMP/as-orig" &&
+	ok "v0.173 team on without --commit prints the plan and writes nothing" || bad "v0.173 team on dry run (exit $code)" "$out"
+out=$("$PO" -C "$AS" team off cy --commit 2>&1); code=$?
+[[ $code == 0 && $out == *'cy is now inactive'* && $(tail -n 1 "$SWF") == cy ]] &&
+	ok "v0.173 team off --commit appends the agent as the last line" || bad "v0.173 team off commit (exit $code)" "$out / $(cat "$SWF")"
+[[ $(stat -c %i "$SWF") == "$as_ino" ]] &&
+	ok "v0.173 team off --commit rewrites the file in place (same inode)" || bad "v0.173 team off inode"
+out=$("$PO" -C "$AS" team off CY --commit 2>&1); code=$?
+[[ $code == 0 && $out == *'cy is already inactive'* && $(grep -ci '^cy$' "$SWF") == 1 ]] &&
+	ok "v0.173 team off twice is already, no duplicate line (names match without case)" || bad "v0.173 team off twice (exit $code)" "$out / $(cat "$SWF")"
+out=$("$PO" -C "$AS" team on cy --commit 2>&1); code=$?
+[[ $code == 0 && $out == *'cy is now active'* ]] && cmp -s "$SWF" "$TMP/as-orig" &&
+	ok "v0.173 team off then on of the last line is byte-exact (no final newline kept)" || bad "v0.173 team round trip (exit $code)" "$out / $(od -c "$SWF")"
+[[ $(stat -c %i "$SWF") == "$as_ino" ]] &&
+	ok "v0.173 team on --commit rewrites the file in place (same inode)" || bad "v0.173 team on inode"
+out=$("$PO" -C "$AS" team on cy --commit 2>&1); code=$?
+[[ $code == 0 && $out == *'cy is already active'* ]] && cmp -s "$SWF" "$TMP/as-orig" &&
+	ok "v0.173 team on of an active agent is already, nothing written" || bad "v0.173 team on twice (exit $code)" "$out"
+printf 'ada\nbo\ncy\n' >"$SWF"
+"$PO" -C "$AS" team on Bo --commit >/dev/null 2>&1
+"$PO" -C "$AS" team off bo --commit >/dev/null 2>&1
+[[ $(cat "$SWF") == $'ada\ncy\nBo' && $(tail -c 1 "$SWF" | od -An -c | tr -d ' ') == '\n' ]] &&
+	ok "v0.173 team on then off of a middle line brings it back at the end (roster spelling)" || bad "v0.173 team middle line" "$(od -c "$SWF")"
+printf 'ada\n' >"$SWF"
+cp "$SWF" "$TMP/as-orig"
+out=$("$PO" -C "$AS" team off ghost --commit 2>&1); code=$?
+[[ $code == 2 && $out == *ghost* ]] && cmp -s "$SWF" "$TMP/as-orig" &&
+	ok "v0.173 team off of an agent not in the roster exits 2 and writes nothing" || bad "v0.173 team unknown agent (exit $code)" "$out"
+rm -f "$SWF"
+out=$("$PO" -C "$AS" team off di --commit 2>&1); code=$?
+[[ $code == 0 && $(cat "$SWF") == di ]] &&
+	ok "v0.173 team off with no switch file yet creates it" || bad "v0.173 team off creates (exit $code)" "$out"
+as_manifest >"$AS/po.toml"
+out=$("$PO" -C "$AS" team off di --commit 2>&1); code=$?
+[[ $code == 2 && $out == *'no [team] inactive_file'* ]] &&
+	ok "v0.173 team off without [team] inactive_file exits 2" || bad "v0.173 team no inactive_file (exit $code)" "$out"
+expect "v0.173 team off needs an agent" 1 "team off: give an agent" -- -C "$AS" team off
+expect "v0.173 team off takes one agent" 1 "team: unknown argument" -- -C "$AS" team off di cy
+git -C "$AS" checkout -q -- po.toml
+
+# ---- po land (v0.181): rebase, stamp, close, changelog, push in one command ----
+# Stubs live outside every fixture repo: a gate that records each run (and
+# whether the item's tag exists yet) and fails on demand, and a push command
+# that records what it was given. Both append to one order file.
+LD=$TMP/land
+mkdir -p "$LD"
+cat >"$LD/gate.sh" <<EOF
+printf 'stamp %s tag=%s\n' "\$(git rev-parse HEAD)" "\$(git tag -l v1.0.3 | grep -c .)" >>"$LD/order"
+[ -e "$LD/gate.fail" ] && { echo "stub gate: failing as told"; exit 1; }
+exit 0
+EOF
+cat >"$LD/push.sh" <<EOF
+printf 'push repo=%s tag=%s env=%s/%s/%s\n' "\$1" "\$(git -C "\$1" tag -l v1.0.3 | grep -c .)" "\$PO_VERSION" "\$PO_TAG" "\$(git -C "\$1" rev-parse --short "\$PO_ADMIN_COMMIT")" >>"$LD/order"
+[ -e "$LD/push.fail" ] && { echo "stub push: failing as told" >&2; exit 3; }
+exit 0
+EOF
+# land_manifest <file> <with-push> <with-changelog>
+land_manifest() {
+	{
+		printf '[gate]\ntest_count_cmd = "echo '"'"'test result: ok. 1 passed; 0 failed;'"'"'"\n\n[gate.legs]\ncheck = "sh %s/gate.sh"\n\n' "$LD"
+		printf '[versioning]\ntag = "v{version}"\nitem_commit = "v{version}: {title}"\nadmin_prefix = "admin:"\ninsert_segment = 4\n\n'
+		printf '[layout]\nbacklog = "docs/BACKLOG.md"\nspecs_dir = "docs/backlog"\nworktrees = ".wt"\nbranch = "item-v{version}"\n\n'
+		printf '[close]\nmemory = true\n'
+		[[ $3 == 0 ]] || printf 'changelog = "CHANGELOG.md"\n'
+		[[ $2 == 0 ]] || printf '\n[land]\npush = "sh %s/push.sh {repo}"\n' "$LD"
+	} >"$1"
+}
+LM=$LD/land.toml && land_manifest "$LM" 1 1
+LM_NOPUSH=$LD/nopush.toml && land_manifest "$LM_NOPUSH" 0 1
+LM_NOCL=$LD/nochangelog.toml && land_manifest "$LM_NOCL" 1 0
+# make_lrepo <dir> [behind]: make_brepo's backlog plus a CHANGELOG.md, the
+# v1.0.3 branch one item commit with a passing stamp; with `behind`, main
+# then moves on by one commit (the branch needs a rebase).
+make_lrepo() {
+	local dir=$1
+	git init -q -b main "$dir"
+	git -C "$dir" config user.name "Boundary PO"
+	git -C "$dir" config user.email po@example.invalid
+	mkdir -p "$dir/docs/backlog"
+	cat >"$dir/docs/BACKLOG.md" <<'EOF'
+# Backlog
+
+Epic one — **v1.0.3 DOING; spec backlog/v1.md** · E0 — v1.0.2 DONE (tag v1.0.2).
+
+| Item | Title | Status |
+|---|---|---|
+| v1.0.1 | First | DONE |
+| v1.0.3 | Third | DOING |
+EOF
+	cat >"$dir/docs/backlog/v1.md" <<'EOF'
+# v1 specs
+
+## v1.0.1 — First — DONE
+
+## v1.0.2 — Second — DONE (no bump)
+
+## v1.0.3 — Third — DOING
+
+Body of three.
+EOF
+	printf '# Changelog\n\n## Unreleased\n\n### An older entry (v1.0.2)\n\n- the second thing.\n\n## Release 1 (2026-01-01): first\n\n- the first thing.\n' >"$dir/CHANGELOG.md"
+	git -C "$dir" add -A
+	git -C "$dir" commit -qm init
+	git -C "$dir" tag v1.0.2
+	git -C "$dir" worktree add -q "$dir/.wt/item-v1.0.3" -b item-v1.0.3
+	echo three >"$dir/.wt/item-v1.0.3/three.txt"
+	git -C "$dir/.wt/item-v1.0.3" add three.txt
+	git -C "$dir/.wt/item-v1.0.3" commit -qm "v1.0.3: Third"
+	"$PO" -C "$dir/.wt/item-v1.0.3" --manifest "$LM" stamp >/dev/null 2>&1
+	if [[ ${2:-} == behind ]]; then
+		echo other >"$dir/other.txt"
+		git -C "$dir" add other.txt
+		git -C "$dir" commit -qm "admin: main moves on"
+	fi
+	: >"$LD/order"
+	rm -f "$LD/gate.fail" "$LD/push.fail"
+}
+lsnap() { # everything a land could touch, in and around one fixture
+	git -C "$1" for-each-ref --format='%(refname) %(objectname)'
+	git -C "$1" worktree list --porcelain
+	git -C "$1" status --porcelain --untracked-files=all --ignored
+	git -C "$1/.wt/item-v1.0.3" status --porcelain --untracked-files=all --ignored 2>/dev/null
+	git -C "$1/.wt/item-v1.0.3" rev-parse HEAD 2>/dev/null
+	ls "$1/.wt/item-v1.0.3" 2>/dev/null
+	cat "$1/docs/BACKLOG.md" "$1/docs/backlog/v1.md" "$1/CHANGELOG.md"
+	find "$1/.git/po-land" 2>/dev/null | sort
+	cat "$LD/order"
+}
+printf 'v1.0.3 report — item-v1.0.3\n\nFiles changed: three.txt\n\nPROPOSED:\n1. the number three is the best one\n\nMemory: proposed 20261103-120000-ab12 (next time X, do Y, because Z)\n' >"$LD/report.md"
+printf '### Third thing lands (v1.0.3)\n\n- three.txt added.\n' >"$LD/changelog.md"
+
+# po land record: the trigger record, outside the worktree.
+L1=$TMP/land-1
+make_lrepo "$L1" behind
+expect "land record refuses an item that is not DOING" 6 'v1\.0\.2 is DONE, not DOING' -- -C "$L1" --manifest "$LM" land record 1.0.2 --spec-met --by dante
+expect "land record needs --spec-met" 1 'needs --spec-met' -- -C "$L1" --manifest "$LM" land record 1.0.3 --by dante
+expect "land record needs --by" 1 'needs --by' -- -C "$L1" --manifest "$LM" land record 1.0.3 --spec-met
+expect "land refuses an item with no SPEC MET record (exit 6, land: REFUSED on stdout)" 6 '^land: REFUSED no SPEC MET recorded for v1\.0\.3' -- -C "$L1" --manifest "$LM" land 1.0.3
+[[ ! -s $LD/order ]] && ok "land with no record ran no gate" || bad "land without a record ran the gate" "$(cat "$LD/order")"
+expect "land record writes the SPEC MET record" 0 'recorded SPEC MET for v1\.0\.3 by first' -- -C "$L1" --manifest "$LM" land record 1.0.3 --spec-met --by first --ref msg-1
+grep -q '^by=first at=[0-9T:-]*Z ref=msg-1$' "$L1/.git/po-land/1.0.3/spec-met" &&
+	ok "the record is one line (by, at, ref) in the common git dir, not the worktree" || bad "record file" "$(cat "$L1/.git/po-land/1.0.3/spec-met" 2>&1)"
+! git -C "$L1/.wt/item-v1.0.3" status --porcelain --untracked-files=all | grep -qv 'gate-' &&
+	ok "the record leaves the worktree clean" || bad "record dirtied the worktree"
+"$PO" -C "$L1" --manifest "$LM" land record 1.0.3 --spec-met --by dante --ref msg-2 --report-file "$LD/report.md" --changelog-file "$LD/changelog.md" >/dev/null 2>&1
+grep -q '^by=dante at=.* ref=msg-2$' "$L1/.git/po-land/1.0.3/spec-met" && [[ -f $L1/.git/po-land/1.0.3/report.md && -f $L1/.git/po-land/1.0.3/changelog.md ]] &&
+	ok "a second land record replaces the first (a new SPEC MET after a FIX?)" || bad "record overwrite" "$(cat "$L1/.git/po-land/1.0.3/spec-met")"
+
+# --dry-run: every pre-flight check as a plan line, then the steps; nothing runs, nothing is written.
+before=$(lsnap "$L1")
+out=$("$PO" -C "$L1" --manifest "$LM" land 1.0.3 --dry-run 2>&1)
+code=$?
+[[ $code == 0 && $(lsnap "$L1") == "$before" ]] && ok "land --dry-run exits 0 and writes nothing (refs, trees, record, order file all equal)" || bad "land dry run (exit $code)" "$out"
+grep -q 'DRY RUN' <<<"$out" && grep -q 'record *ok: SPEC MET by dante' <<<"$out" && grep -q 'commits *ok: 1 commit' <<<"$out" &&
+	ok "land --dry-run reports each pre-flight check as ok" || bad "dry run checks" "$out"
+grep -qE 'rebase: needed, main at [0-9a-f]+ vs merge-base [0-9a-f]+' <<<"$out" && grep -q 'stamp: would run check' <<<"$out" &&
+	grep -q 'SPEC MET: dante' <<<"$out" && grep -q 'Memory: proposed 20261103-120000-ab12' <<<"$out" &&
+	grep -qF "push: sh $LD/push.sh $L1" <<<"$out" &&
+	ok "land --dry-run prints the rebase, stamp, close body and push plan" || bad "dry run steps" "$out"
+L2=$TMP/land-2
+make_lrepo "$L2"
+out=$("$PO" -C "$L2" --manifest "$LM" land 1.0.3 --dry-run 2>&1)
+code=$?
+[[ $code == 0 ]] && grep -q 'would refuse: no SPEC MET recorded for v1\.0\.3' <<<"$out" && grep -q 'rebase: not needed' <<<"$out" && grep -q 'stamp: not needed' <<<"$out" &&
+	ok "land --dry-run on a DOING item with no record exits 0, says 'would refuse' and prints the rest" || bad "dry run no record (exit $code)" "$out"
+expect "the real run on the same item exits 6" 6 '^land: REFUSED no SPEC MET recorded' -- -C "$L2" --manifest "$LM" land 1.0.3
+[[ ! -s $LD/order ]] && ok "neither dry run ran the gate" || bad "dry run ran the gate" "$(cat "$LD/order")"
+
+# The happy path, behind main: rebase -> stamp -> close (changelog in the admin commit) -> push.
+old_tip=$(git -C "$L1" rev-parse item-v1.0.3)
+out=$("$PO" -C "$L1" --manifest "$LM" land 1.0.3 2>"$LD/land-1.err")
+code=$?
+[[ $code == 0 && $out =~ ^land:\ OK\ v1\.0\.3 ]] && [[ $(wc -l <<<"$out") == 1 ]] &&
+	ok "land exits 0 with one 'land: OK' line on stdout" || bad "land happy path (exit $code)" "$out
+$(cat "$LD/land-1.err")"
+mapfile -t order <"$LD/order"
+new_tip=$(git -C "$L1" rev-parse 'v1.0.3^{commit}')
+[[ ${#order[@]} == 2 && ${order[0]} == "stamp $new_tip tag=0" && ${order[1]} == "push repo=$L1 tag=1 env=1.0.3/v1.0.3/$(git -C "$L1" rev-parse --short main)" ]] &&
+	ok "the order is rebase, stamp (of the rebased tip, before the tag), close, push (with PO_VERSION, PO_TAG, PO_ADMIN_COMMIT)" || bad "land order" "$(printf '%s\n' "${order[@]}")"
+[[ $new_tip != "$old_tip" && $(git -C "$L1" rev-parse "$new_tip^") == "$(git -C "$L1" rev-parse main~2)" ]] &&
+	ok "the item commit was rebased onto main's tip" || bad "rebase" "$(git -C "$L1" log --oneline main)"
+[[ $(git -C "$L1" rev-list --count "v1.0.3..main") == 1 ]] && git -C "$L1" log -1 --format=%s main | grep -q '^admin: v1.0.3 DONE (tag v1.0.3)$' &&
+	ok "main moved once past the item commit: the close's admin commit" || bad "one admin commit" "$(git -C "$L1" log --oneline main)"
+stat=$(git -C "$L1" show --stat --format= main)
+grep -q 'CHANGELOG.md' <<<"$stat" && grep -q 'docs/BACKLOG.md' <<<"$stat" && grep -q 'docs/backlog/v1.md' <<<"$stat" &&
+	ok "the changelog block and the backlog edits are in the same admin commit" || bad "admin commit files" "$stat"
+cl=$(git -C "$L1" show main:CHANGELOG.md)
+[[ $cl == $'# Changelog\n\n## Unreleased\n\n### Third thing lands (v1.0.3)\n\n- three.txt added.\n\n### An older entry (v1.0.2)'* ]] &&
+	ok "the block sits right under the Unreleased heading, one blank line each side" || bad "changelog content" "$cl"
+msg=$(git -C "$L1" log -1 --format=%B main)
+grep -q '^SPEC MET: dante .* msg-2$' <<<"$msg" && grep -q '^Memory: proposed 20261103-120000-ab12' <<<"$msg" && grep -q 'the number three is the best one' <<<"$msg" &&
+	grep -q "^Stamp: gate PASS, 1 tests, HEAD $(git -C "$L1" rev-parse --short "$new_tip") (item-v1.0.3), gate-2.txt, rebased onto main" <<<"$msg" &&
+	ok "the close body carries the stamp line, SPEC MET, the PROPOSED notes and the REPORT's Memory line" || bad "close body" "$msg"
+[[ ! -d $L1/.wt/item-v1.0.3 ]] && ! git -C "$L1" show-ref -q refs/heads/item-v1.0.3 && [[ ! -e $L1/.git/po-land/1.0.3 ]] &&
+	ok "after the land the worktree, the branch and the record are gone" || bad "cleanup" "$(git -C "$L1" worktree list; ls "$L1/.git/po-land")"
+grep -q '"kind":"close","item":"1.0.3"' "$L1/.git/po-events.jsonl" && grep -q '"kind":"stamp","item":"1.0.3"' "$L1/.git/po-events.jsonl" &&
+	ok "the land's stamp and close show in po events" || bad "events" "$(cat "$L1/.git/po-events.jsonl")"
+
+# Not behind, dev's stamp names the tip: no second stamp; no [land] push: exit 0 and the none-configured line.
+L3=$TMP/land-3
+make_lrepo "$L3"
+"$PO" -C "$L3" --manifest "$LM_NOPUSH" land record 1.0.3 --spec-met --by dante >/dev/null 2>&1
+out=$("$PO" -C "$L3" --manifest "$LM_NOPUSH" land 1.0.3 2>&1)
+code=$?
+[[ $code == 0 ]] && grep -q '^land: OK v1\.0\.3 .*push none' <<<"$out" && grep -q 'push: none configured; pushing is the PO'"'"'s step' <<<"$out" &&
+	ok "no [land] push: the land closes, says the push is the PO's step, exit 0" || bad "no push key (exit $code)" "$out"
+[[ ! -s $LD/order ]] && ok "a branch at main's tip whose stamp names it is not stamped again" || bad "duplicate stamp" "$(cat "$LD/order")"
+grep -q '^Memory: nothing new learned$' <<<"$(git -C "$L3" log -1 --format=%B main)" &&
+	ok "with no REPORT recorded the body says 'Memory: nothing new learned'" || bad "default memory line" "$(git -C "$L3" log -1 --format=%B main)"
+
+# Refusals before any write: dirty tree, two commits.
+L4=$TMP/land-4
+make_lrepo "$L4" behind
+"$PO" -C "$L4" --manifest "$LM" land record 1.0.3 --spec-met --by dante >/dev/null 2>&1
+before=$(lsnap "$L4")
+echo dirt >"$L4/.wt/item-v1.0.3/dirt.txt"
+expect "a dirty worktree is refused, naming the path" 6 '^land: REFUSED .*dirt\.txt' -- -C "$L4" --manifest "$LM" land 1.0.3
+rm "$L4/.wt/item-v1.0.3/dirt.txt"
+git -C "$L4/.wt/item-v1.0.3" commit -q --allow-empty -m "v1.0.3: Third again"
+expect "two commits are refused, naming both subjects" 6 '^land: REFUSED .*2 commits.*one item = one commit.*v1\.0\.3: Third.*v1\.0\.3: Third again' -- -C "$L4" --manifest "$LM" land 1.0.3
+git -C "$L4/.wt/item-v1.0.3" reset -q --hard HEAD~1
+[[ $(lsnap "$L4") == "$before" && ! -s $LD/order ]] && ok "refusals ran no rebase and no gate, and wrote nothing" || bad "refusal side effects" "$(cat "$LD/order")"
+echo '- three, in the item commit' >>"$L4/.wt/item-v1.0.3/CHANGELOG.md"
+git -C "$L4/.wt/item-v1.0.3" commit -q -a --amend --no-edit
+expect "a record with a changelog block for an item whose commit touches CHANGELOG.md is refused" 6 'land twice' -- -C "$L4" --manifest "$LM" land record 1.0.3 --spec-met --by dante --changelog-file "$LD/changelog.md"
+
+# A rebase conflict: abort, exit 5, the worktree exactly as the dev left it.
+L5=$TMP/land-5
+make_lrepo "$L5"
+echo clash >"$L5/three.txt"
+git -C "$L5" add three.txt
+git -C "$L5" commit -qm "admin: main adds three.txt too"
+"$PO" -C "$L5" --manifest "$LM" land record 1.0.3 --spec-met --by dante >/dev/null 2>&1
+: >"$LD/order"
+before=$(lsnap "$L5")
+out=$("$PO" -C "$L5" --manifest "$LM" land 1.0.3 2>/dev/null)
+code=$?
+[[ $code == 5 && $out == 'land: CONFLICT three.txt' ]] && ok "a rebase conflict exits 5 with 'land: CONFLICT <path>'" || bad "conflict (exit $code)" "$out"
+[[ $(lsnap "$L5") == "$before" ]] && ok "after the conflict HEAD, the tree, the stamps and main are byte-equal to before (rebase aborted)" || bad "conflict left state" "$(diff <(echo "$before") <(lsnap "$L5"))"
+[[ -z $(git -C "$L5/.wt/item-v1.0.3" rev-parse --git-path rebase-merge | xargs -I{} sh -c 'test -e {} && echo busy') ]] && ok "no rebase is left in progress" || bad "rebase in progress"
+
+# A failed post-rebase stamp: exit 4, no tag, main unmoved, the worktree at the rebased tip (R6).
+L6=$TMP/land-6
+make_lrepo "$L6" behind
+"$PO" -C "$L6" --manifest "$LM" land record 1.0.3 --spec-met --by dante >/dev/null 2>&1
+old_tip=$(git -C "$L6" rev-parse item-v1.0.3)
+main_before=$(git -C "$L6" rev-parse main)
+touch "$LD/gate.fail"
+out=$("$PO" -C "$L6" --manifest "$LM" land 1.0.3 2>"$LD/land-6.err")
+code=$?
+rm -f "$LD/gate.fail"
+[[ $code == 4 && $out =~ ^land:\ STAMP\ FAILED\ leg\ check,\ log\ /.*stamp-.*\.log$ ]] && ok "a failed stamp exits 4 with 'land: STAMP FAILED leg <leg>, log <path>'" || bad "failed stamp (exit $code)" "$out
+$(cat "$LD/land-6.err")"
+new_tip=$(git -C "$L6" rev-parse item-v1.0.3)
+[[ $(git -C "$L6" rev-parse main) == "$main_before" ]] && ! git -C "$L6" show-ref -q refs/tags/v1.0.3 &&
+	ok "a failed stamp closes nothing: main unmoved, no tag" || bad "failed stamp wrote" "$(git -C "$L6" log --oneline main)"
+[[ $new_tip != "$old_tip" && $(git -C "$L6" rev-parse "$new_tip^") == "$main_before" ]] && ! git -C "$L6/.wt/item-v1.0.3" status --porcelain | grep -qv 'gate-1.txt' &&
+	grep -q "was $(git -C "$L6" rev-parse --short "$old_tip")" "$LD/land-6.err" &&
+	ok "the worktree stays at the rebased tip, clean, and the old tip is printed" || bad "R6 worktree state" "$(cat "$LD/land-6.err")"
+[[ ! -e $L6/.wt/item-v1.0.3/gate-2.txt ]] && ok "the failed stamp wrote no gate file" || bad "gate file written on failure"
+
+# A failing push: exit 7, the boundary stands.
+L7=$TMP/land-7
+make_lrepo "$L7"
+"$PO" -C "$L7" --manifest "$LM" land record 1.0.3 --spec-met --by dante >/dev/null 2>&1
+touch "$LD/push.fail"
+out=$("$PO" -C "$L7" --manifest "$LM" land 1.0.3 2>/dev/null)
+code=$?
+rm -f "$LD/push.fail"
+[[ $code == 7 && $out == 'land: PUSH FAILED (exit 3)' ]] && git -C "$L7" show-ref -q refs/tags/v1.0.3 && [[ ! -d $L7/.wt/item-v1.0.3 ]] &&
+	ok "a failing push exits 7 with 'land: PUSH FAILED (exit n)'; the close stands" || bad "push failure (exit $code)" "$out"
+
+# po close --changelog-file on its own.
+L8=$TMP/land-8
+make_lrepo "$L8"
+printf 'Memory: nothing new learned\n' >"$LD/body.txt"
+expect "close --changelog-file without [close] changelog is refused" 6 'needs \[close\] changelog' -- -C "$L8" --manifest "$LM_NOCL" close 1.0.3 --body-file "$LD/body.txt" --changelog-file "$LD/changelog.md"
+out=$("$PO" -C "$L8" --manifest "$LM" close 1.0.3 --body-file "$LD/body.txt" --changelog-file "$LD/changelog.md" 2>&1)
+grep -qxF -- '+### Third thing lands (v1.0.3)' <<<"$out" && grep -qxF -- '+++ b/CHANGELOG.md' <<<"$out" && grep -q 'EDITS (3 files)' <<<"$out" &&
+	ok "close plans the changelog block as one more edited file in the same admin commit" || bad "changelog plan" "$out"
+printf '### An older entry (v1.0.2)\n\n- again\n' >"$LD/dup.md"
+expect "a block whose heading the changelog already has is refused" 6 'changelog already has ### An older entry' -- -C "$L8" --manifest "$LM" close 1.0.3 --body-file "$LD/body.txt" --changelog-file "$LD/dup.md"
+expect "close without --changelog-file plans the backlog edits only, as before" 0 'EDITS \(2 files\)' -- -C "$L8" --manifest "$LM" close 1.0.3 --body-file "$LD/body.txt"
+# No Unreleased heading yet: the heading and the block go before the first release heading.
+sed -i '/^## Unreleased$/,/^## Release 1/{/^## Release 1/!d}' "$L8/CHANGELOG.md"
+git -C "$L8" commit -qam "admin: changelog without Unreleased"
+git -C "$L8/.wt/item-v1.0.3" rebase -q main && "$PO" -C "$L8/.wt/item-v1.0.3" --manifest "$LM" stamp >/dev/null 2>&1
+"$PO" -C "$L8" --manifest "$LM" close 1.0.3 --body-file "$LD/body.txt" --changelog-file "$LD/changelog.md" --commit >/dev/null 2>&1
+cl=$(git -C "$L8" show main:CHANGELOG.md)
+[[ $cl == $'# Changelog\n\n## Unreleased\n\n### Third thing lands (v1.0.3)\n\n- three.txt added.\n\n## Release 1 (2026-01-01): first'* ]] &&
+	ok "with no Unreleased heading, close inserts the heading and the block before the first release" || bad "changelog without heading" "$cl"
+
+# po status: a DOING branch behind main is marked, in the table and in --json.
+L9=$TMP/land-9
+make_lrepo "$L9"
+expect "status: a branch at main's tip carries no mark" 0 'branch item-v1\.0\.3  [0-9a-f]+  ahead 1  behind 0  idle [0-9hm]+$' -- -C "$L9" --manifest "$LM" status
+expect "status --json: needs_rebase false at main's tip" 0 '^\[\{"item":"1\.0\.3","idle_hours":0,"needs_rebase":false\}\]$' -- -C "$L9" --manifest "$LM" status --json
+git -C "$L9" commit -q --allow-empty -m "admin: main moves on"
+expect "status: a DOING branch behind main carries 'needs rebase' after its behind count, idle still last" 0 'branch item-v1\.0\.3  [0-9a-f]+  ahead 1  behind 1  needs rebase  idle [0-9hm]+$' -- -C "$L9" --manifest "$LM" status
+expect "status --json: needs_rebase true behind main" 0 '"item":"1\.0\.3","idle_hours":0,"needs_rebase":true\}' -- -C "$L9" --manifest "$LM" status --json
+expect "prune lists no land record while the item is DOING with a branch" 0 '^KEPT' -- -C "$L9" --manifest "$LM" prune
+"$PO" -C "$L9" --manifest "$LM" land record 1.0.3 --spec-met --by dante >/dev/null 2>&1
+out=$("$PO" -C "$L9" --manifest "$LM" prune 2>&1)
+! grep -q 'STALE LAND RECORDS' <<<"$out" && ok "a record for a DOING item with a branch is not stale" || bad "prune listed a live record" "$out"
+mkdir -p "$L7/.git/po-land/1.0.3" && printf 'by=dante at=2026-11-12T00:00:00Z ref=hand\n' >"$L7/.git/po-land/1.0.3/spec-met"
+expect "prune lists a land record whose item is DONE (listed, not removed)" 0 '^  v1\.0\.3  item is DONE, not DOING  \(.*/po-land/1\.0\.3\)$' -- -C "$L7" --manifest "$LM" prune
+"$PO" -C "$L7" --manifest "$LM" prune --commit >/dev/null 2>&1
+[[ -f $L7/.git/po-land/1.0.3/spec-met ]] && ok "prune --commit leaves the stale record alone" || bad "prune removed a record"
+expect "land takes one version" 1 'usage: po land' -- -C "$L9" --manifest "$LM" land
+expect "land rejects unknown options" 1 "land: unknown argument '--force'" -- -C "$L9" --manifest "$LM" land 1.0.3 --force
+
+# ---- tiered gate (v0.182): po stamp --tier fast|full, # covers: lines, full at close/land/release ----
+# A fixture repo whose [stamp] test_files are t/suite.sh and the files of t/d/; the fake suite
+# records the units it was given in $TG/args and passes one check per unit, so the count says how
+# many units ran. Units: t/suite.sh covers lib/, a.sh covers lib/x.sh, b.sh covers lib/ (a // leader), c.sh has no covers
+# line, d.sh covers etc/thing (a -- leader). The full suite is all five.
+TG=$TMP/tier
+mkdir -p "$TG"
+# helper
+cat >"$TG/suite.sh" <<EOF
+printf '%s\n' "\$*" >"$TG/args"
+echo "test result: ok. \$# passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+EOF
+TG_FULL='t/suite.sh t/d/a.sh t/d/b.sh t/d/c.sh t/d/d.sh'
+# tier_manifest <file> [tier=<v>] [fast=0] [always=<toml array>] [ignore=<toml array>] [command=<v>]
+tier_manifest() {
+	local f=$1 tier='' fast=1 always='["t/suite.sh"]' ignore='["CHANGELOG.md", "docs/"]' command="sh $TG/suite.sh {selected}" a
+	shift
+	for a; do
+		case $a in
+		tier=*) tier=${a#tier=} ;;
+		fast=*) fast=${a#fast=} ;;
+		always=*) always=${a#always=} ;;
+		ignore=*) ignore=${a#ignore=} ;;
+		command=*) command=${a#command=} ;;
+		esac
+	done
+	{
+		printf '[gate.legs]\nlint = "true"\ntest = "sh %s/suite.sh %s"\n\n' "$TG" "$TG_FULL"
+		printf '[versioning]\ntag = "v{version}"\nitem_commit = "v{version}: {title}"\nadmin_prefix = "admin:"\ninsert_segment = 4\n\n'
+		printf '[layout]\nbacklog = "docs/BACKLOG.md"\nspecs_dir = "docs/backlog"\nworktrees = ".wt"\nbranch = "item-v{version}"\n\n'
+		printf '[close]\nmemory = true\n\n'
+		printf '[stamp]\ntest_files = ["t/suite.sh", "t/d/"]\ntest_def = "^ok "\n'
+		[[ -z $tier ]] || printf 'tier = "%s"\n' "$tier"
+		if ((fast)); then
+			printf '\n[stamp.fast]\ncommand = "%s"\n' "$command"
+			[[ $always == none ]] || printf 'always = %s\n' "$always"
+			[[ $ignore == none ]] || printf 'ignore = %s\n' "$ignore"
+		fi
+	} >"$f"
+}
+# make_trepo <dir>: main with the units, lib/ and etc/, tag v1.0.2, and the v1.0.3 branch one item
+# commit that changes lib/x.sh, in .wt/item-v1.0.3; no stamp yet.
+make_trepo() {
+	local dir=$1
+	git init -q -b main "$dir"
+	git -C "$dir" config user.name "Boundary PO"
+	git -C "$dir" config user.email po@example.invalid
+	mkdir -p "$dir/docs/backlog" "$dir/t/d" "$dir/lib" "$dir/etc"
+	printf '# Backlog\n\nEpic one — **v1.0.3 DOING; spec backlog/v1.md** · E0 — v1.0.2 DONE (tag v1.0.2).\n\n| Item | Title | Status |\n|---|---|---|\n| v1.0.1 | First | DONE |\n| v1.0.3 | Third | DOING |\n' >"$dir/docs/BACKLOG.md"
+	printf '# v1 specs\n\n## v1.0.1 — First — DONE\n\n## v1.0.2 — Second — DONE (no bump)\n\n## v1.0.3 — Third — DOING\n\nBody of three.\n' >"$dir/docs/backlog/v1.md"
+	printf '# Changelog\n\n## Unreleased\n\n## Release 1 (2026-01-01): first\n\n### First (v1.0.1)\n\n- the first thing.\n' >"$dir/CHANGELOG.md"
+	printf '# the suite\n# covers: lib/\nok one\n' >"$dir/t/suite.sh"
+	printf '# unit a\n# covers: lib/x.sh\nok a\n' >"$dir/t/d/a.sh"
+	printf '# unit b\n  // covers: lib/\nok b\n' >"$dir/t/d/b.sh"
+	printf '# unit c, no covers line\nok c\n' >"$dir/t/d/c.sh"
+	printf -- '-- unit d\n-- covers: etc/thing\nok d\n' >"$dir/t/d/d.sh"
+	echo x >"$dir/lib/x.sh"
+	echo y >"$dir/lib/y.sh"
+	echo thing >"$dir/etc/thing"
+	git -C "$dir" add -A
+	git -C "$dir" commit -qm init
+	git -C "$dir" tag v1.0.2
+	git -C "$dir" worktree add -q "$dir/.wt/item-v1.0.3" -b item-v1.0.3
+	echo x2 >"$dir/.wt/item-v1.0.3/lib/x.sh"
+	git -C "$dir/.wt/item-v1.0.3" commit -qam "v1.0.3: Third"
+}
+TR=$TMP/tier-1
+TW=$TR/.wt/item-v1.0.3
+make_trepo "$TR"
+TM=$TG/tier.toml && tier_manifest "$TM" tier=fast
+TM_PLAIN=$TG/plain.toml && tier_manifest "$TM_PLAIN"
+tstamp() { "$PO" -C "$TW" --manifest "${TMF:-$TM}" stamp "$@" 2>/dev/null; }
+tier_line() { grep '^tier:' <<<"$1"; }
+
+# 1: the item changes only lib/x.sh: a.sh and b.sh cover it, c.sh has no line (runs always), the
+# always unit; no full stamp on record yet, then the denominator is the newest full stamp's count.
+out=$(tstamp)
+[[ $(cat "$TG/args") == 't/suite.sh t/d/a.sh t/d/b.sh t/d/c.sh' && $(tier_line "$out") == 'tier: fast, 4 checks, no full count on record' ]] &&
+	grep -q '^gate PASS: lint/test   tests 4 passed$' <<<"$out" &&
+	ok "tier: a fast stamp runs the units that cover the changed file, the unmapped units and the always set, in test_files order" ||
+	bad "tier fast selection" "$out"$'\n--- args\n'"$(cat "$TG/args")"
+out=$(tstamp --tier full)
+[[ $(cat "$TG/args") == "$TG_FULL" && $(tier_line "$out") == 'tier: full' ]] &&
+	ok "tier: --tier full runs the manifest's own test command and names the tier" || bad "tier full" "$out"
+out=$(tstamp)
+[[ $(tier_line "$out") == 'tier: fast, 4 of 5 checks' ]] &&
+	ok "tier: a fast stamp names its count of the newest full stamp's checks" || bad "tier denominator" "$out"
+awk '/^diffstat vs/ { d = NR } /^tests vs/ { v = NR } /^flag:/ { f = NR } /^tier:/ { t = NR } END { exit !(d && v && f && t == f + 1 && t == NR) }' <<<"$out" &&
+	ok "tier: the tier line follows the diffstat, tests-vs-merge-base and flag lines" || bad "tier line place" "$out"
+
+# 2: a changed path no unit covers falls back to full and says which.
+echo other >"$TW/etc/other"
+out=$(tstamp)
+[[ $(cat "$TG/args") == "$TG_FULL" && $(tier_line "$out") == 'tier: full (fast fell back: etc/other is covered by no test)' ]] &&
+	ok "tier: an unmapped changed file (untracked too) makes the fast stamp run full and name the file" || bad "tier fallback" "$out"
+rm -f "$TW/etc/other"
+
+# 3: a changed test file is selected itself, whatever it covers.
+echo 'ok d2' >>"$TW/t/d/d.sh"
+out=$(tstamp)
+[[ $(cat "$TG/args") == 't/suite.sh t/d/a.sh t/d/b.sh t/d/c.sh t/d/d.sh' ]] &&
+	ok "tier: a changed test file is selected and runs whole" || bad "tier changed unit" "$out"$'\n--- args\n'"$(cat "$TG/args")"
+git -C "$TW" checkout -q -- t/d/d.sh
+
+# 4: an ignored path selects nothing and does not fall back; with no always set, nothing selected
+# falls back.
+git -C "$TW" reset -q --hard main
+echo note >>"$TW/CHANGELOG.md"
+echo note >"$TW/docs/notes.md"
+out=$(tstamp)
+[[ $(cat "$TG/args") == 't/suite.sh t/d/c.sh' && $(tier_line "$out") == 'tier: fast, 2 of 5 checks' ]] &&
+	ok "tier: ignored paths (a file and a dir/ prefix) select nothing and do not fall back" || bad "tier ignore" "$out"$'\n--- args\n'"$(cat "$TG/args")"
+git -C "$TW" checkout -q -- CHANGELOG.md && rm -f "$TW/docs/notes.md"
+printf '# unit c, now mapped\n# covers: lib/y.sh\nok c\n' >"$TR/t/d/c.sh"
+git -C "$TR" commit -qam "admin: c is mapped" && git -C "$TW" reset -q --hard main
+echo note >>"$TW/CHANGELOG.md"
+tier_manifest "$TG/noalways.toml" tier=fast always=none
+out=$(TMF=$TG/noalways.toml tstamp)
+[[ $(cat "$TG/args") == "$TG_FULL" && $(tier_line "$out") == 'tier: full (fast fell back: no test selected)' ]] &&
+	ok "tier: an empty selection falls back to full" || bad "tier empty selection" "$out"
+git -C "$TW" checkout -q -- CHANGELOG.md
+echo x3 >"$TW/lib/x.sh" && git -C "$TW" commit -qam "v1.0.3: Third"
+
+# 5: without the key and the flag the block has no tier line (the byte-identical pin of the stamp
+# section above is the proof for a manifest without [stamp.fast]).
+out=$(TMF=$TM_PLAIN tstamp)
+[[ -z $(tier_line "$out") && $(cat "$TG/args") == "$TG_FULL" ]] &&
+	ok "tier: no [stamp] tier and no --tier: a full run and no tier line" || bad "tier default" "$out"
+out=$(TMF=$TM_PLAIN tstamp --tier fast)
+[[ $(tier_line "$out") == 'tier: fast, 3 of 5 checks' ]] && ok "tier: --tier fast overrides a manifest without [stamp] tier" || bad "tier flag fast" "$out"
+
+# 6: the fast stamp's event says so; po events marks it; --trend counts full stamps only.
+ev=$(git -C "$TR" rev-parse --path-format=absolute --git-common-dir)/po-events.jsonl
+grep '"kind":"stamp"' "$ev" | tail -n 1 | grep -qE '"tests":3,"tier":"fast",' &&
+	ok "tier: a fast stamp's event carries \"tier\":\"fast\" after tests" || bad "tier event" "$(tail -n 2 "$ev")"
+grep '"kind":"stamp"' "$ev" | sed -n 2p | grep -q '"tests":5,"load1":' &&
+	ok "tier: a full stamp's event is unchanged (no tier key)" || bad "tier full event" "$(cat "$ev")"
+out=$("$PO" -C "$TR" --manifest "$TM" events 2>&1)
+grep -qE '^[0-9-]+ [0-9:]+ [A-Z+0-9-]+ +stamp +1\.0\.3 +tier-1 +pass +[^ ]+ +[0-9]+s fast ' <<<"$out" &&
+	ok "tier: po events prints fast after a fast stamp's time" || bad "tier events table" "$out"
+TE=$TMP/tier-ev && git init -q -b main "$TE"
+{
+	printf '{"time":"2026-11-10T10:00:00Z","kind":"stamp","item":"1.0","project":"tier-ev","result":"pass","agent":"a","legs":[{"name":"test","result":"pass","seconds":100}],"seconds":110,"tests":10,"load1":1.0,"detail":""}\n'
+	printf '{"time":"2026-11-10T11:00:00Z","kind":"stamp","item":"1.1","project":"tier-ev","result":"pass","agent":"a","legs":[{"name":"test","result":"pass","seconds":10}],"seconds":12,"tests":3,"tier":"fast","load1":1.0,"detail":""}\n'
+} >"$TE/.git/po-events.jsonl"
+out=$(PO_EVENTS_NOW=$(date -u -d 2026-11-11 +%s) "$PO" -C "$TE" --manifest "$TM" events --trend --days 30 --json 2>&1)
+grep -q '"day":"2026-11-10","stamps":1,"tests":10,"test_leg":100' <<<"$out" &&
+	ok "tier: po events --trend skips fast stamps (one full stamp of 10, one fast of 3: 1 stamp, 10, its test leg)" || bad "tier trend" "$out"
+
+# 7: po close wants a full stamp at the tip; a newer fast one beside it is fine.
+rm -f "$TW"/gate-*.txt
+tstamp >/dev/null
+out=$("$PO" -C "$TR" --manifest "$TM" close 1.0.3 2>&1)
+[[ $? == 6 && $out == *'gate-1.txt is a fast stamp; run po stamp --tier full in .wt/item-v1.0.3 (po land does this)'* ]] &&
+	ok "tier: po close with only a fast stamp is refused (6) and names the command" || bad "tier close fast only" "$out"
+tstamp --tier full >/dev/null && tstamp >/dev/null
+out=$("$PO" -C "$TR" --manifest "$TM" close 1.0.3 2>&1)
+[[ $? == 0 && -f $TW/gate-3.txt ]] && ok "tier: po close reuses a full stamp at the tip under a newer fast one" || bad "tier close reuse" "$out"
+echo x4 >"$TW/lib/x.sh" && git -C "$TW" commit -q --amend -am "v1.0.3: Third"
+tstamp >/dev/null
+out=$("$PO" -C "$TR" --manifest "$TM" close 1.0.3 2>&1)
+[[ $? == 6 && $out == *'gate-2.txt does not stamp the branch tip'* ]] &&
+	ok "tier: po close refuses a stale full stamp with the usual message, a newer fast one notwithstanding" || bad "tier close stale full" "$out"
+
+# 8: po land: the dev's fast stamp at the tip is evidence, the land stamps full.
+"$PO" -C "$TR" --manifest "$TM" land record 1.0.3 --spec-met --by dante >/dev/null 2>&1
+out=$("$PO" -C "$TR" --manifest "$TM" land 1.0.3 --dry-run 2>&1)
+grep -q 'stamp *ok' <<<"$out" && grep -qE '9\. stamp: would run lint/test \(full\) in \.wt/item-v1\.0\.3$' <<<"$out" &&
+	ok "tier: land --dry-run accepts a fast stamp at the tip and plans a full stamp" || bad "tier land dry fast" "$out"
+tstamp --tier full >/dev/null && tstamp >/dev/null
+out=$("$PO" -C "$TR" --manifest "$TM" land 1.0.3 --dry-run 2>&1)
+grep -q '9\. stamp: not needed (gate-5\.txt names the tip)' <<<"$out" &&
+	ok "tier: land --dry-run needs no stamp when a full stamp names the tip (a newer fast one notwithstanding)" || bad "tier land dry full" "$out"
+rm -f "$TW/gate-5.txt" "$TW/gate-6.txt"
+tstamp >/dev/null
+: >"$TG/args"
+printf 'Memory: nothing new learned\n' >"$TG/report.md"
+"$PO" -C "$TR" --manifest "$TM" land record 1.0.3 --spec-met --by dante --report-file "$TG/report.md" >/dev/null 2>&1
+out=$("$PO" -C "$TR" --manifest "$TM" land 1.0.3 2>&1)
+code=$?
+[[ $code == 0 && $(cat "$TG/args") == "$TG_FULL" ]] && git -C "$TR" rev-parse -q --verify refs/tags/v1.0.3 >/dev/null &&
+	grep '"kind":"stamp"' "$ev" | tail -n 1 | grep -q '"agent":.*"tests":5,"load1"' &&
+	ok "tier: po land runs the full tier (the manifest's default is fast) and closes on it" || bad "tier land (exit $code)" "$out"$'\n--- args\n'"$(cat "$TG/args")"
+
+# 9: po release <N> --write wants a full stamp at main's tip in the main checkout.
+out=$("$PO" -C "$TR" --manifest "$TM" release 1 --write 2>&1)
+[[ $? == 6 && $out == *"release-1 needs a full stamp at $(git -C "$TR" rev-parse --short main): run po stamp --tier full in $TR"* ]] &&
+	ok "tier: release --write refuses without a full stamp at main's tip" || bad "tier release refuse" "$out"
+"$PO" -C "$TR" --manifest "$TM" stamp --tier full >/dev/null 2>&1
+"$PO" -C "$TR" --manifest "$TM" stamp >/dev/null 2>&1
+out=$("$PO" -C "$TR" --manifest "$TM" release 1 --write 2>&1)
+code=$?
+[[ $code == 0 ]] && grep -q '^### Setup after install' "$TR/CHANGELOG.md" &&
+	ok "tier: release --write runs with a full stamp at main's tip (a newer fast one notwithstanding)" || bad "tier release ok" "$out"
+git -C "$TR" checkout -q -- CHANGELOG.md
+git -C "$TR" commit -q --allow-empty -m "admin: main moves on"
+out=$("$PO" -C "$TR" --manifest "$TM" release 1 --write 2>&1)
+[[ $? == 6 && $out == *'needs a full stamp at'* ]] && ok "tier: release --write refuses a full stamp of an older main tip" || bad "tier release stale" "$out"
+
+# 10: the keys are checked: --tier fast needs [stamp.fast] command; tier is fast or full; the
+# command names {selected}; po doctor offers the keys.
+tier_manifest "$TG/nofast.toml" fast=0
+out=$("$PO" -C "$TR" --manifest "$TG/nofast.toml" stamp --tier fast 2>&1)
+[[ $? == 2 && $out == *'[stamp.fast] command is needed for the fast tier'* ]] && ok "tier: --tier fast without [stamp.fast] command is exit 2" || bad "tier no command" "$out"
+out=$("$PO" -C "$TR" --manifest "$TG/nofast.toml" release 1 --write 2>&1)
+[[ $out != *'needs a full stamp'* ]] && ok "tier: a project without [stamp] tier or [stamp.fast] releases as before" || bad "tier release not opted in" "$out"
+tier_manifest "$TG/badtier.toml" tier=medium
+expect "tier: [stamp] tier other than fast or full is exit 2" 2 'tier must be "fast" or "full"' -- -C "$TR" --manifest "$TG/badtier.toml" status
+tier_manifest "$TG/nosel.toml" command="sh $TG/suite.sh"
+expect "tier: [stamp.fast] command without {selected} is exit 2" 2 'command must contain \{selected\}' -- -C "$TR" --manifest "$TG/nosel.toml" status
+expect "tier: --tier takes fast or full" 1 "stamp: --tier must be fast or full" -- -C "$TR" --manifest "$TM" stamp --tier half
+out=$(HOME=$KH "$PO" doctor 2>&1)
+adopter_block "$KH/ad1" | grep -q '^  adopt  *\[stamp\] tier$' && adopter_block "$KH/ad1" | grep -q '^  adopt  *\[stamp.fast\] command$' &&
+	ok "tier: doctor offers [stamp] tier and [stamp.fast] command" || bad "tier doctor" "$out"
+
 # ---- private test blocks (absent from a public snapshot) -------------------
+# only_wanted <file>...: with --only, every private file named and, in turn,
+# every file a wanted file's "# needs:" lines name, one repo-relative path per line.
+only_wanted() {
+	local -A seen=()
+	local -a todo=("$@")
+	local f n
+	while ((${#todo[@]} > 0)); do
+		f=${todo[0]}
+		todo=("${todo[@]:1}")
+		[[ -z ${seen[$f]:-} ]] || continue
+		seen[$f]=1
+		printf '%s\n' "$f"
+		[[ $f == private/tests.d/* && -f $KITROOT/$f ]] || continue
+		for n in $(head -n 30 "$KITROOT/$f" | sed -n 's/^# needs: //p'); do todo+=("$n"); done
+	done
+}
+_want=''
+((ONLY_SET == 0)) || _want=$(only_wanted "${ONLY[@]}")
 for _t in "$KITROOT"/private/tests.d/*.sh; do
+	((ONLY_SET == 0)) || grep -qxF "private/tests.d/${_t##*/}" <<<"$_want" || continue
 	# shellcheck source=/dev/null
 	[[ -f "$_t" ]] && source "$_t"
 done
