@@ -225,6 +225,11 @@ def main():
 
     class Dashboard:
         def __init__(self, app):
+            # v0.208: PO_DASHBOARD_STALL_LOG=<path> logs main-loop stalls, naming the callback that ran last
+            self.stall = core.StallProbe.from_env()
+            if self.stall is not None:
+                for name in core.STALL_CALLBACKS:
+                    setattr(self, name, self.stall.wrap(name, getattr(self, name)))
             self.show_all = a.all
             self.note_group = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)
             self.events = []
@@ -445,6 +450,9 @@ def main():
             if not getattr(a, "no_memory_log", False):
                 GLib.timeout_add_seconds(60, self.log_memory)
             GLib.timeout_add_seconds(core.REPORTS_TICK_SECONDS, self.reports_redraw.tick)
+            if self.stall is not None:
+                GLib.timeout_add(core.STALL_BEAT_MS, self.stall.beat)
+                self.win.connect("notify::is-active", lambda w, _p: self.stall.note("active %d" % w.is_active()))
 
         # -- style --
         def dark(self):

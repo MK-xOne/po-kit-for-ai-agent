@@ -450,6 +450,57 @@ po_stamp_sum_pytest() {
 	PO_SUM_LINES=1
 }
 
+# po_stamp_sum_gradle <leg start epoch> <what>: with [gate] test_format =
+# "gradle" the count is read from the JUnit XML reports the test leg wrote
+# (glob [gate] test_results_glob, default build/test-results/**/*.xml,
+# relative to the worktree), not from output. Only files modified at or after
+# the leg's start count. PO_SUM is tests - failures - errors - skipped summed
+# over every <testsuite> (a <testsuites> wrapper adds nothing of its own) and
+# PO_SUM_LINES the number of report files. No fresh report, a malformed one,
+# a failure or error, or no passed tests fails the stamp.
+po_stamp_sum_gradle() {
+	local glob=${PO_MANIFEST[gate.test_results_glob]:-build/test-results/**/*.xml}
+	local -a all=() fresh=()
+	local f m
+	PO_SUM=0 PO_SUM_LINES=0
+	# globstar and nullglob stay inside the subshell; the glob is unquoted on purpose.
+	# shellcheck disable=SC2086
+	while IFS= read -r -d '' f; do [[ -z $f ]] || all+=("$f"); done < <(cd "$wt" && shopt -s globstar nullglob && printf '%s\0' $glob)
+	for f in "${all[@]}"; do
+		[[ -f $wt/$f ]] || continue
+		m=$(stat -c %Y -- "$wt/$f") || continue
+		((m < $1)) || fresh+=("$f")
+	done
+	((${#fresh[@]} > 0)) ||
+		po_stamp_fail "$2 wrote no test report newer than its start under $glob ($((${#all[@]} - ${#fresh[@]})) stale): a Gradle test task that is up to date writes none, so the leg must force the run"
+	local res
+	res=$(cd "$wt" && python3 -I -c '
+import sys, xml.etree.ElementTree as ET
+t = f = e = s = 0
+for name in sys.argv[1:]:
+    try:
+        root = ET.parse(name).getroot()
+    except Exception as ex:
+        print(name + ": " + str(ex))
+        sys.exit(1)
+    suites = [root] if root.tag == "testsuite" else [c for c in root if c.tag == "testsuite"]
+    try:
+        for x in suites:
+            t += int(x.get("tests", 0)); f += int(x.get("failures", 0))
+            e += int(x.get("errors", 0)); s += int(x.get("skipped", 0))
+    except ValueError as ex:
+        print(name + ": " + str(ex))
+        sys.exit(1)
+print(t, f, e, s)' "${fresh[@]}") || po_stamp_fail "$2 wrote a malformed test report: $res"
+	local tests failures errors skipped
+	read -r tests failures errors skipped <<<"$res"
+	((failures == 0 && errors == 0)) ||
+		po_stamp_fail "$2 wrote test reports that are not ok: $failures failures, $errors errors"
+	PO_SUM=$((tests - skipped))
+	((PO_SUM > 0)) || po_stamp_fail "$2 wrote test reports with no passed tests: $tests tests, $skipped skipped"
+	PO_SUM_LINES=${#fresh[@]}
+}
+
 # po_stamp_hunk_lines <+|->: the added (+) or removed (-) lines of the diff
 # on stdin, without their marker; file headers are not hunk lines.
 po_stamp_hunk_lines() {
@@ -693,11 +744,19 @@ po_cmd_stamp() {
 	done
 	if ((test_leg >= 0)); then
 		count_cmd=${PO_MANIFEST[gate.test_count_cmd]:-}
-	else
+	elif [[ ${PO_MANIFEST[gate.test_format]:-libtest} != gradle ]]; then
 		count_cmd=$(po_get gate.test_count_cmd)
 	fi
 	if [[ ${PO_MANIFEST[gate.test_format]:-libtest} == pytest ]]; then
 		sumfn=po_stamp_sum_pytest summary='pytest summary'
+	fi
+	local gradle=0
+	if [[ ${PO_MANIFEST[gate.test_format]:-libtest} == gradle ]]; then
+		gradle=1
+		# The reports belong to the test leg, or to the one [gate] command.
+		((test_leg >= 0)) || [[ ${names[*]} == gate ]] ||
+			po_die "$PO_MANIFEST_FILE: test_format \"gradle\" needs a leg named test or a single [gate] command"
+		((test_leg >= 0)) || test_leg=0
 	fi
 	local fast_leg=-1
 	if [[ $tier == fast ]]; then
@@ -791,7 +850,12 @@ po_cmd_stamp() {
 		((PO_RUN_ABORTED == 0)) ||
 			po_stamp_fail "gate leg '${names[i]}' (${cmds[i]}) printed RUN-ABORTED: the runner died before its last block"
 		po_stamp_left "leg ${names[i]}" $((i + off))
-		$sumfn "$PO_RUN_RESULTS" "gate leg '${names[i]}'"
+		if ((gradle)); then
+			PO_SUM=0 PO_SUM_LINES=0
+			((i != test_leg)) || po_stamp_sum_gradle "$leg_start" "gate leg '${names[i]}'"
+		else
+			$sumfn "$PO_RUN_RESULTS" "gate leg '${names[i]}'"
+		fi
 		PO_STAMP_FAILING=-1
 		PO_STAMP_RES[i + off]=pass
 		gate_sum=$((gate_sum + PO_SUM))
@@ -799,30 +863,36 @@ po_cmd_stamp() {
 		((i != test_leg)) || test_sum=$PO_SUM test_lines=$PO_SUM_LINES
 	done
 
+	local tests
 	local count_run=$count_cmd
-	if ((test_leg >= 0 && ${#PO_STAMP_TMP} > 0)); then
-		local saved
-		printf -v saved '%q' "$PO_STAMP_TMP/out-$((test_leg + off))"
-		count_run="cat $saved"
-		[[ -z $count_cmd ]] || count_run="cat $saved | { $count_cmd; }"
-		count_cmd=${count_cmd:-"the test leg's output"}
-		# The count comes from the test leg alone: so does the sum it is
-		# checked against; other legs' summaries (doc, integration) are theirs.
-		gate_sum=$test_sum gate_lines=$test_lines
+	if ((gradle)); then
+		# The reports were summed after the test leg; there is no count run.
+		tests=$test_sum
+	else
+		if ((test_leg >= 0 && ${#PO_STAMP_TMP} > 0)); then
+			local saved
+			printf -v saved '%q' "$PO_STAMP_TMP/out-$((test_leg + off))"
+			count_run="cat $saved"
+			[[ -z $count_cmd ]] || count_run="cat $saved | { $count_cmd; }"
+			count_cmd=${count_cmd:-"the test leg's output"}
+			# The count comes from the test leg alone: so does the sum it is
+			# checked against; other legs' summaries (doc, integration) are theirs.
+			gate_sum=$test_sum gate_lines=$test_lines
+		fi
+		printf 'po stamp: test count: %s\n' "$count_cmd" >&2
+		po_stamp_run "$wt" "$count_run" out-count "test count: $count_cmd"
+		[[ $PO_RUN_CODE == 0 ]] || po_stamp_fail "test_count_cmd ($count_cmd) exited $PO_RUN_CODE"
+		((PO_RUN_ABORTED == 0)) ||
+			po_stamp_fail "test_count_cmd ($count_cmd) printed RUN-ABORTED: the runner died before its last block, so no count is taken"
+		[[ -z ${PO_MANIFEST[gate.run_sentinel]:-} || $PO_RUN_ENDED -gt 0 ]] ||
+			po_stamp_fail "test_count_cmd ($count_cmd) printed no RUN-END sentinel: the run did not finish, so no count is taken"
+		po_stamp_left "the test count" -1
+		$sumfn "$PO_RUN_RESULTS" "test_count_cmd"
+		((PO_SUM_LINES > 0)) || po_stamp_fail "test_count_cmd ($count_cmd) printed no $summary"
+		tests=$PO_SUM
+		((gate_lines == 0 || gate_sum == tests)) ||
+			po_stamp_fail "the gate passed $gate_sum tests but test_count_cmd counted $tests"
 	fi
-	printf 'po stamp: test count: %s\n' "$count_cmd" >&2
-	po_stamp_run "$wt" "$count_run" out-count "test count: $count_cmd"
-	[[ $PO_RUN_CODE == 0 ]] || po_stamp_fail "test_count_cmd ($count_cmd) exited $PO_RUN_CODE"
-	((PO_RUN_ABORTED == 0)) ||
-		po_stamp_fail "test_count_cmd ($count_cmd) printed RUN-ABORTED: the runner died before its last block, so no count is taken"
-	[[ -z ${PO_MANIFEST[gate.run_sentinel]:-} || $PO_RUN_ENDED -gt 0 ]] ||
-		po_stamp_fail "test_count_cmd ($count_cmd) printed no RUN-END sentinel: the run did not finish, so no count is taken"
-	po_stamp_left "the test count" -1
-	$sumfn "$PO_RUN_RESULTS" "test_count_cmd"
-	((PO_SUM_LINES > 0)) || po_stamp_fail "test_count_cmd ($count_cmd) printed no $summary"
-	local tests=$PO_SUM
-	((gate_lines == 0 || gate_sum == tests)) ||
-		po_stamp_fail "the gate passed $gate_sum tests but test_count_cmd counted $tests"
 
 	[[ $(po_stamp_state "$wt") == "$state" ]] ||
 		po_stamp_fail "the worktree changed while the gate ran; the evidence would not name what was tested"

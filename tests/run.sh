@@ -499,9 +499,11 @@ out=$("$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>/dev/null)
 	ok "a passing stamp's evidence block is byte-identical to the expected block" || bad "passing stamp block" "$out"$'\n--- file\n'"$(cat "$W/gate-1.txt" 2>&1)"
 rm -f "$W"/gate-*.txt
 # A command that leaves a process holding its output must not hang the stamp.
-# LEAK_SLEEP names the leftover (unique, so pgrep finds only ours); the leaker
-# prints a good summary, so the leftover is the only fault.
-LEAK_SLEEP=3171 LEAK_TERM_SLEEP=3172
+# LEAK_SLEEP names the leftover (unique per suite run: the zero-padded PID is
+# in the duration, so pgrep finds only ours even with two suites at once); the
+# leaker prints a good summary, so the leftover is the only fault.
+LEAK_ID=$(printf '%07d' $$)
+LEAK_SLEEP=3171.$LEAK_ID LEAK_TERM_SLEEP=3172.$LEAK_ID
 printf '%s\n' "sleep $LEAK_SLEEP &" 'echo "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"' >"$TMP/z-leak.sh"
 printf '%s\n' "( trap '' TERM; exec sleep $LEAK_TERM_SLEEP ) &" 'echo "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"' >"$TMP/z-leak-term.sh"
 now_ms() { echo $(($(date +%s%N) / 1000000)); }
@@ -720,9 +722,89 @@ out=$("$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>/dev/null)
 grep -qx 'gate PASS: check/test   tests 3 passed' <<<"$out" && ok "pytest format ignores libtest lines in a leg" || bad "pytest ignores libtest" "$out"
 rm -f "$W"/gate-*.txt
 printf '%s[gate]\ntest_format = "nose"\n' "$GOOD_MANIFEST" >"$TMP/m.toml"
-expect "an unknown test_format is an error" 2 'test_format must be "libtest" or "pytest": nose' -- -C "$W" --manifest "$TMP/m.toml" stamp
+expect "an unknown test_format is an error" 2 'test_format must be "libtest", "pytest" or "gradle": nose' -- -C "$W" --manifest "$TMP/m.toml" stamp
 printf '%s[gate]\ntest_format = "pytest"\ncommand = "true"\n' "$GOOD_MANIFEST" >"$TMP/m.toml"
 expect "test_format is a known key" 2 "manifest has no 'gate.test_count_cmd'" -- -C "$W" --manifest "$TMP/m.toml" stamp
+
+# Gradle counting ([gate] test_format = "gradle"): the count is read from the
+# JUnit XML reports the test leg wrote, not from output.
+GX=$TMP/gx
+mkdir -p "$GX"
+gx_suite() { # <file> <tests> <failures> <errors> <skipped>
+	printf '<?xml version="1.0" encoding="UTF-8"?>\n<testsuite name="s" tests="%s" skipped="%s" failures="%s" errors="%s" timestamp="2026-01-01T00:00:00" hostname="h" time="0.1">\n<testcase name="a" classname="c"/>\n</testsuite>\n' "$2" "$5" "$3" "$4" >"$GX/$1.xml"
+}
+gx_suite pass 3 0 0 0
+gx_suite fail 3 1 0 0
+gx_suite err 3 0 1 0
+gx_suite skip 4 0 0 1
+gx_suite zero 0 0 0 0
+gx_suite allskip 2 0 0 2
+gx_suite m1 2 0 0 0
+gx_suite m2 5 0 0 1
+printf '<testsuites>\n<testsuite name="a" tests="2" skipped="0" failures="0" errors="0"/>\n<testsuite name="b" tests="3" skipped="1" failures="0" errors="0"/>\n</testsuites>\n' >"$GX/wrapper.xml"
+printf '<testsuite name="a" tests="3"\n' >"$GX/broken.xml"
+printf 'build/\nout/\n' >>"$(git -C "$W" rev-parse --path-format=absolute --git-path info/exclude)"
+gx_stamp() { # <name> <want: "N" counted, or a refusal pattern> <test leg command> [<old report file> ...]
+	local name=$1 want=$2 leg=$3 out code
+	shift 3
+	rm -rf "$W/build"
+	mkdir -p "$W/build/test-results/test"
+	for f in "$@"; do
+		cp "$GX/$f.xml" "$W/build/test-results/test/old-$f.xml"
+		touch -d '2 days ago' "$W/build/test-results/test/old-$f.xml"
+	done
+	TEST_FORMAT=gradle stamp_manifest "test=$leg"
+	out=$("$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>&1)
+	code=$?
+	if [[ $want =~ ^[0-9]+$ ]]; then
+		[[ $code == 0 ]] && grep -qx "gate PASS: test   tests $want passed" <<<"$out" &&
+			ok "gradle: $name counts $want" || bad "gradle: $name (exit $code, want $want counted)" "$out"
+	else
+		[[ $code == 4 ]] && grep -qE -- "$want" <<<"$out" && ! compgen -G "$W/gate-*.txt" >/dev/null &&
+			ok "gradle: $name is refused, nothing written" || bad "gradle: $name (exit $code; pattern '$want')" "$out"
+	fi
+	rm -f "$W"/gate-*.txt
+	rm -rf "$W/build"
+}
+GXD='build/test-results/test'
+gx_stamp "one passing report" 3 "mkdir -p $GXD; cp $GX/pass.xml $GXD/a.xml"
+gx_stamp "skipped tests do not count as passed" 3 "mkdir -p $GXD; cp $GX/skip.xml $GXD/a.xml"
+gx_stamp "a failure" 'not ok: 1 failures, 0 errors' "mkdir -p $GXD; cp $GX/fail.xml $GXD/a.xml"
+gx_stamp "an error" 'not ok: 0 failures, 1 errors' "mkdir -p $GXD; cp $GX/err.xml $GXD/a.xml"
+gx_stamp "zero tests" 'no passed tests' "mkdir -p $GXD; cp $GX/zero.xml $GXD/a.xml"
+gx_stamp "only skipped tests" 'no passed tests' "mkdir -p $GXD; cp $GX/allskip.xml $GXD/a.xml"
+gx_stamp "a pass beside a failure" 'not ok' "mkdir -p $GXD; cp $GX/pass.xml $GXD/a.xml; cp $GX/fail.xml $GXD/b.xml"
+gx_stamp "a testsuites wrapper does not double count" 4 "mkdir -p $GXD; cp $GX/wrapper.xml $GXD/a.xml"
+gx_stamp "a malformed report names the file" 'malformed test report: build/test-results/test/a.xml' "mkdir -p $GXD; cp $GX/broken.xml $GXD/a.xml"
+gx_stamp "no report at all" 'no test report newer than its start' "true"
+gx_stamp "only an old report (stale)" 'no test report newer than its start under build/test-results/\*\*/\*.xml \(1 stale\)' "true" pass
+gx_stamp "an old report beside a fresh one is not counted" 3 "mkdir -p $GXD; cp $GX/pass.xml $GXD/a.xml" m2
+# A leg that is not the test leg needs no report; a single [gate] command is the test leg.
+TEST_FORMAT=gradle stamp_manifest "lint=true" "test=mkdir -p $GXD; cp $GX/pass.xml $GXD/a.xml"
+out=$("$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>&1)
+grep -qx 'gate PASS: lint/test   tests 3 passed' <<<"$out" && ok "gradle: only the test leg's reports are read" || bad "gradle other leg" "$out"
+rm -rf "$W/build" "$W"/gate-*.txt
+TEST_FORMAT=gradle stamp_manifest "lint=true" "build=true"
+expect "gradle: legs with no test leg are a manifest error" 2 'needs a leg named test or a single \[gate\] command' -- -C "$W" --manifest "$TMP/s.toml" stamp
+# Several modules: the adopter's glob reaches each module's reports.
+{
+	printf '%s[gate]\ntest_format = "gradle"\ntest_results_glob = "*/build/test-results/**/*.xml"\n[gate.legs]\ntest = "mkdir -p m1/build/test-results/test m2/build/test-results/test; cp %s/m1.xml m1/build/test-results/test/a.xml; cp %s/m2.xml m2/build/test-results/test/a.xml"\n' "$GOOD_MANIFEST" "$GX" "$GX"
+} >"$TMP/s.toml"
+printf 'm1/\nm2/\n' >>"$(git -C "$W" rev-parse --path-format=absolute --git-path info/exclude)"
+out=$("$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>&1)
+grep -qx 'gate PASS: test   tests 6 passed' <<<"$out" && ok "gradle: several modules add up" || bad "gradle modules" "$out"
+rm -rf "$W/m1" "$W/m2" "$W"/gate-*.txt
+# The glob is configurable and relative to the worktree.
+{
+	printf '%s[gate]\ntest_format = "gradle"\ntest_results_glob = "out/*.xml"\n[gate.legs]\ntest = "mkdir -p out; cp %s/pass.xml out/r.xml"\n' "$GOOD_MANIFEST" "$GX"
+} >"$TMP/s.toml"
+out=$("$PO" -C "$W" --manifest "$TMP/s.toml" stamp 2>&1)
+grep -qx 'gate PASS: test   tests 3 passed' <<<"$out" && ok "gradle: test_results_glob names the reports" || bad "gradle glob" "$out"
+rm -rf "$W/out" "$W"/gate-*.txt
+printf '%s[gate]\ntest_format = "gradle"\ntest_results_glob = "x"\ncommand = "true"\n' "$GOOD_MANIFEST" >"$TMP/m.toml"
+expect "test_format gradle is accepted" 4 'no test report newer than its start' -- -C "$W" --manifest "$TMP/m.toml" stamp
+printf '%s[gate]\ntest_results_glob = "x"\ncommand = "true"\ntest_count_cmd = "true"\n' "$GOOD_MANIFEST" >"$TMP/m.toml"
+expect "test_results_glob needs test_format gradle" 2 'test_results_glob applies to test_format "gradle" only' -- -C "$W" --manifest "$TMP/m.toml" stamp
 
 # Manifest shapes.
 mf() {
@@ -856,7 +938,7 @@ EOF
 # A repo at a boundary: v1.0.3 DOING (heading, table row, prose), v1.0.4 an
 # investigation DOING with no branch, v1.0.5 founded TODO; the v1.0.3 branch
 # is one item commit with a passing stamp.
-make_brepo() {
+make_brepo_build() {
 	local dir=$1
 	git init -q -b main "$dir"
 	git -C "$dir" config user.name "Boundary PO"
@@ -901,6 +983,20 @@ EOF
 	git -C "$dir/.wt/item-v1.0.3" add three.txt
 	git -C "$dir/.wt/item-v1.0.3" commit -qm "v1.0.3: Third"
 	"$PO" -C "$dir/.wt/item-v1.0.3" --manifest "$BM" stamp >/dev/null 2>&1
+}
+# make_brepo <dir>: the boundary repo above. It is built and stamped once (the
+# 0.204 fixture share); every later call copies that template and repairs the
+# worktree links, as the copy's paths differ. A call with BREPO_TABLE set builds
+# afresh: its backlog differs.
+make_brepo() {
+	local dir=$1 tpl=$TMP/brepo-template
+	if [[ -n ${BREPO_TABLE:-} ]]; then
+		make_brepo_build "$dir"
+		return
+	fi
+	[[ -d $tpl ]] || make_brepo_build "$tpl"
+	cp -a "$tpl" "$dir"
+	git -C "$dir" worktree repair "$dir/.wt/item-v1.0.3" >/dev/null 2>&1
 }
 bsnap() { # every ref, worktree, status and file the boundary could touch
 	git -C "$1" for-each-ref --format='%(refname) %(objectname)'
@@ -2560,7 +2656,7 @@ zlog=$(python3 -I -c 'import json,sys; print(json.loads(sys.argv[1])["log"])' "$
 out=$("$PO" -C "$S" --manifest "$TMP/s.toml" events 2>&1)
 grep -qF "1.0.3: leg noisy failed; its last lines (full output: $zlog):" <<<"$out" &&
 	grep -qx '    noisy line 21' <<<"$out" && grep -qx '    token=\[REDACTED\] and password: \[REDACTED\]' <<<"$out" &&
-	! grep -qx '    noisy line 20' <<<"$out" && [[ $(table <<<"$out" | head -2 | tail -1) == *'first:pass(0s) noisy:fail(0s) last:skip(0s)'* ]] &&
+	! grep -qx '    noisy line 20' <<<"$out" && [[ $(table <<<"$out" | head -2 | tail -1) =~ 'first:pass('[0-9]+'s) noisy:fail('[0-9]+'s) last:skip('[0-9]+'s)' ]] &&
 	ok "events: the table is followed by each failed stamp's tail, indented, naming the leg and the log" || bad "events tail" "$out"
 out=$("$PO" -C "$S" --manifest "$TMP/s.toml" events --json 2>&1)
 [[ $(wc -l <<<"$out") == 10 ]] && python3 -I -c 'import json,sys; e=json.loads(sys.stdin.readline()); assert e["legs"][1]["tail"].count("\n")==39' <<<"$out" &&
@@ -2580,21 +2676,36 @@ rm -f "$W"/gate-*.txt
 # ---- stamp: time taken (item v0.54) -----------------------------------------
 # Each leg and the run record whole wall-clock seconds; readers treat a missing
 # value as unknown, never 0.
+# A still clock: a bare `date +%s` reads $TMP/tclock-now and never moves on
+# its own; a leg that runs `sh $TMP/tclock-tick 2` moves it 2 s, so the leg
+# takes exactly 2 s without sleeping.
+mkdir -p "$TMP/tclock-bin"
+cat >"$TMP/tclock-bin/date" <<EOF
+#!/bin/sh
+[ "\$*" = "+%s" ] && exec cat "$TMP/tclock-now"
+exec $(command -v date) "\$@"
+EOF
+cat >"$TMP/tclock-tick" <<EOF
+echo \$((\$(cat "$TMP/tclock-now") + \$1)) >"$TMP/tclock-now.new"
+mv "$TMP/tclock-now.new" "$TMP/tclock-now"
+EOF
+chmod +x "$TMP/tclock-bin/date"
+echo 1000000000 >"$TMP/tclock-now"
 rm -f "$W"/gate-*.txt
-stamp_manifest check=true "test=sleep 2; sh ./fake-test.sh"
-"$PO" -C "$W" --manifest "$TMP/s.toml" stamp >/dev/null 2>&1
+stamp_manifest check=true "test=sh $TMP/tclock-tick 2; sh ./fake-test.sh"
+PATH="$TMP/tclock-bin:$PATH" "$PO" -C "$W" --manifest "$TMP/s.toml" stamp >/dev/null 2>&1
 tk=$(tail -1 "$SLOG")
-python3 -I -c 'import json,sys; e=json.loads(sys.argv[1]); assert e["result"]=="pass"; assert e["legs"][1]["seconds"]>=2, e; assert e["seconds"]>=e["legs"][1]["seconds"]>=2, e; assert e["legs"][0]["seconds"]<2, e' "$tk" &&
-	ok "time taken: a leg that sleeps 2 s records seconds >= 2 on the leg and on the run" || bad "stamp seconds" "$tk"
+python3 -I -c 'import json,sys; e=json.loads(sys.argv[1]); assert e["result"]=="pass"; assert [l["seconds"] for l in e["legs"]]==[0,2] and e["seconds"]==2, e' "$tk" &&
+	ok "time taken: a leg the clock sees take 2 s records 2 seconds on the leg and on the run" || bad "stamp seconds" "$tk"
 out=$("$PO" -C "$S" --manifest "$TMP/s.toml" events 2>&1)
-[[ $(table <<<"$out" | sed -n 2p) =~ \ [0-9]+s\ +check:pass\([0-9]+s\)\ test:pass\([0-9]+s\)$ ]] &&
+[[ $(table <<<"$out" | sed -n 2p) =~ \ 2s\ +check:pass\(0s\)\ test:pass\(2s\)$ ]] &&
 	ok "time taken: po events shows the run's time and each leg's seconds" || bad "events took" "$out"
 rm -f "$W"/gate-*.txt
-SLOW_AFTER=1 stamp_manifest check=true "test=sleep 2; sh ./fake-test.sh"
-"$PO" -C "$W" --manifest "$TMP/s.toml" stamp >/dev/null 2>&1
+SLOW_AFTER=1 stamp_manifest check=true "test=sh $TMP/tclock-tick 2; sh ./fake-test.sh"
+PATH="$TMP/tclock-bin:$PATH" "$PO" -C "$W" --manifest "$TMP/s.toml" stamp >/dev/null 2>&1
 out=$("$PO" -C "$S" --manifest "$TMP/s.toml" events 2>&1)
-[[ $(table <<<"$out" | sed -n 2p) =~ \ [0-9]+s\ slow\ +check:pass ]] &&
-	ok "time taken: slow_after = 1 marks the sleeping run with the word slow" || bad "events slow" "$out"
+[[ $(table <<<"$out" | sed -n 2p) =~ \ 2s\ slow\ +check:pass ]] &&
+	ok "time taken: slow_after = 1 marks the 2 s run with the word slow" || bad "events slow" "$out"
 rm -f "$W"/gate-*.txt
 stamp_manifest "${STD_LEGS[@]}"
 out=$("$PO" -C "$S" --manifest "$TMP/s.toml" events 2>&1)
@@ -5146,6 +5257,46 @@ except Exception:
     check("memory log write failure", False)
 
 
+# ---- v0.208: the stall probe (PO_DASHBOARD_STALL_LOG) ----
+check("dashboard-stall-probe-off: no PO_DASHBOARD_STALL_LOG is no probe, so nothing is written",
+      c.StallProbe.from_env({}) is None and c.StallProbe.from_env({"PO_DASHBOARD_STALL_LOG": "  "}) is None)
+_sd = tempfile.mkdtemp()
+_sp_path = os.path.join(_sd, "sub", "stall.log")
+_clock = [0.0]
+_sp = c.StallProbe.from_env({"PO_DASHBOARD_STALL_LOG": _sp_path}, clock=lambda: _clock[0], now=lambda: "T")
+def _slow(ms):
+    _clock[0] += ms / 1000.0
+    return "r"
+_red = _sp.wrap("redraw", _slow)
+_dat = _sp.wrap("on_data", lambda: _red(900) and _slow(5))
+check("dashboard-stall-probe: the first beat logs nothing", _sp.check() is None and not os.path.exists(_sp_path))
+_clock[0] += 0.05
+check("dashboard-stall-probe: a 50 ms gap logs nothing", _sp.check() is None and not os.path.exists(_sp_path))
+_clock[0] += 0.149
+check("dashboard-stall-probe: a 149 ms gap logs nothing", _sp.check() is None and not os.path.exists(_sp_path))
+_clock[0] += 0.151
+_ln = _sp.check()
+check("dashboard-stall-probe: a 151 ms gap logs the line", _ln == "T stall 151 ms after start (ran: none over 10 ms)", _ln)
+os.remove(_sp_path)
+_dat()
+_ln = _sp.check()
+check("dashboard-stall-probe: a gap over 150 ms logs stall <ms> ms after <callback>, naming the long callbacks inner first",
+      _ln == "T stall 905 ms after on_data (ran: redraw 900, on_data 905)" and open(_sp_path).read() == _ln + "\n", _ln)
+_clock[0] += 0.4
+_ln = _sp.check()
+check("dashboard-stall-probe: a gap no wrapped callback accounts for says so", _ln == "T stall 400 ms after on_data (ran: none over 10 ms)", _ln)
+check("dashboard-stall-probe: beat keeps the GLib timeout going", _sp.beat() is True)
+check("dashboard-stall-probe: the wrapped callback returns what it returned", _sp.wrap("tick", lambda: True)() is True)
+_sp.note("active 1")
+check("dashboard-stall-probe: a note is one line", open(_sp_path).read().splitlines()[-1] == "T active 1")
+_bad = open(os.path.join(_sd, "afile"), "w"); _bad.close()
+_spb = c.StallProbe(os.path.join(_sd, "afile", "stall.log"), clock=lambda: _clock[0], now=lambda: "T")
+try:
+    _spb.check(); _clock[0] += 1.0; _spb.check(); _spb.note("active 0")
+    check("dashboard-stall-probe: an unwritable path does not raise", True)
+except Exception as e:
+    check("dashboard-stall-probe: an unwritable path does not raise", False, repr(e))
+
 
 # ---- v0.77: the archive in the dashboard ----
 _lv = [{"time": "2026-10-30T10:00:00Z", "kind": "open", "item": "1"}, {"time": "2026-10-29T10:00:00Z", "kind": "open", "item": "2"}]
@@ -5704,7 +5855,7 @@ PY
 			[[ -s $TMP/shot-projects.png ]] && ok "po-dashboard --view projects --screenshot saves the Projects pane" || bad "dashboard projects screenshot"
 		# Activating a Projects card (child-activated, as Enter/Space do) opens that project's screen.
 		# helper
-		out=$(timeout 60 python3 -I - "$DB" "$SV/events.json" "$(dirname "$PO")/../examples/projects-feed.json" 2>/dev/null <<'PY'
+		out=$(DBUS_SESSION_BUS_ADDRESS=disabled: timeout 60 python3 -I - "$DB" "$SV/events.json" "$(dirname "$PO")/../examples/projects-feed.json" 2>/dev/null <<'PY'
 import http.server, importlib.machinery, importlib.util, sys, threading
 sys.dont_write_bytecode = True
 import gi
@@ -5759,7 +5910,7 @@ for e, a in zip(p, (True, False, True)): e["active"] = a
 json.dump(p, open(sys.argv[2], "w"))' "$(dirname "$PO")/../examples/projects-feed.json" "$TMP/v139-projects.json"
 		for _sink in slow ""; do
 			# helper
-			out=$(timeout 60 python3 -I - "$DB" "$SV/events.json" "$TMP/v139-projects.json" "$_sink" 2>/dev/null <<'PY'
+			out=$(DBUS_SESSION_BUS_ADDRESS=disabled: timeout 60 python3 -I - "$DB" "$SV/events.json" "$TMP/v139-projects.json" "$_sink" 2>/dev/null <<'PY'
 import http.server, importlib.machinery, importlib.util, os, sys, threading
 sys.dont_write_bytecode = True
 import gi
@@ -5859,7 +6010,7 @@ json.dump([{"project": "orchard", "release": "release-23", "active": False, "las
     {"project": "grove", "release": "release-23", "last_event": None, "items": [{"item": "v1", "status": "DONE", "released": True}]}],
     open(sys.argv[1], "w"))' "$TMP/v140-projects.json"
 		# helper
-		out=$(timeout 60 python3 -I - "$DB" "$SV/events.json" "$TMP/v140-projects.json" 2>/dev/null <<'PY'
+		out=$(DBUS_SESSION_BUS_ADDRESS=disabled: timeout 60 python3 -I - "$DB" "$SV/events.json" "$TMP/v140-projects.json" 2>/dev/null <<'PY'
 import http.server, importlib.machinery, importlib.util, json, os, sys, threading
 sys.dont_write_bytecode = True
 import gi
@@ -5948,7 +6099,7 @@ PY
 			bad "v0.140 GTK release post" "$out"
 		# v0.109: the errored project's card is greyed (po-errored) and says `feed error`; the others do not (the example feed's Projects screenshot above shows it).
 		# helper
-		out=$(timeout 60 python3 -I - "$DB" "$SV/events.json" "$(dirname "$PO")/../examples/projects-feed.json" 2>/dev/null <<'PY'
+		out=$(DBUS_SESSION_BUS_ADDRESS=disabled: timeout 60 python3 -I - "$DB" "$SV/events.json" "$(dirname "$PO")/../examples/projects-feed.json" 2>/dev/null <<'PY'
 import http.server, importlib.machinery, importlib.util, os, sys, threading
 sys.dont_write_bytecode = True
 import gi
@@ -5997,7 +6148,7 @@ PY
 		[[ $out == errored-only ]] && ok "v0.109 po-dashboard greys only the errored project's card, says feed error and carries it in the tooltip" || bad "v0.109 errored card" "$out"
 		# v0.83: the release label is the last widget of the card's top row and of the screen header, right-aligned; `no release` is muted.
 		# helper
-		out=$(timeout 60 python3 -I - "$DB" "$SV/events.json" "$(dirname "$PO")/../examples/projects-feed.json" 2>/dev/null <<'PY'
+		out=$(DBUS_SESSION_BUS_ADDRESS=disabled: timeout 60 python3 -I - "$DB" "$SV/events.json" "$(dirname "$PO")/../examples/projects-feed.json" 2>/dev/null <<'PY'
 import http.server, importlib.machinery, importlib.util, os, sys, threading
 sys.dont_write_bytecode = True
 import gi
@@ -6052,7 +6203,7 @@ PY
  {"project":"p","item":"3","title":"a","waiting_for":"a block","asked_at":"2026-10-24T11:00:00Z","kind":"action","id":"d-action","machine":"m","steps":[{"text":"one","expect":"x"},{"text":"two","expect":"y"}],"done_when":"pass"}]
 JSON
 		# helper
-		out=$(XDG_CONFIG_HOME="$TMP/xdg-drafts" timeout 60 python3 -I - "$DB" "$SV/events.json" "$TMP/drafts-feed.json" 2>/dev/null <<'PY'
+		out=$(DBUS_SESSION_BUS_ADDRESS=disabled: XDG_CONFIG_HOME="$TMP/xdg-drafts" timeout 60 python3 -I - "$DB" "$SV/events.json" "$TMP/drafts-feed.json" 2>/dev/null <<'PY'
 import gc, http.server, importlib.machinery, importlib.util, os, sys, threading
 sys.dont_write_bytecode = True
 import gi
@@ -6194,7 +6345,7 @@ PY
 		mkdir -p "$TMP/slow-bin" && printf '#!/bin/sh\nsleep 3\necho "a 1-1"\n' >"$TMP/slow-bin/pacman" && chmod +x "$TMP/slow-bin/pacman"
 		printf '[{"project":"p","item":"1","title":"Look","waiting_for":"a look","asked_at":"2026-10-29T10:00:00Z","kind":"action","id":"sl1","machine":"laptop","steps":[{"text":"open the Bookmarks menu","expect":"three bookmarks"}],"done_when":"pass","requires":{"package":"a-1-1-x86_64.pkg.tar.zst","sha256":"%s"},"fixtures":[],"checked_by":"rev","check_sha256":"%s","ready":{"build":"a 1-1","checked_at":"%s"}}]\n' "$sha" "$sha" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$TMP/slow-feed.json"
 		# helper
-		out=$(PATH="$TMP/slow-bin:$PATH" XDG_CONFIG_HOME="$TMP/xdg-slow" timeout 60 python3 -I - "$DB" "$SV/events.json" "$TMP/slow-feed.json" 2>&1 <<'PY'
+		out=$(DBUS_SESSION_BUS_ADDRESS=disabled: PATH="$TMP/slow-bin:$PATH" XDG_CONFIG_HOME="$TMP/xdg-slow" timeout 60 python3 -I - "$DB" "$SV/events.json" "$TMP/slow-feed.json" 2>&1 <<'PY'
 import gc, http.server, importlib.machinery, importlib.util, os, sys, threading, time
 sys.dont_write_bytecode = True
 import gi
@@ -6255,7 +6406,7 @@ PY
  {"project":"p","item":"3","title":"a","waiting_for":"a block","asked_at":"2026-10-24T11:00:00Z","kind":"action","id":"t-action","machine":"m","steps":[{"text":"one","expect":"x"},{"text":"two","expect":"y"}],"done_when":"pass"}]
 JSON
 		# helper
-		out=$(XDG_CONFIG_HOME="$TMP/xdg-toggle" timeout 60 python3 -I - "$DB" "$SV/events.json" "$TMP/toggle-feed.json" "$TMP/xdg-toggle" 2>&1 <<'PY'
+		out=$(DBUS_SESSION_BUS_ADDRESS=disabled: XDG_CONFIG_HOME="$TMP/xdg-toggle" timeout 60 python3 -I - "$DB" "$SV/events.json" "$TMP/toggle-feed.json" "$TMP/xdg-toggle" 2>&1 <<'PY'
 import gc, http.server, importlib.machinery, importlib.util, json, os, sys, threading
 sys.dont_write_bytecode = True
 import gi

@@ -14,6 +14,7 @@ import sys
 import re
 import string
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -1215,6 +1216,80 @@ def load_projects(url, last=None, feed=None):
         return parse_projects(fetch(url)), ""
     except DashboardError as e:
         return last, "%s (showing the last projects data)" % e if last is not None else str(e)
+
+
+STALL_LOG_ENV = "PO_DASHBOARD_STALL_LOG"  # v0.208: a main-loop stall log, written only when this names a file
+STALL_BEAT_MS = 50
+STALL_OVER_MS = 150
+STALL_CALLBACKS = ("tick", "fade_tick", "on_data", "on_team", "on_decisions", "on_projects", "redraw", "apply_css",
+                   "redraw_team", "redraw_decisions", "redraw_projects", "redraw_reports", "log_memory")
+
+
+class StallProbe:
+    """A main-loop stall probe (v0.208). The window wraps its callbacks with wrap(name, fn) and calls beat()
+    every STALL_BEAT_MS; two beats more than STALL_OVER_MS apart log "stall <ms> ms after <name>", naming
+    the wrapped callback that ran last before the gap and those that ran long in it. Gtk-free; off without a path."""
+
+    def __init__(self, path, clock=None, now=None):
+        self.path = path
+        self.clock = clock or time.monotonic
+        self.now = now or (lambda: datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        self.last = None  # the monotonic time of the last beat
+        self.after = "start"  # the wrapped callback that ran last
+        self.ran = []  # "<name> <ms>" of each wrapped callback since the last beat that ran 10 ms or more
+
+    @classmethod
+    def from_env(cls, env=None, **kw):
+        """A probe when PO_DASHBOARD_STALL_LOG names a file, else None (nothing is ever written)."""
+        env = os.environ if env is None else env
+        path = (env.get(STALL_LOG_ENV) or "").strip()
+        return cls(path, **kw) if path else None
+
+    def wrap(self, name, fn):
+        def run(*args, **kwargs):
+            t0 = self.clock()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                ms = round((self.clock() - t0) * 1000)
+                self.after = name
+                if ms >= 10:
+                    self.ran.append("%s %d" % (name, ms))
+        run.__name__ = getattr(fn, "__name__", name)
+        return run
+
+    def beat(self):
+        """The GLib timeout: one check, and keep going."""
+        self.check()
+        return True
+
+    def check(self):
+        """One probe tick: the line logged, or None. The line lists the wrapped callbacks that ran 10 ms or more in the gap, inner ones first; a gap they
+        do not account for was spent outside them (GTK layout and drawing, the Python GC, a paused process)."""
+        t = self.clock()
+        line = None
+        if self.last is not None:
+            gap = round((t - self.last) * 1000)
+            if gap > STALL_OVER_MS:
+                line = "%s stall %d ms after %s (ran: %s)" % (self.now(), gap, self.after, ", ".join(self.ran) or "none over 10 ms")
+                self.write(line)
+        self.last = t
+        self.ran = []
+        return line
+
+    def note(self, text):
+        """A plain line (the window's focus changes), so the log shows when the click came."""
+        self.write("%s %s" % (self.now(), text))
+
+    def write(self, line):
+        try:
+            d = os.path.dirname(self.path)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
 
 
 def memory_log_path(env=None):

@@ -96,6 +96,8 @@ OK|REFUSED|CONFLICT|STAMP FAILED|CLOSE FAILED|PUSH FAILED ...`; `--dry-run` prin
 and step and runs nothing. It judges nothing: SPEC MET stays the reviewer's, the diff read the
 PO's (after the land), and an item that waits on a ruling is held, never landed.
 
+**Gradle projects.** With `[gate] test_format = "gradle"` the stamp counts tests from the JUnit XML reports (`[gate] test_results_glob`, default `build/test-results/**/*.xml`) the test leg wrote, only those newer than the leg's start. Gradle skips an up-to-date test task and then writes no new reports, which exits 4 ("no test report newer than its start"): the leg's command must force the run (for example by running the clean-test task first).
+
 **Slow gate trigger.** Every stamp event records the seconds it took, and `po events` and the dashboard mark a run over `[stamp] slow_after` (default 300) as `slow`. When a gate goes over about 5 minutes, the PO adopts the tiered gate (v0.182: `[stamp] tier` and `[stamp.fast]`, a `# covers:` line per test file): item stamps run fast, `po land` and `po close` want a full stamp at the tip, and `po release <N> --write` wants a full stamp of main's tip in the main checkout (`po stamp --tier full` there first; the release commit then touches only `CHANGELOG.md`). `po events` marks a fast run `fast`; `po events --trend` counts full stamps only.
 
 ## Asking the owner

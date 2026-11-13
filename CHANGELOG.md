@@ -16,6 +16,32 @@ one row per step or per group of steps.
 
 ## Unreleased
 
+## Release 30 (2026-11-12): Gradle test counts and a dashboard stall probe
+
+### Setup after install
+
+| # | Machine | Command | Who | Check |
+|---|---|---|---|---|
+| 1 | optional, a machine that shows the dashboard freeze | start `po-dashboard` with `PO_DASHBOARD_STALL_LOG=<path>` (v0.208) | the machine's operator | the log gets a `stall` line after a freeze |
+
+**Agents:** none. **Adopt:** `[gate] test_format = "gradle"` in a Gradle project (v0.207). Also in this release: two test suites started at once on one host no longer kill each other (v0.184).
+
+### A stall probe for the dashboard (v0.208, 2026-11-12)
+
+- po-dashboard: `PO_DASHBOARD_STALL_LOG=<path>` logs each main-loop stall over 150 ms as `stall <ms> ms after <callback>` (with the callbacks that ran 10 ms or more), and the window's focus changes as `active 0/1`; unset, nothing is written. Measures the freeze on the first click after the window sat in the background.
+- **Agents**: none. **Adopt**: none. Setup: optional, on the desktop that shows the freeze, add `Environment=PO_DASHBOARD_STALL_LOG=%h/.local/state/po-dashboard/stall.log` to the dashboard's user unit and restart it.
+
+### `test_format = "gradle"`: count tests from JUnit XML reports (v0.207, 2026-11-12)
+
+- `[gate] test_format = "gradle"` makes `po stamp` count a Gradle project's tests from the JUnit XML reports (`[gate] test_results_glob`, default `build/test-results/**/*.xml`, bash `globstar`, relative to the repo root) after the test leg: tests - failures - errors - skipped over every `<testsuite>`. A failure or error, no passed tests, a malformed report or no report newer than the leg's start exits 4. The block line and the event count keep their shape. libtest and pytest are unchanged.
+- Gradle skips an up-to-date test task and then writes no reports, which exits 4: the leg's command must force the run.
+- **Agents**: none. **Adopt**: `test_format = "gradle"` in a Gradle project.
+
+### Two test suites at once no longer kill each other (v0.184, 2026-11-12)
+
+- tests/run.sh: the leak marker is unique per run (`sleep 3171.<PID>`), and the dashboard blocks run with `DBUS_SESSION_BUS_ADDRESS=disabled:`, so two `tests/run.sh` started at once on one host both pass and the leak check still names only its own leftover.
+- **Agents**: none. **Adopt**: none.
+
 ## Release 29 (2026-11-12): a tiered gate and `po land`; the host lands finished items; a test review and faster tests
 
 ### Setup after install

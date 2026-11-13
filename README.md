@@ -257,6 +257,19 @@ the same from any worktree.
   `error`/`errors`, or no passed tests, exits 4; so does output with no
   pytest summary.
 
+  With `[gate] test_format = "gradle"` the count comes from the JUnit XML
+  reports Gradle writes, not from output. After the test leg (the leg named
+  `test`, or the single `[gate] command`) `po stamp` reads every file matching
+  `[gate] test_results_glob` (default `build/test-results/**/*.xml`, expanded
+  with bash `globstar` relative to the repo root; it needs `python3`).
+  Only reports modified at or after the leg's start count. It sums `tests`,
+  `failures`, `errors` and `skipped` over every `<testsuite>`; passed is
+  tests minus failures, errors and skipped. A failure or an error, no passed
+  tests, a malformed report (named in the message) or no fresh report exits 4;
+  `test_count_cmd` is not used. Gradle skips an up-to-date test task and then
+  writes no new reports, which exits 4: the leg's command must force the run
+  (for example by running the clean-test task first). A multi-module build sets the glob to reach each module, e.g. `*/build/test-results/**/*.xml`.
+
   A line `RUN-ABORTED` in a leg's or the count command's output exits 4, and
   with `[gate] run_sentinel = "required"` so does a count command whose output
   has no `RUN-END ...` line (a test runner prints it last but for its summary).

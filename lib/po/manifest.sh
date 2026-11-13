@@ -28,6 +28,7 @@ declare -gA PO_SCHEMA=(
 	[gate.command]=0
 	[gate.test_count_cmd]=0
 	[gate.test_format]=0
+	[gate.test_results_glob]=0
 	[gate.run_sentinel]=0
 	[gate.drain_secs]=0
 	[gate.scope]=0
@@ -253,8 +254,12 @@ po_manifest_load() {
 		po_die "$file: [release] pattern applies to source \"tag\" only"
 	[[ -z ${PO_MANIFEST[release.pattern]+x} || -n ${PO_MANIFEST[release.pattern]} ]] ||
 		po_die "$file: [release] pattern must not be empty"
-	[[ -z ${PO_MANIFEST[gate.test_format]+x} || ${PO_MANIFEST[gate.test_format]} == libtest || ${PO_MANIFEST[gate.test_format]} == pytest ]] ||
-		po_die "$file: [gate] test_format must be \"libtest\" or \"pytest\": ${PO_MANIFEST[gate.test_format]}"
+	[[ -z ${PO_MANIFEST[gate.test_format]+x} || ${PO_MANIFEST[gate.test_format]} == libtest || ${PO_MANIFEST[gate.test_format]} == pytest || ${PO_MANIFEST[gate.test_format]} == gradle ]] ||
+		po_die "$file: [gate] test_format must be \"libtest\", \"pytest\" or \"gradle\": ${PO_MANIFEST[gate.test_format]}"
+	[[ -z ${PO_MANIFEST[gate.test_results_glob]+x} || ${PO_MANIFEST[gate.test_format]:-} == gradle ]] ||
+		po_die "$file: [gate] test_results_glob applies to test_format \"gradle\" only"
+	[[ -z ${PO_MANIFEST[gate.test_results_glob]+x} || -n ${PO_MANIFEST[gate.test_results_glob]} ]] ||
+		po_die "$file: [gate] test_results_glob must not be empty"
 	[[ -z ${PO_MANIFEST[gate.run_sentinel]+x} || ${PO_MANIFEST[gate.run_sentinel]} == required ]] ||
 		po_die "$file: [gate] run_sentinel must be \"required\": ${PO_MANIFEST[gate.run_sentinel]}"
 	[[ -z ${PO_MANIFEST[gate.drain_secs]+x} || ${PO_MANIFEST[gate.drain_secs]} =~ ^[0-9]+$ ]] ||
