@@ -5,6 +5,7 @@ here so tests can run them anywhere; bin/po-dashboard only draws the window.
 Standard library only.
 """
 import datetime
+import hashlib
 import http.client
 import json
 import math
@@ -805,6 +806,26 @@ def team_check_lines(entries, now=None, tz=None):
     ]
 
 
+def _team_display(entry, now=None, tz=None):
+    """What one Team line shows, less the idle-minute text: the idle status ("idle 12 min") moves with the clock."""
+    r = team_row(entry, now, tz)
+    return (r["agent"], r["model"], r["kind"], "" if r["kind"] == "idle" else r["status"], r["usage"], r["now"], r["owns"])
+
+
+def team_same(old, new, now=None, tz=None):
+    """Whether a refresh brought the same Team view (v0.209): the same agents in the same order with the same
+    model, kind, status, usage, now and owns. An idle agent's "idle 12 min" text is ignored, as it only moves
+    with the clock; the line is then not rebuilt, its text is moved on in place."""
+    if old is None or new is None or len(old) != len(new):
+        return False
+    return [_team_display(e, now, tz) for e in old] == [_team_display(e, now, tz) for e in new]
+
+
+class TeamRedraw(ReportsRedraw):
+    """The Team view's redraw gate (v0.209), the Reports one for Team: a changed feed redraws only while Team is on
+    screen; hidden, it is marked dirty and redrawn once when Team is shown. visible() says whether Team is on screen."""
+
+
 # ---- the decisions view ----------------------------------------------------
 
 
@@ -1237,6 +1258,9 @@ class StallProbe:
         self.last = None  # the monotonic time of the last beat
         self.after = "start"  # the wrapped callback that ran last
         self.ran = []  # "<name> <ms>" of each wrapped callback since the last beat that ran 10 ms or more
+        self.click_at = None  # v0.209: the monotonic time of a click not yet followed by a frame
+        self.frame_at = None  # the time of the last frame tick, None while unmapped or suspended
+        self.mapped, self.suspended = None, False
 
     @classmethod
     def from_env(cls, env=None, **kw):
@@ -1281,6 +1305,46 @@ class StallProbe:
         """A plain line (the window's focus changes), so the log shows when the click came."""
         self.write("%s %s" % (self.now(), text))
 
+    def started(self, pid, build):
+        """The first line of a window: which process (and which build of the dashboard) wrote this log."""
+        self.note("start %d %s" % (pid, build))
+
+    def click(self):
+        """A click on the window (capture phase): the next frame tick says how long the window took to paint."""
+        self.click_at = self.clock()
+        self.note("click")
+
+    def frame(self):
+        """One frame-clock tick (add_tick_callback; returns True to keep it): logs "frame <ms> ms after click" for
+        the first frame after a click, and "frame gap <ms>" when two ticks are over STALL_OVER_MS apart while the
+        window is mapped and not suspended."""
+        t = self.clock()
+        if self.click_at is not None:
+            self.note("frame %d ms after click" % round((t - self.click_at) * 1000))
+            self.click_at = None
+        if self.frame_at is not None and self.mapped is not False and not self.suspended:
+            gap = round((t - self.frame_at) * 1000)
+            if gap > STALL_OVER_MS:
+                self.note("frame gap %d" % gap)
+        self.frame_at = t
+        return True
+
+    def set_mapped(self, mapped):
+        """The window was mapped or unmapped: a change is a line; no frame gap is counted across it."""
+        mapped = bool(mapped)
+        if mapped != self.mapped:
+            self.mapped = mapped
+            self.frame_at = None
+            self.note("mapped %d" % mapped)
+
+    def set_suspended(self, suspended):
+        """The toplevel was suspended (the compositor stopped asking for frames) or resumed: a change is a line."""
+        suspended = bool(suspended)
+        if suspended != self.suspended:
+            self.suspended = suspended
+            self.frame_at = None
+            self.note("suspended %d" % suspended)
+
     def write(self, line):
         try:
             d = os.path.dirname(self.path)
@@ -1290,6 +1354,19 @@ class StallProbe:
                 f.write(line + "\n")
         except OSError:
             pass
+
+
+def build_id():
+    """A short id of this build of the dashboard (12 hex of the sha256 of its two sources), or "?" when unreadable."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    h = hashlib.sha256()
+    try:
+        for path in (os.path.join(here, "dashboard_core.py"), os.path.join(here, "..", "..", "bin", "po-dashboard")):
+            with open(path, "rb") as f:
+                h.update(f.read())
+    except OSError:
+        return "?"
+    return h.hexdigest()[:12]
 
 
 def memory_log_path(env=None):

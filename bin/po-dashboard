@@ -248,6 +248,7 @@ def main():
             self.report_archive_note = ""  # why it is not there: loading, or the failure
             self.team = []
             self.team_text = None
+            self.team_idle = {}  # agent name -> its idle-status label, moved on in place when only the clock changed (v0.209)
             self.order_path = core.team_order_path()
             self.team_order = core.load_team_order(self.order_path)  # saved agent names, the viewer's own order
             self.team_shown = []  # agent names as the Team view shows them now
@@ -324,6 +325,7 @@ def main():
             self.reports_on = a.view == "reports"  # the Reports pane replaces the Events list; kept across refreshes
             self.report_range = core.REPORT_DEFAULT
             self.reports_redraw = core.ReportsRedraw(lambda: self.redraw_reports(), self.reports_visible)  # v0.178
+            self.team_redraw = core.TeamRedraw(lambda: self.redraw_team(), lambda: self.view == "team")  # v0.209
             title.set_text(self.title_for("events"))
             self.reports_button = Gtk.ToggleButton(label="Reports", active=self.reports_on)
             self.reports_button.add_css_class("po-small")
@@ -453,6 +455,29 @@ def main():
             if self.stall is not None:
                 GLib.timeout_add(core.STALL_BEAT_MS, self.stall.beat)
                 self.win.connect("notify::is-active", lambda w, _p: self.stall.note("active %d" % w.is_active()))
+                self.stall_window()
+
+        def stall_window(self):
+            """v0.209: the probe also logs what the window itself does: its start, each click and the frame that
+            paints after it, a gap between frames, and the window being mapped, unmapped or suspended."""
+            probe = self.stall
+            probe.started(os.getpid(), core.build_id())
+            click = Gtk.GestureClick()
+            click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+            click.connect("pressed", lambda *_: probe.click())
+            self.win.add_controller(click)
+            self.win.add_tick_callback(lambda _w, _clock: probe.frame())
+            self.win.connect("map", lambda _w: probe.set_mapped(True))
+            self.win.connect("unmap", lambda _w: probe.set_mapped(False))
+            probe.set_mapped(self.win.get_mapped())
+            def watch_surface(*_):
+                surface = self.win.get_surface()
+                if surface is not None and hasattr(surface, "get_suspended"):
+                    surface.connect("notify::suspended", lambda s, _p: probe.set_suspended(s.get_suspended()))
+            if self.win.get_realized():
+                watch_surface()
+            else:
+                self.win.connect("realize", watch_surface)
 
         # -- style --
         def dark(self):
@@ -916,8 +941,15 @@ def main():
             self.team_error.set_visible(False)
             if text != self.team_text:
                 roster = {r.get("agent") for r in self.team}
+                same = core.team_same(self.team if self.team_text is not None else None, team)
                 self.team_text, self.team = text, team
-                self.redraw_team()
+                if same:  # only the idle minutes moved: no card is rebuilt, the idle texts move on (v0.209)
+                    rows = {r["agent"]: r for r in core.team_rows(team)}
+                    for agent, label in self.team_idle.items():
+                        if rows.get(agent, {}).get("kind") == "idle":
+                            label.set_text(rows[agent]["status"])
+                else:
+                    self.team_redraw.fetched(True)  # redraws now with Team on screen, else when it is shown
                 if {r.get("agent") for r in team} != roster:
                     self.redraw_reports()  # first-try counts only the roster's agents (v0.143)
             self.show_status()
@@ -1004,6 +1036,8 @@ def main():
             self.projects_error.set_visible(name == "projects" and self.projects_failed)
             if name == "events":
                 self.reports_redraw.shown()
+            elif name == "team":
+                self.team_redraw.shown()
             self.show_status()
 
         def fetch_worker(self, since):
@@ -1348,6 +1382,8 @@ def main():
             self.event_scroll.add_tick_callback(tick)
 
         def redraw_team(self):
+            self.team_redraw.dirty = False  # every redraw is current, whoever asked for it
+            self.team_idle = {}
             child = self.team_list.get_first_child()
             while child is not None:
                 nxt = child.get_next_sibling()
@@ -1381,7 +1417,10 @@ def main():
                 if r["kind"] == "working":
                     state.append(self.label("\u25cf", "po-live"))
                 style = {"working": "po-live", "free": "po-free", "limit": "po-fail", "off": "po-off-badge"}.get(r["kind"], "po-muted")
-                state.append(self.label(r["status"], style, ellipsize=3, max_width_chars=28))
+                status = self.label(r["status"], style, ellipsize=3, max_width_chars=28)
+                state.append(status)
+                if r["kind"] == "idle":
+                    self.team_idle[r["agent"]] = status
                 if r["usage"] and r["usage"] != shared:
                     state.append(self.label(r["usage"], "po-muted", ellipsize=3, max_width_chars=20))
                 now = self.label(("now " + r["now"]) if r["now"] else "", "po-text", width_chars=10, max_width_chars=16, ellipsize=3)

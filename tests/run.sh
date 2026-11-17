@@ -5297,6 +5297,104 @@ try:
 except Exception as e:
     check("dashboard-stall-probe: an unwritable path does not raise", False, repr(e))
 
+# ---- v0.209: the Team view rebuilds only when it shows something new; the probe sees clicks and frames ----
+_TA = [{"agent": "agent-a", "model": "Sonnet", "state": "idle 4 min", "now": None, "owns": [], "free": False, "usage": {"five_hour": 0.27, "seven_day": 0.02}},
+       {"agent": "agent-b", "model": "Sonnet", "state": "WORKING", "now": "po-kit v0.209", "owns": ["po-kit v0.209"], "free": False}]
+def _tb(i, **kw):
+    e = [dict(x) for x in _TA]
+    e[i].update(kw)
+    return e
+check("team_same: rows differing only in the idle minutes are the same", c.team_same(_TA, _tb(0, state="idle 19 min")))
+check("team_same: no earlier rows is not the same", not c.team_same(None, _TA))
+check("team_same: a changed state is not the same", not c.team_same(_TA, _tb(1, state="idle 1 min")) and not c.team_same(_TA, _tb(0, state="WORKING")))
+check("team_same: a changed model is not the same", not c.team_same(_TA, _tb(0, model="Opus")))
+check("team_same: a changed now or owns is not the same", not c.team_same(_TA, _tb(1, now="po-kit v0.210")) and not c.team_same(_TA, _tb(1, owns=[])))
+check("team_same: a changed usage is not the same", not c.team_same(_TA, _tb(0, usage={"five_hour": 0.5, "seven_day": 0.02})))
+check("team_same: a switch flipped off is not the same", not c.team_same(_TA, _tb(0, inactive=True)))
+check("team_same: the free flag is not the same", not c.team_same(_TA, _tb(0, free=True)))
+check("team_same: a new or a dropped agent is not the same", not c.team_same(_TA, _TA + [{"agent": "x", "state": "idle 1 min"}]) and not c.team_same(_TA, _TA[:1]))
+check("team_same: a changed order is not the same", not c.team_same(_TA, list(reversed(_TA))))
+class _App209:  # as bin/po-dashboard on_team / on_view: counts Team redraws
+    def __init__(self, view="events"):
+        self.view, self.n, self.team, self.text, self.idle_moves = view, 0, [], None, 0
+        self.gate = c.TeamRedraw(self.redraw_team, lambda: self.view == "team")
+    def redraw_team(self):
+        self.gate.dirty = False
+        self.n += 1
+    def on_team(self, text, team):
+        if text != self.text:
+            same = c.team_same(self.team if self.text is not None else None, team)
+            self.text, self.team = text, team
+            if same:
+                self.idle_moves += 1
+            else:
+                self.gate.fetched(True)
+    def show(self, view):
+        self.view = view
+        if view == "team":
+            self.gate.shown()
+def _mod(base, i, **kw):
+    e = [dict(x) for x in base]
+    e[i].update(kw)
+    return e
+_tA = _TA
+_tB = _mod(_tA, 0, state="idle 5 min")  # only the idle minutes moved
+_tC = _mod(_tB, 1, state="idle 2 min")  # agent-b stopped working: a real change
+_tD = _mod(_tC, 0, state="idle 6 min")  # only the idle minutes moved
+_tE = _mod(_tD, 1, state="WORKING", now="po-kit v0.209")  # a real change
+_tF = _mod(_tE, 1, owns=[])  # a real change
+_t9 = _App209()
+_t9.on_team("a", _tA); _t9.on_team("b", _tB); _t9.on_team("c", _tC)
+check("v0.209 team: a changed feed with Team hidden redraws 0 times", _t9.n == 0, repr(_t9.n))
+_t9.show("team")
+check("v0.209 team: the first show after a change redraws once", _t9.n == 1 and not _t9.gate.dirty, repr(_t9.n))
+_t9.show("events"); _t9.show("team")
+check("v0.209 team: a show with nothing changed redraws 0 times", _t9.n == 1, repr(_t9.n))
+_t9.on_team("d", _tD)
+check("v0.209 team: Team shown, only idle text changed: no redraw, the idle texts move on", _t9.n == 1 and _t9.idle_moves == 2, repr((_t9.n, _t9.idle_moves)))
+_t9.on_team("e", _tE)
+check("v0.209 team: Team shown, a real change redraws once", _t9.n == 2, repr(_t9.n))
+_t9.on_team("e", _tE)
+check("v0.209 team: Team shown, an unchanged text redraws 0 times", _t9.n == 2, repr(_t9.n))
+_t9.show("events"); _t9.on_team("f", _tF); _t9.gate.redraw()
+_t9.show("team")
+check("v0.209 team: a direct redraw clears the dirty mark, so the show does not redraw again", _t9.n == 3, repr(_t9.n))
+# the probe: start, click, frame after click, frame gap, suspended, mapped
+_f = os.path.join(_sd, "frames", "stall.log")
+_k = [0.0]
+_fp = c.StallProbe(_f, clock=lambda: _k[0], now=lambda: "T")
+_fp.started(4242, "abc123")
+_fp.set_mapped(True)
+check("v0.209 probe: a start line names the process and the build", open(_f).read().splitlines()[0] == "T start 4242 abc123")
+check("v0.209 probe: mapped is a line", open(_f).read().splitlines()[1] == "T mapped 1")
+_fp.frame(); _k[0] += 0.149; _fp.frame()
+check("v0.209 probe: a 149 ms frame gap logs nothing", len(open(_f).read().splitlines()) == 2)
+_k[0] += 0.151; _fp.frame()
+check("v0.209 probe: a 151 ms frame gap logs frame gap 151", open(_f).read().splitlines()[-1] == "T frame gap 151")
+_fp.click(); _k[0] += 0.42; _fp.frame()
+_l = open(_f).read().splitlines()
+check("v0.209 probe: a click is a line and the next frame says frame <ms> ms after click", _l[-3:] == ["T click", "T frame 420 ms after click", "T frame gap 420"] and _fp.click_at is None, repr(_l[-3:]))
+_k[0] += 0.02; _fp.frame()
+check("v0.209 probe: only the first frame after a click says so", open(_f).read().splitlines() == _l)
+_fp.set_suspended(True); _k[0] += 5; _fp.frame(); _k[0] += 5; _fp.frame()
+check("v0.209 probe: suspended is a line, and no frame gap is counted while suspended",
+      open(_f).read().splitlines()[len(_l):] == ["T suspended 1"], repr(open(_f).read().splitlines()[len(_l):]))
+_fp.set_suspended(True)
+_fp.set_suspended(False); _k[0] += 5; _fp.frame()
+check("v0.209 probe: resuming is a line and the first frame after it is no gap", open(_f).read().splitlines()[-1] == "T suspended 0")
+_fp.set_mapped(False); _k[0] += 9; _fp.set_mapped(True); _k[0] += 0.01; _fp.frame()
+check("v0.209 probe: unmapped and mapped are lines, and no frame gap is counted across them",
+      open(_f).read().splitlines()[-2:] == ["T mapped 0", "T mapped 1"])
+check("v0.209 probe: the frame tick returns True to keep going", _fp.frame() is True)
+check("v0.209 probe: build_id is 12 hex", len(c.build_id()) == 12 and set(c.build_id()) <= set("0123456789abcdef"), c.build_id())
+_spc = c.StallProbe(os.path.join(_sd, "afile", "stall.log"), clock=lambda: _k[0], now=lambda: "T")
+try:
+    _spc.started(1, "x"); _spc.click(); _spc.frame(); _spc.set_mapped(True); _spc.set_suspended(True)
+    check("v0.209 probe: an unwritable path does not raise on the new lines", True)
+except Exception as e:
+    check("v0.209 probe: an unwritable path does not raise on the new lines", False, repr(e))
+check("v0.209 probe: unset variable is no probe, so the new lines are never written", c.StallProbe.from_env({}) is None)
+
 
 # ---- v0.77: the archive in the dashboard ----
 _lv = [{"time": "2026-10-30T10:00:00Z", "kind": "open", "item": "1"}, {"time": "2026-10-29T10:00:00Z", "kind": "open", "item": "2"}]
@@ -5443,6 +5541,15 @@ grep -q 'GLib.timeout_add_seconds(core.REPORTS_TICK_SECONDS, self.reports_redraw
 	ok "v0.178 po-dashboard: the minute tick is armed and the view switch and Reports toggle redraw a dirty Reports" || bad "v0.178 tick/shown"
 [[ $(awk '/def on_range\(/,/def on_report_archive\(/' "$DB") == *'self.redraw_reports()'* && $(awk '/def apply_css\(/,/def step_of\(/' "$DB") == *'self.redraw_reports()'* ]] &&
 	ok "v0.178 po-dashboard: a range or variant change still redraws Reports directly" || bad "v0.178 range/variant"
+_ot=$(awk '/def on_team\(/,/def show_status\(/' "$DB")
+[[ $_ot == *'core.team_same('* && $_ot == *'self.team_redraw.fetched(True)'* && $_ot != *'self.redraw_team()'* ]] &&
+	ok "v0.209 po-dashboard: on_team compares with team_same and hands a real change to the Team gate, never redrawing itself" || bad "v0.209 on_team" "$_ot"
+[[ $(awk '/def on_view\(/,/def fetch_worker\(/' "$DB") == *'self.team_redraw.shown()'* ]] &&
+	grep -q 'self.team_redraw = core.TeamRedraw(' "$DB" &&
+	ok "v0.209 po-dashboard: showing Team redraws it once when it went dirty while hidden" || bad "v0.209 team shown"
+_st=$(awk '/def stall_window\(/,/# -- style --/' "$DB")
+[[ $_st == *'probe.started('* && $_st == *'probe.click()'* && $_st == *'PropagationPhase.CAPTURE'* && $_st == *'add_tick_callback'* && $_st == *'probe.set_mapped('* && $_st == *'probe.set_suspended('* ]] &&
+	ok "v0.209 po-dashboard: the stall probe hooks start, a capture-phase click, the frame tick, map and suspended" || bad "v0.209 probe hooks" "$_st"
 
 # v0.159: the card rules (card_rule_problems), one case per rule, and the reference card passes unchanged
 block card-rules python3 -B -I - "$DBLIB" <<'PY'

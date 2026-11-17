@@ -16,6 +16,59 @@ one row per step or per group of steps.
 
 ## Unreleased
 
+## Release 32 (2026-11-16): heartbeat fixes and four stop checks
+
+### Setup after install
+
+| # | Machine | Command | Who | Check |
+|---|---|---|---|---|
+| 1 | the dashboard host | run the host glue's `install` (v0.211, v0.212, v0.213) | the host's operator | the unit files install without error |
+| 2 | the dashboard host | `systemctl --user restart answer-receiver.service` (v0.211, v0.212) | the host's operator | a no-item card is answerable |
+| 3 | the dashboard host | start both heartbeat units once each (v0.212, v0.213) | the host's operator | both `wake-ticks` files get a `ran` line |
+
+**Agents:** none. **Adopt:** none. Also in this release: one ask card per message and rulings that name their card (v0.211); the heartbeat pauses only at `limit_until`, and `mk-queue` lists TODO cards (v0.212); four heartbeat stop checks (v0.213).
+
+### Four heartbeat stop checks (v0.213, 2026-11-16)
+
+- Each PO heartbeat appends `ran|skipped <unix> <limit_until|->` per tick to its own `wake-ticks` state file; the other heartbeat raises HEARTBEAT SKIPPING after 4 skips in a row with no `limit_until` (`auto-dispatch` sends one DM line to the second PO when both skip).
+- The second PO heartbeat: REPORT NO VERDICT (a REPORT 4 h old with no SPEC MET, FIX? or CLOSED), CARD MISSING (a valid ask to the owner or a relay with no dashboard card), CLICK REJECTED (a 4xx in the `answer-receiver` journal, 429 excluded, once per ask id and reason; `card unknown` when the line has none).
+- **Agents**: none. **Adopt**: none. Setup: run the host glue's `install`, start both heartbeat units once each, check both `wake-ticks` files get a `ran` line.
+
+### Heartbeat pauses at the limit, mk-queue lists TODO cards, no-item cards answerable (v0.212, 2026-11-16)
+
+- The PO heartbeat: a PO is skipped only while their `team-status` row has `limit_until` ahead; a chat-client "couldn't process" notice alone never skips (it could not end: a skipped tick sends nothing). No hold and no `last_sent` for a skipped destination.
+- `mk-queue`: a card is listed when its item is in `po status` or its backlog row says DOING, TODO or BLOCKED (po status never prints TODO). `--flag` sends no FIX? to an asker at its limit and defers it (`mk-queue-deferred.json`) so it is still sent after the reset.
+- `answer-receiver`: a missing, null, empty or "-" item are one "no item" value on feed and body; a real mismatch is still 400.
+- **Agents**: none. **Adopt**: none. Setup: run the host glue's `install`, restart the answer receiver, start the heartbeat unit once.
+
+### One ask card per message, and a ruling names its card (v0.211, 2026-11-16)
+
+- `mk-queue` lists every unanswered ask card of a thread, not only the newest, and a post ends only the card it answers: a dashboard ruling carries the ask's event id on a line `(ask <id>)` just before its unchanged last line, an older ruling ends the card whose question it repeats, and a free-text answer ends the newest card before it. The spec PO's heartbeat raises `BLOCKED-NO-CARD` for a DOING item that says BLOCKED on the owner while no card is open, and the dispatch prompt names a first checker who is switched on.
+- **Agents**: none. **Adopt**: none. Setup: run the host glue's `install`, then restart the answer receiver.
+
+## Release 31 (2026-11-15): dashboard Team view and switch-file fixes
+
+### Setup after install
+
+| # | Machine | Command | Who | Check |
+|---|---|---|---|---|
+| 1 | the dashboard host | run the install script, then `systemctl --user daemon-reload` (v0.210) | the host's operator | the unit files reload without error |
+| 2 | the dashboard host | `systemctl --user restart answer-receiver.service` | the host's operator | the project and agent switches answer after a rename of their file |
+| 3 | the dashboard host | restart the PO agent unit | the host's operator | the unit is active |
+
+**Agents:** none. **Adopt:** none. Also in this release: the dashboard Team view no longer rebuilds every 15 s and its stall probe logs clicks and frames (v0.209).
+
+### Dashboard Team view stops rebuilding every 15 s; the stall probe sees clicks and frames (v0.209, 2026-11-15)
+
+- `po-dashboard`: the Team view rebuilds only when it shows something new (`core.team_same` ignores the idle-minute text, which moves on in place); with another view on screen a changed team feed marks Team dirty and it redraws once when shown.
+- `po-dashboard`: with `PO_DASHBOARD_STALL_LOG=<path>` the log also gets a `start <pid> <build>` line, `click` lines each followed by `frame <ms> ms after click`, `frame gap <ms>` when two frame ticks are over 150 ms apart, and `suspended 0/1` and `mapped 0/1` changes; off and no file written without the variable.
+- **Agents**: none. **Adopt**: none. Setup: none.
+
+### Dashboard switch files survive a rename (v0.210, 2026-11-13)
+
+- The host's project and agent switch files move into a directory of their own, and the answer receiver's sandboxed unit mounts that directory instead of each file: a single-file mount is bound to the inode, so replacing the file by a rename (`sed -i`, an editor's save) left the switch answering 500 until a restart. The host install moves the old files there (content and mode kept), never overwrites one already there, and creates a missing one empty.
+- **Agents**: none. **Adopt**: none. Setup: on the host, run the install script, then `systemctl --user daemon-reload` and restart the answer receiver.
+
 ## Release 30 (2026-11-12): Gradle test counts and a dashboard stall probe
 
 ### Setup after install
