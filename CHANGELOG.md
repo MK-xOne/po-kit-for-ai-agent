@@ -16,6 +16,23 @@ one row per step or per group of steps.
 
 ## Unreleased
 
+## Release 33 (2026-11-17): an answered card stays off the decisions feed
+
+### Setup after install
+
+| # | Machine | Command | Who | Check |
+|---|---|---|---|---|
+| 1 | the dashboard host | run the host glue's `install` (v0.214) | the host's operator | the unit files install without error |
+| 2 | the dashboard host | `systemctl --user restart po-dashboard.service` (v0.214) | the host's operator | the decisions feed still answers |
+
+**Agents:** none. **Adopt:** none. Also in this release: nothing else; it bundles v0.214 only.
+
+### An answered card leaves the decisions feed at once (v0.214, 2026-11-17)
+
+- `mk-queue` and the dashboard server leave out a card whose answer the `answer-receiver` ledger has `posted`, so a card the owner answered is not listed again while the channel cache still lacks its ruling (up to 5 minutes). The server filters per request; a `pending` answer and a ledger that is missing or unreadable hide nothing.
+- The second PO heartbeat raises neither CARD MISSING nor BLOCKED-NO-CARD for such an ask.
+- **Agents**: none. **Adopt**: none. Setup: run the host glue's `install`, restart the dashboard unit, check the decisions feed still answers.
+
 ## Release 32 (2026-11-16): heartbeat fixes and four stop checks
 
 ### Setup after install
