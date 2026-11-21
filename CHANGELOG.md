@@ -16,6 +16,58 @@ one row per step or per group of steps.
 
 ## Unreleased
 
+## Release 34 (2026-11-20): the heartbeat sends a finding once, and the host glue catches up
+
+### Setup after install
+
+| # | Machine | Command | Who | Check |
+|---|---|---|---|---|
+| 1 | the dashboard host | run the host glue's `install` (v0.215-v0.225) | the host's operator | the unit files and scripts install without error |
+| 2 | the dashboard host | `systemctl --user restart answer-receiver.service` (v0.221) | the host's operator | a project whose channel and repo names differ can be switched |
+| 3 | the dashboard host | `lint-founding-notify <po-kit dir>` (v0.222) | the host's operator | no `unknown agent` line for a roster agent |
+
+**Agents:** dante: a QUEUE line now names the items without a ready line (v0.216); use `ready-add` to write a ready line (v0.223); a ready line alone opens an item (v0.218). A REPORT or COMMIT handoff needs a current stamp (v0.219); `run-scoped --report <item>` posts a passing stamp's REPORT (v0.217). **Adopt:** none. Also in this release: auto-dispatch gives items to the Nous agents again (v0.215); `spec-outcomes` reads a handoff line written with `@name` (v0.220).
+
+### Every roster agent has a pubkey (v0.222, 2026-11-20)
+
+- Host glue only. The agent pubkey file now lists a roster agent it lacked, and a test fails, naming the agent, when a name in the roster file has no entry. Root cause: the notify readers skip a name missing from the file, so the notes stayed unsent and `lint-founding-notify` reported `unknown agent`.
+- **Agents**: none. **Adopt**: none. Setup: run the host glue's `install` (it copies the file into place), then `lint-founding-notify <repo>` must show no `unknown agent` line.
+
+### The heartbeat sends a finding once (v0.216, 2026-11-19)
+
+- Host glue only. Both PO heartbeats keep, per finding, a hash of the text sent (ages left out). A hold that lapses no longer sends the same finding again: it is sent again when its text changed, when it went away and came back, or 24 h later (repeat +1). HEARTBEAT SKIPPING keeps its own rule; a failed send still holds nothing.
+- OWED is not raised for a closing handoff (`· SPEC MET`, `· CLOSED`) or for a mention the spec PO answered anywhere in the channel within 2 h. QUEUE is raised for a project with a TODO item that has no ready line, and is sent at every tick while the spec PO is idle, never while it is WORKING. FREE names only agents `auto-dispatch` would give an item (its `free_agents()` verdict, loaded).
+- **Agents**: dante: a QUEUE line now names the items without a ready line; write the line or park the item. **Adopt**: none. Setup: run the host glue's `install`; each standing finding is sent once more after it.
+
+### run-scoped failed lines include cargo's FAILED form (v0.225, 2026-11-19)
+Host glue only. A failed `run-scoped --notify ... --log L` wake now also carries lines that start `test ` and end ` FAILED` (cargo's per-test failure line); order, the 40-line cap and `failed_total` are unchanged. **Agents**: none. **Adopt**: none. Setup: run the host glue's `install`.
+
+### A passing stamp posts its own REPORT (v0.217, 2026-11-19)
+
+- Host glue only. `run-scoped --notify ... --report <item> -- po stamp`: a stamp that exits 0 posts the item's REPORT itself (through `handoff`) and wakes nobody. A failed run wakes the dev with the failed lines of its log (at most 40) instead of a bare exit code; a REPORT that could not be posted wakes the dev with the error. Without `--report` nothing changes.
+- **Agents**: none until the item prompt names `--report`. **Adopt**: none. Setup: run the host glue's `install`.
+
+### Dashboard project switch resolves channel and repo names (v0.221, 2026-11-19)
+The answer-receiver resolves a project name through the channel map (channel name, hyphenated name or repo dir), so a project whose channel and repo names differ (POGG Vision) can be switched; projects-feed uses the same function. **Agents**: none. **Adopt**: none. Install and restart the answer-receiver unit after the release.
+
+### ready-add writes a ready line from the roster (v0.223, 2026-11-19)
+`ready-add <project> <vN> "<title>" --level <n> [--depends ...] [--commit]` appends a ready.jsonl line with the agent list computed from the roster (dev roles, less the inactive agents and the dispatch exclusions). **Agents**: use it instead of picking agents by hand. **Adopt**: none.
+
+### A ready spec goes straight to dispatch (v0.218, 2026-11-18)
+
+- Host glue only. The spec PO's heartbeat no longer asks for a "spec ready" tag to the running PO: the ready line alone opens an item, so the tag started a turn that did nothing. The per-spec outcome report finds an item that has no tag from the PO's first PROMPT for it; an item with a tag gets the numbers it had.
+- **Agents**: none. **Adopt**: none. Setup: run the host glue's `install`.
+
+### A REPORT or COMMIT handoff needs a current stamp (v0.219, 2026-11-18)
+
+- Host glue only. `handoff <item> <recipient> REPORT|COMMIT --post` refuses (exit 1, nothing posted) when the item's newest `gate-<n>.txt` is missing, not a `gate PASS`, for another commit than the worktree's HEAD, or dirty. Without `--post` it warns on stderr and exits 0; BLOCKED and the other kinds are never refused.
+- **Agents**: none. **Adopt**: none. Setup: run the host glue's `install`.
+
+### A test world never reads the live answer journal (v0.224, 2026-11-19)
+
+- Host glue only. The spec PO's heartbeat check read the answer receiver's journal with `journalctl --user`, which goes by uid, so a test that ran it under a fixture HOME read the machine's live journal and a rejected dashboard click turned the gate red for 2 hours. Without `--journal` the check now reads the journal only when HOME is the account's own home, and the tests name an empty journal.
+- **Agents**: none. **Adopt**: none. Setup: run the host glue's `install`.
+
 ## Release 33 (2026-11-17): an answered card stays off the decisions feed
 
 ### Setup after install
